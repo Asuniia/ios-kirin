@@ -3,14 +3,15 @@
 # a stock-style v0 boot.img by tools/mkboot-v0.sh.
 # A PAYLOAD (tools/mkpayload.py, or tools/mkstub-payload.py with
 # out/pixel/stub.bin) is appended to the Image at _end (see pixel.c).
-# Usage: shim/build-pixel.sh STOCK_BOOT.img [PAYLOAD]   -> shim/out/pixel-boot.img
+# Usage: [WDT_SECS=120] shim/build-pixel.sh STOCK_BOOT.img [PAYLOAD]   -> shim/out/pixel-boot.img
+# WDT_SECS: APSS watchdog bite after the jump (0 = off; see pixel.c).
 set -euo pipefail
 stock=$(realpath "$1")
 payload=${2:+$(realpath "$2")}
 cd "$(dirname "$0")"
 X=aarch64-linux-gnu-
 command -v ${X}gcc >/dev/null || X=aarch64-elf-	# macOS Homebrew
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DPIXEL1"
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DPIXEL1 -DWDT_SECS=${WDT_SECS:-120}"
 mkdir -p out/pixel
 for f in start.S pixel.c pstore.c console.c fdt.c loader.c; do
 	${X}gcc $CFLAGS -c $f -o out/pixel/${f%.*}.o

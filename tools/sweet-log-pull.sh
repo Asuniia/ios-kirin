@@ -1,6 +1,6 @@
 #!/bin/sh
 # Read the SWEET console log (kernel patch 0047) from a phone booted into
-# OrangeFox recovery (fastboot boot recovery/recovery.img; adb root shell).
+# recovery with an adb root shell (Redmi: OrangeFox; Pixel: LineageOS recovery).
 #   tools/sweet-log-pull.sh OUT.txt
 # Only reads: the last 1025 blocks (4 KiB) of the userdata partition.
 set -eu
@@ -10,5 +10,5 @@ dev=$(adb shell 'for d in /dev/block/by-name/userdata /dev/block/bootdevice/by-n
 bytes=$(adb shell blockdev --getsize64 "$dev" | tr -d '\r')
 skip=$((bytes / 4096 - 1025))
 adb exec-out "dd if=$dev bs=4096 skip=$skip count=1025 2>/dev/null" > "$out.bin"
-echo "$dev: $bytes bytes, read blocks $skip.. ($(stat -c %s "$out.bin") bytes)" >&2
+echo "$dev: $bytes bytes, read blocks $skip.. ($(wc -c <"$out.bin" | tr -d " ") bytes)" >&2
 python3 "$(dirname "$0")/sweet-log.py" "$out.bin" "$out"
