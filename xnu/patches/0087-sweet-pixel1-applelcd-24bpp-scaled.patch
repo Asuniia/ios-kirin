@@ -1,0 +1,242 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -735,6 +735,7 @@
+ 	}
+ }
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
++void sweet_fbcon_kick(bool force);
+ 
+ static void
+ fbcon_clear_row(uint32_t row)
+@@ -753,11 +754,30 @@
+ 	fbcon_row = (fbcon_row + 1) % fbcon_rows;
+ 	fbcon_clear_row(fbcon_row);
+ 	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
+-	if (fbcon_kickoff != NULL) {
+-		/* ponytail: one frame per line, no wait for the previous transfer */
+-		__builtin_arm_dsb(DSB_SY);
+-		*fbcon_kickoff = 1;
++	sweet_fbcon_kick(false);
++}
++
++/*
++ * Command-mode panel (Pixel 1): send the frame. A kickoff while the previous
++ * transfer (~16 ms) still runs leaves a torn mix of frames in the panel's
++ * memory, so console kickoffs are spaced >= 20 ms apart (the last lines show
++ * with the next one); force is for whole frames (AppleCLCD, 10 Hz).
++ */
++void
++sweet_fbcon_kick(bool force)
++{
++	static uint64_t last;
++
++	if (fbcon_kickoff == NULL) {
++		return;
+ 	}
++	uint64_t now = mach_absolute_time();
++	if (!force && now - last < gPEClockFrequencyInfo.timebase_frequency_hz / 50) {
++		return;
++	}
++	last = now;
++	__builtin_arm_dsb(DSB_SY);
++	*fbcon_kickoff = 1;
+ }
+ 
+ static void
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -25,7 +25,13 @@
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+- * default framebuffer surface. The kernel text console keeps drawing over
++ * default framebuffer surface.
++ *
++ * Pixel 1 (boot framebuffer depth 24: 1080x1920 B,G,R, command-mode panel):
++ * the display is presented as the iPhone 8 panel, 750x1334 (canvas in the
++ * ADT), the default surface is a 750x1334 BGRA buffer in RAM, and each shown
++ * frame is scaled 1.44x (nearest) into the panel memory as 3-byte pixels,
++ * then sent to the panel (sweet_fbcon_kick, CTL0 START). The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
+@@ -75,7 +81,13 @@
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++#define SWEET_FB_P1_W                   750     /* Pixel 1: iPhone 8 points @2x */
++#define SWEET_FB_P1_H                   1334
++#define SWEET_FB_P1_DOT_PITCH           326
+ 
++extern "C" void sweet_fbcon_kick(bool force);           /* pexpert/arm/pe_serial.c */
++extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -108,12 +120,22 @@
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++	/* Pixel 1: fPhys..fRowBytes describe the 750x1334 RAM surface, these the panel */
++	bool          fScaled;
++	uintptr_t     fPanel;
++	uint32_t      fPanelW, fPanelH, fPanelStride;
++	IOBufferMemoryDescriptor *fShadow;
++	uint8_t      *fRow, *fOut;     /* one source row, one panel row */
++	uint32_t     *fXmap;           /* panel column -> byte offset in fRow */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	bool startScaled(void);
++	void blitScaled(uintptr_t src, uint32_t bpr, int32_t sx, int32_t sy,
++	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -154,6 +176,11 @@
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
++	if (video.v_depth == 24 && fPhys != 0 && fWidth != 0 && fHeight != 0 &&
++	    fRowBytes >= fWidth * 3 && !startScaled()) {
++		IOLog("SWEET FB: 24 bpp setup failed\n");
++		return false;
++	}
+ 	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+@@ -162,7 +189,7 @@
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++	if (!native && !fScaled && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+@@ -193,11 +220,78 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
++	    fScaled ? ", scaled to the 24 bpp panel" : "");
+ 	return true;
+ }
+ 
++/* Pixel 1: keep the panel aside, give the rest of the driver a 750x1334 BGRA surface. */
++bool
++AppleCLCD::startScaled(void)
++{
++	fPanelW = fWidth;
++	fPanelH = fHeight;
++	fPanelStride = fRowBytes;
++	fPanel = ml_io_map_wcomb((vm_offset_t)fPhys, (vm_size_t)fRowBytes * fHeight);
++	fShadow = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous,
++	    round_page(SWEET_FB_P1_W * 4 * SWEET_FB_P1_H), 0xFFFFFFFFFULL & ~(uint64_t)PAGE_MASK);
++	fRow = (uint8_t *)IOMallocData(SWEET_FB_P1_W * 4);
++	fOut = (uint8_t *)IOMallocData(fPanelW * 3);
++	fXmap = (uint32_t *)IOMallocData(fPanelW * sizeof(uint32_t));
++	if (fPanel == 0 || fShadow == NULL || fRow == NULL || fOut == NULL || fXmap == NULL) {
++		return false;
++	}
++	bzero(fShadow->getBytesNoCopy(), fShadow->getLength());
++	fPhys = fShadow->getPhysicalAddress();
++	fWidth = SWEET_FB_P1_W;
++	fHeight = SWEET_FB_P1_H;
++	fRowBytes = SWEET_FB_P1_W * 4;
++	fScaled = true;
++	return true;
++}
++
++/*
++ * Logical rect (dx,dy,w,h) of a BGRA source at (sx,sy) -> every panel pixel
++ * whose logical (nearest) pixel is inside it. Source rows are read once into
++ * fRow (the surface mapping is write-combined: slow to read piecemeal).
++ */
++void
++AppleCLCD::blitScaled(uintptr_t src, uint32_t bpr, int32_t sx, int32_t sy,
++    int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	uint32_t lw = fWidth, lh = fHeight;
++	uint32_t x0 = ((uint32_t)dx * fPanelW + lw - 1) / lw;
++	uint32_t x1 = ((uint32_t)(dx + w) * fPanelW + lw - 1) / lw;
++	uint32_t y0 = ((uint32_t)dy * fPanelH + lh - 1) / lh;
++	uint32_t y1 = ((uint32_t)(dy + h) * fPanelH + lh - 1) / lh;
++	x1 = MIN(x1, fPanelW);
++	y1 = MIN(y1, fPanelH);
++	if (x0 >= x1 || y0 >= y1) {
++		return;
++	}
++	uint32_t n = x1 - x0;
++	for (uint32_t i = 0; i < n; i++) {
++		fXmap[i] = ((x0 + i) * lw / fPanelW - (uint32_t)dx) * 4;
++	}
++	int32_t last = -1;
++	for (uint32_t y = y0; y < y1; y++) {
++		int32_t ly = (int32_t)(y * lh / fPanelH) - dy;
++		if (ly != last) {
++			memcpy(fRow, (const void *)(src + (uint64_t)(sy + ly) * bpr + (uint64_t)sx * 4), (size_t)w * 4);
++			for (uint32_t i = 0; i < n; i++) {
++				const uint8_t *p = fRow + fXmap[i];
++				fOut[3 * i] = p[0];
++				fOut[3 * i + 1] = p[1];
++				fOut[3 * i + 2] = p[2];
++			}
++			last = ly;
++		}
++		memcpy((void *)(fPanel + (uint64_t)y * fPanelStride + (uint64_t)x0 * 3), fOut, (size_t)n * 3);
++	}
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -317,7 +411,7 @@
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+-		if (s == NULL || s == fSurface) {
++		if (s == NULL || (s == fSurface && !fScaled)) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+@@ -364,7 +458,9 @@
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4) {
++		if (src != 0 && bpe == 4 && fScaled) {
++			blitScaled(src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
++		} else if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -373,6 +469,9 @@
+ 		}
+ 		s->release();
+ 	}
++	if (fScaled) {
++		sweet_fbcon_kick(true);
++	}
+ }
+ 
+ bool
+@@ -490,7 +589,7 @@
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDotPitch:
+-		out[0] = SWEET_FB_DOT_PITCH;
++		out[0] = fFB->fScaled ? SWEET_FB_P1_DOT_PITCH : SWEET_FB_DOT_PITCH;
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBNotifications:
