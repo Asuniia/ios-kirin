@@ -7,6 +7,7 @@
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$(mkdir -p "$1" && cd "$1" && pwd)
+rm -rf "$OUT"/kernel.* "$OUT/SHA256SUMS"	# a failed build must not leave an old kernel
 WORK=$REPO/research/xnu-build
 DXB_REPO=https://github.com/blacktop/darwin-xnu-build
 DXB_SHA=663906528d1cd5ea8fde7de6f16de73db9511549
@@ -19,9 +20,13 @@ if [ ! -d "$WORK" ]; then
 	git init -q "$WORK"
 	git -C "$WORK" fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
 	git -C "$WORK" checkout -q FETCH_HEAD
-	# libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
-	sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' "$WORK/build.sh"
 fi
+# libfirehose_kernel is built for x86_64/arm64e with Xcode's default CPU (LSE,
+# LDAPR); the SWEET kernel needs plain arm64 for the Pixel 1 Kryo (ARMv8.0).
+# '$(inherited)' (single quotes in build.sh) keeps the xcconfig's -mkernel etc.
+git -C "$WORK" checkout -q -- build.sh
+sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS='"'"'$(inherited) -mcpu=kryo'"'"'/' "$WORK/build.sh"
+grep -q "OTHER_CFLAGS='\$(inherited) -mcpu=kryo'" "$WORK/build.sh"
 # Our patches next to blacktop's (12.5-14.3 use the top-level patches dir).
 rm -f "$WORK"/patches/0[0-9][0-9][0-9]-*
 cp "$REPO"/xnu/patches/*.patch "$REPO"/xnu/patches/*.sh "$WORK/patches/"
