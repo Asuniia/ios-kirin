@@ -1,0 +1,125 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index f18356e..a784618 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -6,8 +6,9 @@
+  * started (shim/pstore.c): after a reset (the shim re-arms the APSS watchdog
+  * before jumping here) Android shows it as /sys/fs/pstore/console-ramoops-0.
+  * start.s maps the 32MB block holding the zone VA=PA as Device memory;
+- * arm_vm_init installs a kernel VA alias before removing TTBR0. Kept until
+- * the framebuffer serial console is ready.
++ * arm_vm_init installs a kernel VA alias before removing TTBR0, which stays
++ * mapped: once the framebuffer serial console is ready, it mirrors every
++ * character here (sweet_log_putc) and the early marks stop.
+  */
+ #include <arm64/sweet_early.h>
+ 
+@@ -26,24 +27,72 @@ static volatile uint8_t *early_base = (volatile uint8_t *)(uintptr_t)SWEET_EARLY
+ /* Initialized data must remain writable until disable, including panics. */
+ static unsigned int early_disabled, early_panicking;
+ 
+-void
+-sweet_early_putc(char c)
++/*
++ * Ring like Linux persistent_ram: start = next write position, size grows
++ * to the buffer size; Android unrolls it as data[start..size) + data[0..start).
++ */
++static void
++sweet_log_raw(char c)
+ {
+-	if (early_disabled) {
+-		return;
+-	}
+ 	if (PRZ_W(0) != PRZ_SIG) {      /* no shim record: start one */
+ 		PRZ_W(4) = 0;
+ 		PRZ_W(8) = 0;
+ 		PRZ_W(0) = PRZ_SIG;
+ 	}
+-	uint32_t n = PRZ_W(8);
+-	if (n >= PRZ_DATA_MAX) {
+-		return;
++	uint32_t start = PRZ_W(4), size = PRZ_W(8);
++	if (start >= PRZ_DATA_MAX || size > PRZ_DATA_MAX) {     /* not ours: restart */
++		start = size = 0;
++	}
++	early_base[PRZ_OFF + 12 + start] = (uint8_t)c;
++	start = (start + 1) % PRZ_DATA_MAX;
++	if (size < PRZ_DATA_MAX) {
++		size++;
++	}
++	PRZ_W(4) = start;
++	PRZ_W(8) = size;
++}
++
++static unsigned int log_line_start = 1;
++
++/*
++ * Each line starts with "[sec.ms] " from the 19.2 MHz CNTVCT (since power-on).
++ * One instruction per asm statement: ';' starts a comment in Apple's assembler.
++ */
++void
++sweet_log_putc(char c)
++{
++	if (log_line_start && c != '\n') {
++		uint64_t t;
++		__asm__ volatile ("isb");
++		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r"(t));
++		uint64_t ms = t / 19200, sec = ms / 1000;
++		char digits[20];
++		int nd = 0;
++		do {
++			digits[nd++] = (char)('0' + sec % 10);
++			sec /= 10;
++		} while (sec != 0 && nd < 20);
++		sweet_log_raw('[');
++		while (nd > 0) {
++			sweet_log_raw(digits[--nd]);
++		}
++		sweet_log_raw('.');
++		sweet_log_raw((char)('0' + ms % 1000 / 100));
++		sweet_log_raw((char)('0' + ms % 100 / 10));
++		sweet_log_raw((char)('0' + ms % 10));
++		sweet_log_raw(']');
++		sweet_log_raw(' ');
++	}
++	log_line_start = (c == '\n');
++	sweet_log_raw(c);
++}
++
++void
++sweet_early_putc(char c)
++{
++	if (!early_disabled) {
++		sweet_log_putc(c);
+ 	}
+-	early_base[PRZ_OFF + 12 + n] = (uint8_t)c;
+-	PRZ_W(4) = n + 1;
+-	PRZ_W(8) = n + 1;
+ }
+ 
+ static void
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index 954534e..546c0d0 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -9,6 +9,8 @@
+ #if defined(SWEET)
+ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
++/* Same log, also after sweet_early_disable: the console mirrors into it. */
++void sweet_log_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_hex(const char *label, uint64_t v);
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 225d2d4..10eb17d 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -780,6 +780,7 @@ fbcon_transmit_ready(void)
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++	sweet_log_putc((char)c);        /* pstore copy, readable after a reset */
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;

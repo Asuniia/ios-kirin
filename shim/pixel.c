@@ -11,7 +11,9 @@
 
 #define PSCI_SYSTEM_RESET	0x84000009UL
 #define APSS_WDT		0x9830000UL	/* qcom,wdt@9830000, 32768 Hz ticks */
+#define WDT_RST			0x04
 #define WDT_EN			0x08
+#define WDT_BARK		0x10
 #define WDT_BITE		0x14
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
@@ -61,6 +63,16 @@ void shim_main(uint64_t dtb)
 	con_clear(0);
 	con_str("SHIM", "pixel1 (sailfish) loader");
 	con_skip();
+	/*
+	 * Re-arm the watchdog for the kernel (bite 120 s after this): a hang
+	 * then ends in a warm reset that keeps RAM, so the kernel's early log
+	 * in the pstore zone (xnu sweet_early.c) can be read from Android.
+	 */
+	plog_str("watchdog re-armed (120 s), loading xnu\n");
+	wr32(APSS_WDT + WDT_BARK, 120 * 32768);
+	wr32(APSS_WDT + WDT_BITE, 120 * 32768);
+	wr32(APSS_WDT + WDT_RST, 1);
+	wr32(APSS_WDT + WDT_EN, 1);
 	const char *why = loader_boot_rd((uintptr_t)_end, TAGS_ADDR);
 	plog_str("LOADER: ");
 	plog_str(why);

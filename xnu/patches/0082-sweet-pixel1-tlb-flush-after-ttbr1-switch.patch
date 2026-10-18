@@ -1,0 +1,56 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 3411ce9..7ed7d29 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2186,6 +2186,15 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #endif
+ 	arm_vm_physmap_init(args);
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
++#if defined(SWEET)
++	/*
++	 * set_mmu_ttb_alternate does no TLB maintenance. The Pixel 1 Kryo then
++	 * walks new kernel mappings (early log alias, physmap) through cached
++	 * entries of the bootstrap TTBR1 tables -> level 2 translation fault
++	 * (AT S1E1W on the same VA succeeded). Flush before any of them is used.
++	 */
++	flush_mmu_tlb();
++#endif
+ 
+ 	ml_enable_monitor();
+ 
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index e9dc226..f18356e 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -54,6 +54,19 @@ sweet_early_string(const char *s)
+ 	}
+ }
+ 
++/* "SWEET EARLY   label 0x0123456789abcdef", for bring-up debugging */
++void
++sweet_early_hex(const char *label, uint64_t v)
++{
++	sweet_early_string("SWEET EARLY   ");
++	sweet_early_string(label);
++	sweet_early_string(" 0x");
++	for (int sh = 60; sh >= 0; sh -= 4) {
++		sweet_early_putc("0123456789abcdef"[(v >> sh) & 0xf]);
++	}
++	sweet_early_putc('\n');
++}
++
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index d7a25f2..954534e 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -11,6 +11,7 @@ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
++void sweet_early_hex(const char *label, uint64_t v);
+ void sweet_early_disable(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)

@@ -1,0 +1,34 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..b609326 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1863,6 +1863,11 @@ sleh_irq(arm_saved_state_t *state)
+ 	 */
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++	static uint32_t sweet_irq_seen;   /* bring-up: first interrupts taken */
++	if (sweet_irq_seen < 10) {
++		sweet_irq_seen++;
++		kprintf("SWEET IRQ %u: intid %u\n", sweet_irq_seen, intid);
++	}
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index bd8432c..b8f1807 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -228,6 +228,13 @@ pe_init_fiq()
+ 	}
+ 	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
++	/* bring-up: GIC state as programmed (Pixel 1 timer debugging) */
++	kprintf("SWEET GIC dbg: GICD_CTLR 0x%x GICR_WAKER 0x%x GICR_ISENABLER0 0x%x GICR_IGROUPR0 0x%x\n",
++	    gicd_read32(GICD_CTLR), gicr_read32(GICR_WAKER), gicr_read32(GICR_ISENABLER0), gicr_read32(GICR_IGROUPR0));
++	kprintf("SWEET GIC dbg: ICC_SRE 0x%llx IGRPEN1 0x%llx PMR 0x%llx CTLR 0x%llx CNTV_CTL 0x%llx DAIF 0x%llx\n",
++	    __builtin_arm_rsr64("ICC_SRE_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
++	    __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_CTLR_EL1"),
++	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("DAIF"));
+ #else
+ 	// Enable the forwarding of the vtimer interrupt
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);

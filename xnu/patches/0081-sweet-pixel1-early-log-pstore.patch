@@ -1,0 +1,267 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..3411ce9 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1829,7 +1829,8 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ /*
+  * The reserved low-globals/kernel region is excluded from VM allocation.
+  * Use the otherwise empty 32MB block above low globals and below gVirtBase
+- * for a Normal-NC framebuffer alias that survives bootstrap TTBR0 teardown.
++ * for a Device alias of the early log block (sweet_early.c) that survives
++ * bootstrap TTBR0 teardown.
+  */
+ #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+ 
+@@ -1843,9 +1844,9 @@ sweet_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = SWEET_EARLY_LOG_BLOCK | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..5ea69e3 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -514,22 +514,29 @@ LEXT(start_first_cpu)
+ 	mov		x21, #0
+ 
+ #if defined(SWEET)
+-	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
+-	mov		w1, #-1
+-	mov		x2, #32
+-	mov		x4, #4320
+-Lsweet_mark_row:
+-	mov		x3, #64
+-	mov		x5, x0
+-Lsweet_mark_pixel:
+-	str		w1, [x5], #4
+-	subs	x3, x3, #1
+-	b.ne	Lsweet_mark_pixel
+-	add		x0, x0, x4
+-	subs	x2, x2, #1
+-	b.ne	Lsweet_mark_row
++	/*
++	 * Stage 0, MMU off: append a line to the pstore console record the
++	 * shim started (layout in sweet_early.c), no stack or page tables.
++	 */
++	MOV64	x0, SWEET_EARLY_LOG_PRZ
++	ldr		w1, [x0, #8]			// size
++	add		x4, x0, #12			// text
++	adr		x2, Lsweet_s0_msg
++Lsweet_s0_char:
++	ldrb	w3, [x2], #1
++	cbz		w3, Lsweet_s0_done
++	strb	w3, [x4, x1]
++	add		w1, w1, #1
++	b		Lsweet_s0_char
++Lsweet_s0_done:
++	str		w1, [x0, #4]			// start
++	str		w1, [x0, #8]			// size
+ 	dsb		sy
++	b		Lsweet_s0_after
++Lsweet_s0_msg:
++	.asciz	"SWEET EARLY 0: start.s entered (MMU off)\n"
++	.align	2
++Lsweet_s0_after:
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -680,14 +687,15 @@ Lkernelcache_base_found:
+ 
+ #if defined(SWEET)
+ 	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+-	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+-	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+-	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
++	 * Early log block (pstore zone, sweet_early.c): one 32MB Device block
++	 * in the EXISTING V=P L2 table. Both it and RAM use L1 index 0; another
++	 * call to create_bootstrap_mapping would replace the RAM L2 table.
++	 * SWEET uses 16K pages and the RAM is below 64GB, so the first V=P L2
++	 * page is bootstrap_pagetables + 2*PGBYTES. Device: no speculative
++	 * reads of the carve-outs that share the block.
+ 	 */
+-	MOV64	x10, 0x9c000000
+-	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	MOV64	x10, SWEET_EARLY_LOG_BLOCK
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..e9dc226 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -1,9 +1,13 @@
+ /*
+- * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
+- * per-CPU state: panic() can reach this before a current thread exists.
+- * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
+- * arm_vm_init installs a reserved kernel VA alias before removing TTBR0;
+- * retain this console until the normal framebuffer serial console is ready.
++ * Pixel 1 bootstrap log. No allocation, locks, ADT parsing or per-CPU state:
++ * panic() can reach this before a current thread exists.
++ *
++ * Text is appended to the Android ramoops console record that the shim
++ * started (shim/pstore.c): after a reset (the shim re-arms the APSS watchdog
++ * before jumping here) Android shows it as /sys/fs/pstore/console-ramoops-0.
++ * start.s maps the 32MB block holding the zone VA=PA as Device memory;
++ * arm_vm_init installs a kernel VA alias before removing TTBR0. Kept until
++ * the framebuffer serial console is ready.
+  */
+ #include <arm64/sweet_early.h>
+ 
+@@ -11,33 +15,16 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+-#define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
+-#define EARLY_SCALE 2u
+-#define EARLY_CELL_W (8u * EARLY_SCALE)
+-#define EARLY_CELL_H (16u * EARLY_SCALE)
+-#define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)
+-#define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
++/* persistent_ram_buffer: "DBGC", start, size, then the text (no ECC) */
++#define PRZ_OFF         (SWEET_EARLY_LOG_PRZ - SWEET_EARLY_LOG_BLOCK)
++#define PRZ_SIG         0x43474244u
++#define PRZ_DATA_MAX    (0x80000u - 12u)
+ 
+-extern unsigned char iso_font[256 * 16];
++static volatile uint8_t *early_base = (volatile uint8_t *)(uintptr_t)SWEET_EARLY_LOG_BLOCK;
++#define PRZ_W(off) (*(volatile uint32_t *)(early_base + PRZ_OFF + (off)))
+ 
+ /* Initialized data must remain writable until disable, including panics. */
+-static unsigned int early_row, early_col;
+-static unsigned int early_started, early_disabled, early_panicking;
+-
+-static void
+-sweet_early_clear_row(void)
+-{
+-	for (unsigned int y = 0; y < EARLY_CELL_H; y++) {
+-		volatile uint32_t *line = EARLY_FB + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
+-		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
+-			line[x] = 0xff000000u;
+-		}
+-	}
+-}
++static unsigned int early_disabled, early_panicking;
+ 
+ void
+ sweet_early_putc(char c)
+@@ -45,37 +32,18 @@ sweet_early_putc(char c)
+ 	if (early_disabled) {
+ 		return;
+ 	}
+-	if (!early_started) {
+-		early_started = 1;
+-		sweet_early_clear_row();
++	if (PRZ_W(0) != PRZ_SIG) {      /* no shim record: start one */
++		PRZ_W(4) = 0;
++		PRZ_W(8) = 0;
++		PRZ_W(0) = PRZ_SIG;
+ 	}
+-	if (c == '\r') {
+-		early_col = 0;
++	uint32_t n = PRZ_W(8);
++	if (n >= PRZ_DATA_MAX) {
+ 		return;
+ 	}
+-	if (c == '\n' || early_col == EARLY_COLS) {
+-		early_col = 0;
+-		early_row = (early_row + 1) % EARLY_ROWS;
+-		sweet_early_clear_row();
+-		if (c == '\n') {
+-			return;
+-		}
+-	}
+-	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
+-	for (unsigned int gy = 0; gy < 16; gy++) {
+-		for (unsigned int sy = 0; sy < EARLY_SCALE; sy++) {
+-			volatile uint32_t *line = EARLY_FB +
+-			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE +
+-			    early_col * EARLY_CELL_W;
+-			for (unsigned int gx = 0; gx < 8; gx++) {
+-				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
+-				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
+-					line[gx * EARLY_SCALE + sx] = pixel;
+-				}
+-			}
+-		}
+-	}
+-	early_col++;
++	early_base[PRZ_OFF + 12 + n] = (uint8_t)c;
++	PRZ_W(4) = n + 1;
++	PRZ_W(8) = n + 1;
+ }
+ 
+ static void
+@@ -89,24 +57,18 @@ sweet_early_string(const char *s)
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
+-	if (early_disabled || stage > 20) {
++	if (early_disabled) {
+ 		return;
+ 	}
+-	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+-	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+-		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+-			EARLY_FB[y * EARLY_STRIDE + x] = color;
+-		}
+-	}
+-	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_string("SWEET EARLY ");
+ 	if (stage >= 10) {
+-		sweet_early_putc((char)('0' + stage / 10));
++		sweet_early_putc((char)('0' + stage / 10 % 10));
+ 	}
+ 	sweet_early_putc((char)('0' + stage % 10));
+ 	sweet_early_string(": ");
+ 	sweet_early_string(label);
+ 	sweet_early_putc('\n');
++	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+ void
+@@ -129,9 +91,9 @@ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	early_base = (volatile uint8_t *)(uintptr_t)base;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	sweet_early_mark(9, "kernel framebuffer VA live");
++	sweet_early_mark(9, "kernel log VA live");
+ }
+ 
+ void
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 9eea047..5d2856f 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -36,6 +36,13 @@
+ /* no __ARM_PAN_AVAILABLE__: PAN is ARMv8.1, the Pixel 1 Kryo is v8.0 */
+ #define __ARM_16K_PG__            1
+ 
++/*
++ * Early boot log (osfmk/arm64/sweet_early.c): the Pixel 1 ramoops console
++ * zone and the 32MB block start.s / arm_vm_init map around it.
++ */
++#define SWEET_EARLY_LOG_BLOCK     0x82000000
++#define SWEET_EARLY_LOG_PRZ       0x83540000
++
+ #define HAS_GIC_V3                1
+ 
+ #ifndef ASSEMBLER
