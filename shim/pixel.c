@@ -6,13 +6,12 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "loader.h"
 #include "pstore.h"
 
 #define PSCI_SYSTEM_RESET	0x84000009UL
 #define APSS_WDT		0x9830000UL	/* qcom,wdt@9830000, 32768 Hz ticks */
 #define WDT_EN			0x08
-#define WDT_STS			0x0c
-#define WDT_BARK		0x10
 #define WDT_BITE		0x14
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
@@ -35,51 +34,41 @@ static void delay_ms(unsigned ms)
 		;
 }
 
-/* Full-screen colour named on screen: swapped R/B shows as the wrong one. */
-static void colour_test(uint32_t c, const char *name)
-{
-	plog_str(name);
-	con_clear(c);
-	con_str("SHIM", "pixel1 colour test");
-	con_str("SHOULD", name);
-	con_flush();
-	delay_ms(8000);
-}
+/*
+ * The payload (tools/mkpayload.py) is appended to this Image at _end by
+ * build-pixel.sh: LK decompresses the kernel to 0x80080000 and the room up to
+ * the DTB at 0x82600000 is ~37 MB. (The ramdisk slot is no good: LK forces it
+ * to 0x82800000, refused a 24 MiB one, and it runs into ramoops at 13 MiB.)
+ */
+#define TAGS_ADDR	0x82600000UL	/* where LK puts the DTB */
+
+extern char _end[];
 
 void shim_main(uint64_t dtb)
 {
-	plog_init();
-	plog_str("PIXEL1 SHIM: console test\n");
-	/* The bootloader leaves the APSS watchdog running (reset ~27 s after entry). */
-	plog_hex("WDT_EN", rd32(APSS_WDT + WDT_EN));
-	plog_hex("WDT_STS", rd32(APSS_WDT + WDT_STS));
-	plog_hex("WDT_BARK", rd32(APSS_WDT + WDT_BARK));
-	plog_hex("WDT_BITE", rd32(APSS_WDT + WDT_BITE));
-	plog_hex("CNTPCT", rsr("cntpct_el0"));
+	/* The bootloader leaves the APSS watchdog running (bite 30 s after entry). */
+	uint32_t wdt_en = rd32(APSS_WDT + WDT_EN), wdt_bite = rd32(APSS_WDT + WDT_BITE);
 	wr32(APSS_WDT + WDT_EN, 0);
 	__asm__ volatile("dsb sy" ::: "memory");
-	plog_hex("WDT_EN off", rd32(APSS_WDT + WDT_EN));
-	colour_test(RED, "RED\n");
-	colour_test(BLUE, "BLUE\n");
+
+	plog_init();
+	plog_str("PIXEL1 SHIM: loader\n");
+	plog_hex("WDT_EN was", wdt_en);
+	plog_hex("WDT_BITE", wdt_bite);
+	plog_hex("DTB", dtb);
+	plog_hex("PAYLOAD", (uintptr_t)_end);
 
 	con_clear(0);
-	con_str("SHIM", "pixel1 (sailfish) console");
+	con_str("SHIM", "pixel1 (sailfish) loader");
 	con_skip();
-	con_hex("EL", rsr("CurrentEL") >> 2);
-	con_hex("MIDR", rsr("midr_el1"));
-	con_hex("MMFR0", rsr("id_aa64mmfr0_el1"));
-	con_hex("ISAR0", rsr("id_aa64isar0_el1"));
-	con_hex("DTB", dtb);
-	con_skip();
-	con_str("RESET", "in 90s");
+	const char *why = loader_boot_rd((uintptr_t)_end, TAGS_ADDR);
+	plog_str("LOADER: ");
+	plog_str(why);
+	plog_str("\n");
+	con_str("LOADER", why);
+	con_str("RESET", "in 15s");
 	con_flush();
-	plog_str("text shown\n");
-	/* heartbeat: the last value tells when an unexpected reset (watchdog) hit */
-	for (int t = 1; t <= 90; t++) {
-		delay_ms(1000);
-		plog_hex("t", t);
-	}
-	plog_str("PIXEL1 SHIM: done, PSCI reset\n");
+	delay_ms(15000);
 	psci_reset();
 }
 

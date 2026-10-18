@@ -26,6 +26,15 @@ void plog_init(void)
 	PRZ_SIG_ = PRZ_SIG;
 }
 
+/* Keep what an earlier stage logged (valid record), else start fresh. */
+void plog_append(void)
+{
+	if (PRZ_SIG_ == PRZ_SIG && PRZ_SIZE == PRZ_START && PRZ_SIZE <= PRZ_DATA_MAX)
+		pos = PRZ_SIZE;
+	else
+		plog_init();
+}
+
 static void plog_putc(char c)
 {
 	if (pos >= PRZ_DATA_MAX)
