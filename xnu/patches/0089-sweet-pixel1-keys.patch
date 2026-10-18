@@ -72,7 +72,7 @@ diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
  		return false;
  	}
 -	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
-+	uint32_t off = 0x8000u * apid; /* v2 obs: EE(0)*0x1000 + APID*0x8000 */
++	uint32_t off = 0;	/* keys_obs maps only this APID's channel (see init) */
  	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
  	__asm__ volatile("dmb oshst" ::: "memory");
  	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
@@ -143,7 +143,7 @@ diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
  			}
  		}
  		keys_wait();
-@@ -136,42 +165,27 @@
+@@ -136,42 +165,34 @@
  		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
  		return;
  	}
@@ -152,10 +152,9 @@ diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
  	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
 -	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
 -	if (!keys_core || !keys_cnfg || !keys_obs) {
-+	keys_obs = ml_io_map(KEYS_OBS_PA, 0x8000u * KEYS_APIDS);
 +	keys_volup = keys_gpio_map(KEYS_GPIO_VOLUP);
 +	keys_voldn = keys_gpio_map(KEYS_GPIO_VOLDN);
-+	if (!keys_core || !keys_cnfg || !keys_obs || !keys_volup || !keys_voldn) {
++	if (!keys_core || !keys_cnfg || !keys_volup || !keys_voldn) {
  		printf("SWEET KEYS: MMIO mapping failed\n");
  		return;
  	}
@@ -172,6 +171,14 @@ diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
 -	keys_pon_apid = keys_find_apid(0x008, count);
 -	keys_gpio_apid = keys_find_apid(0x4c1, count);
 -	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
++	/* v2 observer channel: obs + EE(0)*0x1000 + APID*0x8000. Map only that
++	 * page: the whole 8 MB window does not fit the io map (kmem_alloc panic). */
++	if (keys_pon_apid != KEYS_NO_APID) {
++		keys_obs = ml_io_map(KEYS_OBS_PA + 0x8000u * keys_pon_apid, 0x1000);
++		if (!keys_obs) {
++			keys_pon_apid = KEYS_NO_APID;
++		}
++	}
 +	uint8_t pon = 0;
  	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
 -	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
