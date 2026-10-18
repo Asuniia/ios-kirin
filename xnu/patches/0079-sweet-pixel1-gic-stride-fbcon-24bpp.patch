@@ -1,0 +1,133 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..bd8432c 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -20,6 +20,11 @@ MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS,
+ #if defined(SWEET)
+ /* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
+ SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++/* Redistributor frame stride, ADT gic "redistributor-stride" (Pixel 1: 0x40000). */
++SECURITY_READ_ONLY_LATE(static uint32_t) sweet_gicr_stride = GICR_PE_SIZE;
++#define GICR_STRIDE sweet_gicr_stride
++#else
++#define GICR_STRIDE GICR_PE_SIZE
+ #endif
+ 
+ static vm_offset_t gicd_base;
+@@ -56,7 +61,7 @@ find_gicr_pe_base()
+ 	// We only care about aff1 and aff0
+ 	uint32_t phys_id = __builtin_arm_rsr64("MPIDR_EL1") & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
+ 
+-	for (vm_offset_t offset = 0; offset < gicr_size; offset += GICR_PE_SIZE) {
++	for (vm_offset_t offset = 0; offset < gicr_size; offset += GICR_STRIDE) {
+ 		vm_offset_t gicr_pe_base = gicr_base + offset;
+ 		uint64_t gicr_typer = gicr_read64(GICR_TYPER);
+ 		uint32_t aff_value = (uint32_t) (gicr_typer >> GICR_TYPER_AFFINITY_VALUE_SHIFT) & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
+@@ -117,6 +122,16 @@ pe_init_fiq()
+ 			sweet_vtimer_intid = intid;
+ 		}
+ 		kprintf("SWEET GIC: virtual timer INTID %u\n", sweet_vtimer_intid);
++		void const *stride_prop;
++		unsigned int stride_size;
++		if (SecureDTGetProperty(entry, "redistributor-stride", &stride_prop, &stride_size) == kSuccess) {
++			uint32_t stride = stride_size == sizeof(uint32_t) ? *(const uint32_t *)stride_prop : 0;
++			if (stride != 0x20000 && stride != 0x40000) {
++				panic("%s: unsupported redistributor-stride 0x%x", __func__, stride);
++			}
++			sweet_gicr_stride = stride;
++		}
++		kprintf("SWEET GIC: redistributor stride 0x%x\n", sweet_gicr_stride);
+ #endif
+ 
+ 		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..225d2d4 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -717,17 +717,31 @@ extern unsigned char iso_font[256 * 16];
+ #define FBCON_FG        0xffffffffu
+ #define FBCON_BG        0xff000000u
+ 
+-static volatile uint32_t *fbcon_base;
+-static uint32_t fbcon_width, fbcon_height, fbcon_stride;
++static volatile uint8_t *fbcon_base;
++static uint32_t fbcon_width, fbcon_height, fbcon_stride, fbcon_bypp = 4;
++/* Command-mode panels (Pixel 1) only refresh when this register gets a 1. */
++static volatile uint32_t *fbcon_kickoff;
++
++static inline void
++fbcon_px(uint32_t x, uint32_t y, uint32_t c)
++{
++	volatile uint8_t *p = fbcon_base + y * fbcon_stride + x * fbcon_bypp;
++	if (fbcon_bypp == 4) {
++		*(volatile uint32_t *)p = c;
++	} else {        /* 24 bpp: bytes B, G, R */
++		p[0] = (uint8_t)c;
++		p[1] = (uint8_t)(c >> 8);
++		p[2] = (uint8_t)(c >> 16);
++	}
++}
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
+ static void
+ fbcon_clear_row(uint32_t row)
+ {
+ 	for (uint32_t y = row * 16 * FBCON_SCALE; y < (row + 1) * 16 * FBCON_SCALE; y++) {
+-		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
+ 		for (uint32_t x = 0; x < fbcon_width; x++) {
+-			line[x] = FBCON_BG;
++			fbcon_px(x, y, FBCON_BG);
+ 		}
+ 	}
+ }
+@@ -739,6 +753,11 @@ fbcon_newline(void)
+ 	fbcon_row = (fbcon_row + 1) % fbcon_rows;
+ 	fbcon_clear_row(fbcon_row);
+ 	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
++	if (fbcon_kickoff != NULL) {
++		/* ponytail: one frame per line, no wait for the previous transfer */
++		__builtin_arm_dsb(DSB_SY);
++		*fbcon_kickoff = 1;
++	}
+ }
+ 
+ static void
+@@ -776,11 +795,11 @@ fbcon_transmit_data(uint8_t c)
+ 	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
+ 	for (uint32_t gy = 0; gy < 16; gy++) {
+ 		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
+-			volatile uint32_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
++			uint32_t y = y0 + gy * FBCON_SCALE + sy;
+ 			for (uint32_t gx = 0; gx < 8; gx++) {
+ 				uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
+ 				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
+-					line[gx * FBCON_SCALE + sx] = px;
++					fbcon_px(x0 + gx * FBCON_SCALE + sx, y, px);
+ 				}
+ 			}
+ 		}
+@@ -831,11 +850,22 @@ fbcon_probe(void)
+ 	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
+ 		fbcon_stride = *val;
+ 	}
+-	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
++	if (SecureDTGetProperty(entry, "bits-per-pixel", (void const **)&val, &size) == kSuccess &&
++	    (*val == 24 || *val == 32)) {
++		fbcon_bypp = *val / 8;
++	}
++	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * fbcon_bypp) {
+ 		return;
+ 	}
+ 	sweet_early_mark(17, "fbcon config read; mapping");
+-	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
++	uint64_t const *kick;
++	if (SecureDTGetProperty(entry, "kickoff-reg", (void const **)&kick, &size) == kSuccess && size == 8) {
++		vm_offset_t page = ml_io_map(trunc_page_64(*kick), PAGE_SIZE);
++		if (page != 0) {
++			fbcon_kickoff = (volatile uint32_t *)(page + (*kick & PAGE_MASK));
++		}
++	}
++	fbcon_base = (volatile uint8_t *)ml_io_map_wcomb(reg[0], reg[1]);
+ 	sweet_early_mark(18, "fbcon mapping returned");
+ 	if (fbcon_base != NULL) {
+ 		register_serial_functions(&sweet_fbcon_serial_functions);

@@ -33,6 +33,9 @@ if [ -d "$WORK/xnu/.git" ]; then
 fi
 
 cd "$WORK"
+# build.sh skips the kernel if this exists (and we would copy a stale one):
+# remove it, make still rebuilds only what changed in build/xnu.obj.
+rm -rf build/xnu.obj/kernel.development.sweet* fakeroot/System/Library/Kernels/kernel.development.sweet*
 env PATH="$REPO/research/bin:/opt/homebrew/bin:$PATH" \
 	DEVELOPER_DIR="$XCODE/Contents/Developer" KDKROOT="$KDK" \
 	MACOS_VERSION=13.5 KERNEL_CONFIG=DEVELOPMENT MACHINE_CONFIG=SWEET \
