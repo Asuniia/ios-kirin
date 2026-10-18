@@ -5,8 +5,7 @@
 #
 #   sudo tools/mkiosroot-mac.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]   (SIZE default 16g)
 #
-# OUT.img is the raw volume (flash with `fastboot flash userdata OUT.img`);
-# OUT.img.dmg is the same volume as a UDIF image (hdiutil attach) for edits.
+# OUT.img is the raw volume (flash with `fastboot flash userdata OUT.img`).
 # macOS reads the LZFSE/LZBITMAP-compressed IPSW files transparently and
 # ditto --nopreserveHFSCompression writes them uncompressed (SWEET's HFS has
 # no decmpfs decompressors). See mkiosroot.sh for what each step is for.
@@ -19,9 +18,9 @@ os=$1 sysos=$2 appos=$3 out=$4 size=${5:-16g}
 here=$(cd "$(dirname "$0")" && pwd)
 
 work=$(mktemp -d /tmp/mkiosroot.XXXXXX)
-mounts=()
+mounts=()	# bash 3.2 (macOS /bin/bash): empty "${a[@]}" trips set -u
 cleanup() {
-	for m in "${mounts[@]}"; do hdiutil detach -quiet "$m" 2>/dev/null || hdiutil detach -force -quiet "$m" || true; done
+	for m in ${mounts[@]+"${mounts[@]}"}; do hdiutil detach -quiet "$m" 2>/dev/null || hdiutil detach -force -quiet "$m" || true; done
 	rmdir "$work"/* "$work" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -29,7 +28,7 @@ trap cleanup EXIT
 attach() {	# IMAGE NAME [hdiutil options]
 	mkdir "$work/$2"
 	hdiutil attach -nobrowse -owners on -mountpoint "$work/$2" "${@:3}" "$1" >/dev/null
-	mounts=("$work/$2" "${mounts[@]}")
+	mounts=("$work/$2" ${mounts[@]+"${mounts[@]}"})
 }
 attach "$os" os -readonly
 # The cryptexes are raw APFS images, not UDIF.
@@ -92,19 +91,17 @@ rm -rf "$r/.fseventsd" "$r/.Spotlight-V100" "$r/.Trashes"
 df -h "$r"
 
 hdiutil detach -quiet "$r"
-mounts=("${mounts[@]:1}")
+mounts=("${mounts[@]:1}")	# root was first; bash 3.2: never empty here
 dev=$(hdiutil attach -nobrowse -nomount "$out.dmg" | awk 'NR==1{print $1}')
 fsck_hfs -fn "$dev"
 hdiutil detach -quiet "$dev"
 
-# UDIF read/write = the raw volume followed by a 512-byte trailer: an APFS
-# clone without the trailer is the raw image.
-cp -c "$out.dmg" "$out"
-python3 -I -c 'import os, sys
-p = sys.argv[1]; n = os.path.getsize(p) - 512
-with open(p, "rb") as f:
-    f.seek(n); assert f.read(4) == b"koly", "no UDIF trailer"
-os.truncate(p, n)' "$out"
+# hdiutil's UDRW image here is plain raw (CRawDiskImage, no UDIF trailer):
+# the file is the volume itself. Reattach with
+# `hdiutil attach -imagekey diskimage-class=CRawDiskImage OUT.img`.
+[[ $(stat -f %z "$out.dmg") == $(( $(hdiutil imageinfo "$out.dmg" | awk '/Total Bytes/{print $3; exit}') )) ]] ||
+	{ echo "$out.dmg is not a raw image" >&2; exit 1; }
+mv "$out.dmg" "$out"
 [[ $(xxd -s 1024 -l 2 -p "$out") == 4858 ]] || { echo "no HX signature at 1024" >&2; exit 1; }
-chown "${SUDO_UID:-0}:${SUDO_GID:-0}" "$out" "$out.dmg"
-ls -l "$out" "$out.dmg"
+chown "${SUDO_UID:-0}:${SUDO_GID:-0}" "$out"
+ls -l "$out"
