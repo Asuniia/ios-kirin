@@ -124,6 +124,12 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
         # of the A11 that the iPhone X userland expects.
         ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
         ('chip-id', u32(0x8015)),
+        # MAC addresses iBoot copies from syscfg (WMac/BMac). MobileGestalt's
+        # WifiAddress (part of the A11 UniqueDeviceID) reads /chosen first,
+        # else waits forever for an IONetworkController (Pixel 1: lsd's first
+        # database seed hung there). Synthetic, locally administered.
+        ('mac-address-wifi0', bytes.fromhex('02005e77ee10')),
+        ('mac-address-bluetooth0', bytes.fromhex('02005e77ee11')),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
         # DeviceType then takes its native "Hactivation" branch (state
