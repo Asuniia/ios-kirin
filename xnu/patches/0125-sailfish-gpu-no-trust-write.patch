@@ -1,0 +1,30 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -20,9 +20,10 @@
+  * a5xx_me_init): GPU SMMU 0xb40000 identity-mapped (smmu_identity), CP
+  * microcode from the payload (mkpayload --blob GPU-PM4 / GPU-PFP = the
+  * vendor a530_pm4.fw / a530_pfp.fw without their 4-byte header; not in git),
+- * a 16 KB ring, CP_ME_INIT + CP_MEM_WRITE of 0xc0ffee01 to a scratch page,
+- * then (separately, last) RBBM_SECVID_TRUST_CNTL = 0 to leave secure mode
+- * as mainline does without a zap shader.
++ * a 16 KB ring, CP_ME_INIT + CP_MEM_WRITE of 0xc0ffee01 to a scratch page
++ * (works, 0124a). The GPU stays in secure mode (TRUST_CNTL 1): writing
++ * RBBM_SECVID_TRUST_CNTL = 0 (mainline's no-zap-shader path) reset the
++ * phone; leaving it needs the zap shader loaded through TZ.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -374,13 +375,6 @@
+ 	smmu_faults(smmu, "after ring:");
+ 	printf("SWEET GPU: scratch %08x -> %s\n", got,
+ 	    got == 0xc0ffee01 ? "CP_MEM_WRITE landed: COMMAND PROCESSOR WORKS" : "no write");
+-	gpu_wait(11);
+-
+-	/* Leave secure mode (mainline's no-zap-shader path); TZ may refuse. */
+-	printf("SWEET GPU: writing RBBM_SECVID_TRUST_CNTL = 0\n");
+-	gpu_wait(11);
+-	gw(gpu, R_SECVID_TRUST_CNTL, 0);
+-	cp_state(gpu, "after TRUST_CNTL write:");
+ }
+ 
+ static void
