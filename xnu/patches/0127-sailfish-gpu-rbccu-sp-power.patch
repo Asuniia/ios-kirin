@@ -1,0 +1,33 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -107,6 +107,10 @@
+ #define R_GRAS_CL_CNTL          0xe000
+ #define R_RB_CNTL               0xe140
+ #define R_RB_RENDER_CNTL        0xe141
++#define R_GPMU_SP_POWER_CNTL    0xa881
++#define R_GPMU_RBCCU_POWER_CNTL 0xa887
++#define R_GPMU_SP_PWR_CLK_STATUS 0xa88b
++#define R_GPMU_RBCCU_PWR_CLK_STATUS 0xa88d
+ /* a5xx_color_fmt */
+ #define RB5_R8G8B8A8_UNORM      0x30
+ #define RB5_R8G8B8_UNORM        0x31
+@@ -539,7 +543,18 @@
+ 	flush_dcache64((addr64_t)pfp, pfp_len, TRUE);
+ 	gpu_wait(11);
+ 
+-	/* Subset of a5xx_hw_init (A530 values; HWCG, GPMU, CP_PROTECT left out). */
++	/*
++	 * a5xx_pm_resume (A530): power the RB/CCU and SP islands; without them
++	 * the CP hung on the first 2D blit (0126a, RBBM_STATUS c00001c3).
++	 */
++	gw(gpu, R_GPMU_RBCCU_POWER_CNTL, 0x778000);
++	bool rbccu = poll(gpu, R_GPMU_RBCCU_PWR_CLK_STATUS * 4, 1u << 20, 1u << 20, 1);
++	gw(gpu, R_GPMU_SP_POWER_CNTL, 0x778000);
++	bool sp = poll(gpu, R_GPMU_SP_PWR_CLK_STATUS * 4, 1u << 20, 1u << 20, 1);
++	printf("SWEET GPU: RBCCU power %s (%08x), SP power %s (%08x)\n", rbccu ? "on" : "TIMEOUT",
++	    gr(gpu, R_GPMU_RBCCU_PWR_CLK_STATUS), sp ? "on" : "TIMEOUT", gr(gpu, R_GPMU_SP_PWR_CLK_STATUS));
++
++	/* Subset of a5xx_hw_init (A530 values; HWCG, GPMU firmware, CP_PROTECT left out). */
+ 	gw(gpu, R_VBIF_RR_QOS_ARB, 3);
+ 	gw(gpu, R_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
+ 	gw(gpu, R_RBBM_AHB_CNTL0, 1);
