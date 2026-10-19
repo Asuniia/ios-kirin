@@ -1,0 +1,123 @@
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -37,6 +37,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/proc_internal.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
+ #include <kern/thread.h>
+@@ -336,9 +337,95 @@
+ 	clock_interval_to_deadline(secs, NSEC_PER_SEC, &deadline);
+ 	(void)assert_wait_deadline(&perf_sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * Per-process CPU use over the last interval ("SWEET TOP"), from the
++ * cpu_time ledger. Percent of one CPU (400% = all four busy).
++ */
++extern uint64_t get_task_cpu_time(task_t task);
++
++#define TOP_SLOTS 512
++static struct {
++	int pid;
++	uint32_t gen;
++	uint64_t last, delta;
++	char name[20];
++} top_tab[TOP_SLOTS];
++static uint32_t top_gen;
++
++static int
++top_visit(proc_t p, __unused void *arg)
++{
++	task_t task = proc_task(p);
++	int pid = proc_pid(p), free = -1, i;
++	if (task == TASK_NULL) {
++		return PROC_RETURNED;
++	}
++	uint64_t ns = get_task_cpu_time(task);
++	for (i = 0; i < TOP_SLOTS; i++) {
++		if (top_tab[i].gen != 0 && top_tab[i].pid == pid) {
++			break;
++		}
++		if (free < 0 && top_tab[i].gen + 1 < top_gen) {
++			free = i;	/* unused, or not seen last round */
++		}
++	}
++	if (i == TOP_SLOTS) {
++		if (free < 0) {
++			return PROC_RETURNED;
++		}
++		i = free;
++		top_tab[i].pid = pid;
++		top_tab[i].last = ns;
++		strlcpy(top_tab[i].name, proc_best_name(p), sizeof(top_tab[i].name));
++	}
++	top_tab[i].delta = ns >= top_tab[i].last ? ns - top_tab[i].last : 0;	/* pid reused */
++	top_tab[i].last = ns;
++	top_tab[i].gen = top_gen;
++	return PROC_RETURNED;
+ }
+ 
+ static void
++perf_top(uint64_t interval_ns)
++{
++	char line[400];
++	int n, used[8];
++	uint64_t total = 0;
++	top_gen++;
++	proc_iterate(PROC_ALLPROCLIST, top_visit, NULL, NULL, NULL);
++	for (int i = 0; i < TOP_SLOTS; i++) {
++		if (top_tab[i].gen == top_gen) {
++			total += top_tab[i].delta;
++		}
++	}
++	if (interval_ns == 0) {
++		return;
++	}
++	n = snprintf(line, sizeof(line), "SWEET TOP: all %llu%% |", total * 100 / interval_ns);
++	for (int k = 0; k < 8; k++) {
++		int best = -1;
++		for (int i = 0; i < TOP_SLOTS; i++) {
++			bool taken = false;
++			for (int j = 0; j < k; j++) {
++				taken |= used[j] == i;
++			}
++			if (!taken && top_tab[i].gen == top_gen &&
++			    (best < 0 || top_tab[i].delta > top_tab[best].delta)) {
++				best = i;
++			}
++		}
++		used[k] = best;
++		if (best < 0 || top_tab[best].delta * 100 / interval_ns == 0) {
++			break;
++		}
++		n += snprintf(line + n, sizeof(line) - n, " %s[%d] %llu%%", top_tab[best].name,
++		    top_tab[best].pid, top_tab[best].delta * 100 / interval_ns);
++	}
++	printf("%s\n", line);
++}
++
++static void
+ perf_thread(void *arg, wait_result_t result)
+ {
+ 	(void)arg;
+@@ -350,6 +437,8 @@
+ 		perf_bandwidth(c);
+ 	}
+ 	thread_bind(NULL);
++	top_gen = 1;
++	perf_top(0);
+ 	uint64_t swaps = 0, presents = 0, pabs = 0, t = mach_absolute_time();
+ 	for (;;) {
+ 		uint64_t mhz[4] = {0, 0, 0, 0};
+@@ -369,6 +458,7 @@
+ 		    dp ? perf_ns(dabs) / 1000 / dp : 0);
+ 		printf("SWEET PERF: panel kicks %llu (after done %llu, after 50 ms timeout %llu)\n",
+ 		    sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout);
++		perf_top(perf_ns(now - t));
+ 		swaps = sweet_fb_stat_swaps;
+ 		presents = sweet_fb_stat_presents;
+ 		pabs = sweet_fb_stat_present_abs;
