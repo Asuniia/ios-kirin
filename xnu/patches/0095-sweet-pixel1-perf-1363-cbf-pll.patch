@@ -1,0 +1,131 @@
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -8,10 +8,16 @@
+  * and once at start the cached memcpy bandwidth of each CPU.
+  *
+  * Also the CPU clocks (MSM8996 Pro, Linux drivers/clk/msm/clock-cpu-8996.c):
+- * ABL leaves the perf cluster (CPU 2/3) on the 19.2 MHz XO. The register
+- * state is logged; boot-arg sweetclk=1 then runs the perf PLL at
+- * sweetclk_mhz (default 883: the rate Linux's early init sets before any
+- * voltage regulator driver runs, i.e. safe at ABL's APC voltage).
++ * ABL leaves the perf cluster (CPU 2/3) on the 19.2 MHz XO, the pwr cluster
++ * at 1228.8 MHz and the CBF (cluster/memory fabric) on GPLL0 (~300 MHz), with
++ * the shared APC rail PM8994 S11 at 905 mV and both kryo regulators in BHS
++ * (clusters fed straight from S11). 905 mV is the CPR ceiling of the
++ * nominal band (DT qcom,cpr-voltage-ceiling), so its top corners are safe
++ * without touching the PMIC: perf 1363.2 MHz, CBF 1190.4 MHz. Boot-arg
++ * sweetclk=1 starts the perf PLL at sweetclk_mhz (default 1363) and, if
++ * sweetcbf_mhz is set, the CBF PLL; with S11 below 905 mV (or unreadable)
++ * the perf cluster gets 883 MHz (Linux's early-init rate, set before any
++ * regulator driver runs) and the CBF is left alone.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -69,27 +75,42 @@
+ 	    clk_rd(b, 0x100), clk_rd(b, 0x104), clk_rd(b, 0x110));
+ }
+ 
+-/* Linux cpu_clock_8996_early_init + __variable_rate_pll_init, perf PLL only, no ACD. */
++/* Register offsets of one PLL (APCC cluster PLLs and the CBF PLL differ). */
++struct clk_pll {
++	const char *name;
++	uint32_t l, alpha, user, cfg, cfghi, testlo, testhi;
++	uint32_t postdiv;               /* USER_CTL [9:8] value (main output divider) */
++};
++static const struct clk_pll clk_perf = {"perf", 0x04, 0x08, 0x10, 0x18, 0x1c, 0x20, 0x24, 0x100};
++static const struct clk_pll clk_cbf = {"CBF", 0x08, 0x10, 0x18, 0x20, 0x24, 0x30, 0x34, 0x300};
++
++/*
++ * Linux cpu_clock_8996_early_init + __variable_rate_pll_init (v3/Pro values,
++ * no ACD): program the PLL while its consumer runs from another source,
++ * wait for lock, then switch mux [1:0] at muxbase+muxoff from `from` to 1
++ * (the PLL's full-rate output).
++ */
+ static void
+-clk_perf_pll(vm_offset_t b, uint32_t mhz)
++clk_pll_start(const struct clk_pll *p, vm_offset_t b, vm_offset_t muxbase, uint32_t muxoff,
++    uint32_t from, uint32_t mhz)
+ {
+ 	uint32_t l = (mhz * 10 + 96) / 192;    /* nearest 19.2 MHz step */
+-	uint32_t mux = clk_rd(b, CLK_MUX);
+-	if ((mux & 3u) != 0) {
+-		printf("SWEET CLK: perf cluster not on the low mux (mux=%#x), left alone\n", mux);
++	uint32_t mux = clk_rd(muxbase, muxoff);
++	if ((mux & 3u) != from) {
++		printf("SWEET CLK: %s mux=%#x is not on source %u, left alone\n", p->name, mux, from);
+ 		return;
+ 	}
+-	clk_wr(b, CLK_PLL_MODE, 0);     /* off: the cluster runs from the lf mux */
+-	uint32_t user = clk_rd(b, 0x10);
++	clk_wr(b, CLK_PLL_MODE, 0);
++	uint32_t user = clk_rd(b, p->user);
+ 	user &= ~((3u << 8) | (1u << 12) | (1u << 24));
+-	user |= 0x100u | (1u << 0) | (1u << 3); /* post-div 2 on main, main + early outputs */
+-	clk_wr(b, 0x10, user);
+-	clk_wr(b, 0x08, 0);             /* alpha */
+-	clk_wr(b, 0x18, 0x200d4828);    /* config_ctl (v3/Pro) */
+-	clk_wr(b, 0x1c, 0x006);
+-	clk_wr(b, 0x20, 0x1c000000);    /* test_ctl lo/hi */
+-	clk_wr(b, 0x24, 0x00004000);
+-	clk_wr(b, CLK_PLL_L, l);
++	user |= p->postdiv | (1u << 0) | (1u << 3);     /* main + early outputs */
++	clk_wr(b, p->user, user);
++	clk_wr(b, p->alpha, 0);
++	clk_wr(b, p->cfg, 0x200d4828);
++	clk_wr(b, p->cfghi, 0x006);
++	clk_wr(b, p->testlo, 0x1c000000);
++	clk_wr(b, p->testhi, 0x00004000);
++	clk_wr(b, p->l, l);
+ 	clk_wr(b, CLK_PLL_MODE, 0x00118000);    /* FSM mode: turns the PLL on */
+ 	delay(50);
+ 	unsigned i;
+@@ -97,13 +118,13 @@
+ 		delay(1);
+ 	}
+ 	if (!(clk_rd(b, CLK_PLL_MODE) & (1u << 31))) {
+-		printf("SWEET CLK: perf PLL did not lock (mode=%#x), staying on the low mux\n", clk_rd(b, 0));
++		printf("SWEET CLK: %s PLL did not lock (mode=%#x), mux unchanged\n", p->name, clk_rd(b, 0));
+ 		return;
+ 	}
+-	clk_wr(b, CLK_MUX, (mux & ~3u) | 1u);   /* glitch-free switch to the primary PLL */
++	clk_wr(muxbase, muxoff, (mux & ~3u) | 1u);     /* glitch-free switch */
+ 	delay(5);
+-	printf("SWEET CLK: perf PLL locked after %u us, L=%u (%u.%u MHz), mux %#x -> %#x\n",
+-	    i + 50, l, l * 192 / 10, l * 192 % 10, mux, clk_rd(b, CLK_MUX));
++	printf("SWEET CLK: %s PLL locked after %u us, L=%u (%u.%u MHz), mux %#x -> %#x\n",
++	    p->name, i + 50, l, l * 192 / 10, l * 192 % 10, mux, clk_rd(muxbase, muxoff));
+ }
+ 
+ static void
+@@ -134,13 +155,27 @@
+ 	printf("SWEET CLK: S11 %s type=%#x subtype=%#x range=%#x vset=%#x (%u) mode=%#x en=%#x\n",
+ 	    ok ? "ok" : "READ FAILED", r[0], r[1], r[2], r[3], r[3], r[4], r[5]);
+ 	int on = 0;
+-	uint32_t mhz = 883;
++	uint32_t mhz = 1363, cbfmhz = 0;
+ 	(void)PE_parse_boot_argn("sweetclk", &on, sizeof(on));
+ 	(void)PE_parse_boot_argn("sweetclk_mhz", &mhz, sizeof(mhz));
+-	if (on && mhz >= 300 && mhz <= 2150) {
+-		clk_perf_pll(apc1, mhz);
+-		clk_dump("perfcl", apc1);
++	(void)PE_parse_boot_argn("sweetcbf_mhz", &cbfmhz, sizeof(cbfmhz));
++	if (!on) {
++		return;
+ 	}
++	/* Nominal-band limits need S11 >= 905 mV (FTS2.5 range 0: 80 mV + 5 mV * vset). */
++	bool nominal = ok && r[1] == 0x09 && r[2] == 0 && r[3] >= 165;
++	uint32_t perfmax = nominal ? 1363 : 883, cbfmax = nominal ? 1190 : 0;
++	if (mhz > perfmax || cbfmhz > cbfmax) {
++		printf("SWEET CLK: capped to perf %u / CBF %u MHz (S11 %s)\n", perfmax, cbfmax,
++		    nominal ? "905 mV" : "below 905 mV or unknown");
++	}
++	clk_pll_start(&clk_perf, apc1, apc1, CLK_MUX, 0, MIN(MAX(mhz, 300u), perfmax));
++	clk_dump("perfcl", apc1);
++	if (cbfmhz >= 300 && cbfmax != 0) {
++		clk_pll_start(&clk_cbf, cbfpll, cbf, 0x18, 3, MIN(cbfmhz, cbfmax));
++		printf("SWEET CLK: cbf mux=%#x pll mode=%#x l=%u user=%#x\n",
++		    clk_rd(cbf, 0x18), clk_rd(cbfpll, 0), clk_rd(cbfpll, 8), clk_rd(cbfpll, 0x18));
++	}
+ }
+ 
+ static uint64_t
