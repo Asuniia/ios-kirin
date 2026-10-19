@@ -1,0 +1,308 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -42,7 +42,9 @@
+  * in tools/gpu-shaders/, assembled by tools/ir3asm into sweet_gpu_shaders.h)
+  * dispatched like Mesa's computerator a5xx backend (a5xx_emit_grid): 16
+  * workgroups of 64 write out[i] = i ^ 0x5a5a0000 into an SSBO, checked by
+- * the CPU.
++ * the CPU. Then blend.asm: premultiplied BGRA8 source-over (CA's
++ * vAlpha_Blend_Premultiplied_BGRA_8888) on 1024 pixels, compared with the
++ * same arithmetic on the CPU.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -55,6 +57,17 @@
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++
++/* A compute kernel as tools/ir3asm describes it (sweet_gpu_shaders.h). */
++struct sweet_kernel {
++	const uint32_t *bin;
++	uint32_t size;
++	uint32_t instrlen, constlen;    /* 16-instruction units, vec4 */
++	int max_reg, max_half_reg, double_threadsize;
++	uint32_t branchstack;
++	uint32_t local[3];
++	uint32_t localid_regid, wgid_regid, num_bufs;
++};
+ #include "sweet_gpu_shaders.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -661,29 +674,16 @@
+ }
+ 
+ /*
+- * Step 4.1: one compute dispatch (computerator a5xx_emit_grid with
+- * cs_restore_emit / cs_program_emit / cs_ibo_emit; no consts, no private
+- * memory), then the CPU checks the SSBO.
++ * One compute dispatch of `groups` x k->local[0] invocations (computerator
++ * a5xx_emit_grid: cs_restore_emit, cs_program_emit, cs_ibo_emit; no consts,
++ * no private memory); the shader binary must already be at shader_pa. Ends
++ * with CACHE_FLUSH_TS writing seq to fence. True if the CP read it all.
+  */
+-static void
+-compute_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
++static bool
++compute_run(vm_offset_t gpu, const struct sweet_kernel *k, uint64_t shader_pa,
++    const uint64_t *buf, const uint32_t *buf_bytes, uint32_t groups, uint64_t fence, uint32_t seq)
+ {
+-	static const uint32_t local[3] = {k_fill_LOCAL_SIZE}, groups = 16;
+-	uint32_t n = local[0] * groups, bytes = n * 4;
+-	vm_offset_t shva, outva;
+-	uint64_t sh = gpu_page(&shva), out = gpu_page(&outva);
+-	if (sh == 0 || out == 0 || bytes > PAGE_SIZE) {
+-		printf("SWEET GPU: no compute pages\n");
+-		return;
+-	}
+-	memcpy((void *)shva, k_fill, sizeof(k_fill));
+-	memset((void *)outva, 0xee, bytes);
+-	flush_dcache64((addr64_t)sh, PAGE_SIZE, TRUE);
+-	flush_dcache64((addr64_t)out, PAGE_SIZE, TRUE);
+-	uint64_t fence = scratch + 32;
+-	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 32);
+-	uint32_t thr = k_fill_DOUBLE_THREADSIZE ? 1 : 0;   /* FOUR_QUADS : TWO_QUADS */
+-	wr(smmu + 0x8000, 0x58, 0xffffffffu);
++	uint32_t thr = k->double_threadsize ? 1 : 0;     /* FOUR_QUADS : TWO_QUADS */
+ 
+ 	/* cs_restore_emit */
+ 	emit(pkt7(CP_SET_RENDER_MODE, 5)); emit(BYPASS); emit(0); emit(0); emit(0); emit(0);
+@@ -704,68 +704,142 @@
+ 	emit(pkt4(R_SP_SP_CNTL, 1)); emit(0);
+ 	emit(pkt4(R_HLSQ_CONTROL_0_REG, 1)); emit((thr << 2) | 0x880);
+ 	emit(pkt4(R_SP_CS_CTRL_REG0, 1));
+-	emit((thr << 3) | ((uint32_t)(k_fill_MAX_HALF_REG + 1) << 4) | ((uint32_t)(k_fill_MAX_REG + 1) << 10) |
+-	    ((uint32_t)k_fill_BRANCHSTACK << 24) | (1u << 2) /* BUFFER */ | 0x2);
++	emit((thr << 3) | ((uint32_t)(k->max_half_reg + 1) << 4) | ((uint32_t)(k->max_reg + 1) << 10) |
++	    (k->branchstack << 24) | (1u << 2) /* BUFFER */ | 0x2);
+ 	emit(pkt4(R_HLSQ_CS_CONFIG, 1)); emit(1);
+-	emit(pkt4(R_HLSQ_CS_CNTL, 1)); emit((k_fill_INSTRLEN << 1) | (k_fill_NUM_BUFS ? 1u : 0));
++	emit(pkt4(R_HLSQ_CS_CNTL, 1)); emit((k->instrlen << 1) | (k->num_bufs ? 1u : 0));
+ 	emit(pkt4(R_SP_CS_CONFIG, 1)); emit(1);
+-	emit(pkt4(R_HLSQ_CS_CONSTLEN, 2)); emit(k_fill_CONSTLEN / 4); emit(k_fill_INSTRLEN);
++	emit(pkt4(R_HLSQ_CS_CONSTLEN, 2)); emit(k->constlen / 4); emit(k->instrlen);
+ 	emit(pkt4(R_TPL1_CS_TEX_COUNT, 1)); emit(0);
+ 	emit(pkt4(R_SP_CS_OBJ_START, 6));
+-	emit((uint32_t)sh); emit((uint32_t)(sh >> 32));
++	emit((uint32_t)shader_pa); emit((uint32_t)(shader_pa >> 32));
+ 	emit(0);                                /* PVT_MEM_PARAM */
+ 	emit(0); emit(0);                       /* PVT_MEM_ADDR */
+ 	emit(0);                                /* PVT_MEM_SIZE */
+ 	emit(pkt4(R_HLSQ_UPDATE_CNTL, 1)); emit(0x01f00000);
+ 	emit(pkt4(R_HLSQ_CS_CNTL_0, 2));
+-	emit(k_fill_WGID_REGID | (0xfcu << 8) | (0xfcu << 16) | ((uint32_t)k_fill_LOCALID_REGID << 24));
++	emit(k->wgid_regid | (0xfcu << 8) | (0xfcu << 16) | (k->localid_regid << 24));
+ 	emit(1);                                /* HLSQ_CS_CNTL_1 */
+ 	emit(pkt7(CP_LOAD_STATE4, 3));
+-	emit((2u << 16) | (SB4_CS_SHADER << 18) | ((uint32_t)k_fill_INSTRLEN << 22));     /* SS4_INDIRECT */
+-	emit((uint32_t)sh);                     /* STATE_TYPE ST4_SHADER (0) in bits 1:0 */
+-	emit((uint32_t)(sh >> 32));
+-	/* cs_ibo_emit: SSBO 0 size (bytes, overflowing from WIDTH into HEIGHT), then address */
+-	emit(pkt7(CP_LOAD_STATE4, 5));
+-	emit((SB4_CS_SSBO << 18) | (1u << 22));
+-	emit(1);                                /* ST4_CONSTANTS */
+-	emit(0);
+-	emit((bytes & 0xffffu) << 16);
+-	emit(bytes >> 16);
+-	emit(pkt7(CP_LOAD_STATE4, 5));
+-	emit((SB4_CS_SSBO << 18) | (1u << 22));
+-	emit(2);                                /* ST4_UBO */
+-	emit(0);
+-	emit((uint32_t)out); emit((uint32_t)(out >> 32));
+-	/* grid */
++	emit((2u << 16) | (SB4_CS_SHADER << 18) | (k->instrlen << 22));    /* SS4_INDIRECT */
++	emit((uint32_t)shader_pa);              /* STATE_TYPE ST4_SHADER (0) in bits 1:0 */
++	emit((uint32_t)(shader_pa >> 32));
++	/* cs_ibo_emit: SSBO sizes (bytes, overflowing from WIDTH into HEIGHT), then addresses */
++	if (k->num_bufs) {
++		emit(pkt7(CP_LOAD_STATE4, 3 + 2 * k->num_bufs));
++		emit((SB4_CS_SSBO << 18) | (k->num_bufs << 22));
++		emit(1);                        /* ST4_CONSTANTS */
++		emit(0);
++		for (uint32_t i = 0; i < k->num_bufs; i++) {
++			emit((buf_bytes[i] & 0xffffu) << 16);
++			emit(buf_bytes[i] >> 16);
++		}
++		emit(pkt7(CP_LOAD_STATE4, 3 + 2 * k->num_bufs));
++		emit((SB4_CS_SSBO << 18) | (k->num_bufs << 22));
++		emit(2);                        /* ST4_UBO */
++		emit(0);
++		for (uint32_t i = 0; i < k->num_bufs; i++) {
++			emit((uint32_t)buf[i]); emit((uint32_t)(buf[i] >> 32));
++		}
++	}
++	/* grid: 1-D, `groups` workgroups */
+ 	emit(pkt4(R_HLSQ_CS_NDRANGE_0, 7));
+-	emit(3u | ((local[0] - 1) << 2) | ((local[1] - 1) << 12) | ((local[2] - 1) << 22));
+-	emit(local[0] * groups); emit(0);
+-	emit(local[1]); emit(0);
+-	emit(local[2]); emit(0);
++	emit(3u | ((k->local[0] - 1) << 2) | ((k->local[1] - 1) << 12) | ((k->local[2] - 1) << 22));
++	emit(k->local[0] * groups); emit(0);
++	emit(k->local[1]); emit(0);
++	emit(k->local[2]); emit(0);
+ 	emit(pkt4(R_HLSQ_CS_KERNEL_GROUP_X, 3)); emit(1); emit(1); emit(1);
+ 	emit(pkt7(CP_EXEC_CS, 4)); emit(0); emit(groups); emit(1); emit(1);
+ 	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+ 	emit(pkt7(CP_EVENT_WRITE, 4)); emit(CACHE_FLUSH_TS);
+-	emit((uint32_t)fence); emit((uint32_t)(fence >> 32)); emit(0x400);
++	emit((uint32_t)fence); emit((uint32_t)(fence >> 32)); emit(seq);
+ 	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	return kick(gpu);
++}
+ 
+-	bool read = kick(gpu);
+-	delay(5000);
+-	flush_dcache64((addr64_t)scratch, 64, TRUE);
+-	flush_dcache64((addr64_t)out, PAGE_SIZE, TRUE);
+-	const uint32_t *o = (const uint32_t *)outva;
+-	uint32_t bad = 0, first = ~0u, untouched = 0;
+-	for (uint32_t i = 0; i < n; i++) {
+-		untouched += o[i] == 0xeeeeeeeeu;
+-		if (o[i] != (i ^ 0x5a5a0000u) && bad++ == 0) {
+-			first = i;
++/* A kernel's binary in its own page; returns the PA (0 on failure). */
++static uint64_t
++kernel_page(const struct sweet_kernel *k)
++{
++	vm_offset_t va;
++	uint64_t pa = gpu_page(&va);
++	if (pa != 0 && k->size <= PAGE_SIZE) {
++		memcpy((void *)va, k->bin, k->size);
++		flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
++	}
++	return k->size <= PAGE_SIZE ? pa : 0;
++}
++
++/* CPU reference of blend.asm: premultiplied source-over, same rounding. */
++static uint32_t
++blend_ref(uint32_t src, uint32_t dst)
++{
++	uint32_t ia = 255 - (src >> 24), out = 0;
++	for (int sh = 0; sh < 32; sh += 8) {
++		uint32_t t = ((dst >> sh) & 0xff) * ia;
++		out |= (((t + 128 + (t >> 8)) >> 8) & 0xff) << sh;
++	}
++	return src + out;
++}
++
++/* Step 4.1: fill.asm and blend.asm, checked by the CPU. */
++static void
++compute_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
++{
++	const uint32_t groups = 16, n = 64 * groups, bytes = n * 4;
++	vm_offset_t ava, bva, wva;
++	uint64_t a = gpu_page(&ava), b = gpu_page(&bva), w = gpu_page(&wva);
++	uint64_t kfill = kernel_page(&k_fill), kblend = kernel_page(&k_blend);
++	if (a == 0 || b == 0 || w == 0 || kfill == 0 || kblend == 0 || bytes > PAGE_SIZE) {
++		printf("SWEET GPU: no compute pages\n");
++		return;
++	}
++	uint32_t *pa_ = (uint32_t *)ava, *pb = (uint32_t *)bva, *want = (uint32_t *)wva;
++	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 32);
++
++	for (uint32_t t = 0; t < 2; t++) {
++		if (t == 0) {
++			memset(pa_, 0xee, bytes);
++		} else {
++			for (uint32_t i = 0; i < n; i++) {
++				/* premultiplied source: every channel <= alpha */
++				uint32_t al = (i * 37) & 0xff, c = al ? (i * 11) % (al + 1) : 0;
++				pa_[i] = (al << 24) | (c << 16) | ((c / 2) << 8) | (c / 3);
++				pb[i] = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++				want[i] = blend_ref(pa_[i], pb[i]);
++			}
+ 		}
++		flush_dcache64((addr64_t)a, PAGE_SIZE, TRUE);
++		flush_dcache64((addr64_t)b, PAGE_SIZE, TRUE);
++		wr(smmu + 0x8000, 0x58, 0xffffffffu);
++		uint64_t bufs[2] = {a, b};
++		uint32_t sizes[2] = {bytes, bytes};
++		bool read = compute_run(gpu, t == 0 ? &k_fill : &k_blend, t == 0 ? kfill : kblend,
++		    bufs, sizes, groups, scratch + 32, 0x400 + t);
++		delay(5000);
++		flush_dcache64((addr64_t)scratch, 64, TRUE);
++		flush_dcache64((addr64_t)a, PAGE_SIZE, TRUE);
++		flush_dcache64((addr64_t)b, PAGE_SIZE, TRUE);
++		const uint32_t *o = t == 0 ? pa_ : pb;
++		uint32_t bad = 0, first = ~0u;
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t w = t == 0 ? (i ^ 0x5a5a0000u) : want[i];
++			if (o[i] != w && bad++ == 0) {
++				first = i;
++			}
++		}
++		cp_state(gpu, read ? "compute read:" : "compute NOT read (200 ms):");
++		smmu_faults(smmu, "after compute:");
++		printf("SWEET GPU: compute %s, %u pixels: fence %x (want %x), %u wrong (first [%u] = %08x want %08x); "
++		    "out[1..3] %08x %08x %08x -> %s\n", t == 0 ? "fill" : "blend (premultiplied source-over)", n,
++		    *fv, 0x400 + t, bad, first, first < n ? o[first] : 0,
++		    first < n ? (t == 0 ? first ^ 0x5a5a0000u : want[first]) : 0, o[1], o[2], o[3],
++		    bad == 0 ? (t == 0 ? "GPU SHADER WORKS" : "GPU BLEND MATCHES THE CPU") : "wrong");
++		if (!read) {
++			return;
++		}
++		gpu_wait(1);
+ 	}
+-	cp_state(gpu, read ? "compute read:" : "compute NOT read (200 ms):");
+-	smmu_faults(smmu, "after compute:");
+-	printf("SWEET GPU: compute %u invocations: fence %x (want 400), %u wrong (first [%u] = %08x), %u untouched; "
+-	    "out[0..3] %08x %08x %08x %08x -> %s\n", n, *fv, bad, first, first < n ? o[first] : 0, untouched,
+-	    o[0], o[1], o[2], o[3], bad == 0 ? "GPU SHADER WORKS" : "wrong");
+ }
+ 
+ /* Step 2: command processor. */
+--- a/bsd/dev/sweet_gpu_shaders.h
++++ b/bsd/dev/sweet_gpu_shaders.h
+@@ -3,19 +3,40 @@
+  * (tools/build-ir3asm.sh) from tools/gpu-shaders/*.asm. Do not edit.
+  */
+ /* k_fill: generated by tools/ir3asm from tools/gpu-shaders/fill.asm */
+-#define k_fill_INSTRLEN 1    /* units of 16 instructions */
+-#define k_fill_CONSTLEN 0    /* vec4 */
+-#define k_fill_MAX_REG 3
+-#define k_fill_MAX_HALF_REG -1
+-#define k_fill_DOUBLE_THREADSIZE 1
+-#define k_fill_BRANCHSTACK 0
+-#define k_fill_LOCAL_SIZE 64, 1, 1
+-#define k_fill_LOCALID_REGID 0x0
+-#define k_fill_WGID_REGID 0xc0
+-#define k_fill_NUM_BUFS 1
+-static const uint32_t k_fill[32] = {
++static const uint32_t k_fill_bin[32] = {
+ 	0x5a5a0000, 0x204cc00d, 0x00000000, 0x204cc009, 0x200600c0, 0x46d00004, 0x00000000, 0x00000200,
+ 	0x00000004, 0x42100004, 0x00000000, 0x00000200, 0x20020004, 0x46d00008, 0x000d0004, 0x43f0000c,
+ 	0x00000000, 0x00000500, 0x04000619, 0xc7260008, 0x00000000, 0x03000000, 0x00000000, 0x00000000,
+ 	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+ };
++static const struct sweet_kernel k_fill = {
++	.bin = k_fill_bin, .size = sizeof(k_fill_bin),
++	.instrlen = 1, .constlen = 0, .max_reg = 3, .max_half_reg = -1,
++	.double_threadsize = 1, .branchstack = 0,
++	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 1,
++};
++/* k_blend: generated by tools/ir3asm from tools/gpu-shaders/blend.asm */
++static const uint32_t k_blend_bin[128] = {
++	0x00000000, 0x204cc009, 0x00ff00ff, 0x204cc014, 0x00800080, 0x204cc015, 0x000000ff, 0x204cc016,
++	0x200600c0, 0x46d00004, 0x00000000, 0x00000200, 0x00000004, 0x42100004, 0x00000000, 0x00000200,
++	0x20020004, 0x46d00008, 0x00000000, 0x00000500, 0x04020600, 0xc6e6000c, 0x04020600, 0xc6e6020d,
++	0x2018000c, 0x56f00010, 0x2008000d, 0x46f00012, 0x0014000d, 0x43900011, 0x00000000, 0x00000100,
++	0x00100016, 0x42500010, 0x00140012, 0x43900012, 0x00000000, 0x00000200, 0x00100011, 0x46100011,
++	0x00100012, 0x46100012, 0x00000000, 0x00000200, 0x20080011, 0x46f00013, 0x20080012, 0x46f00018,
++	0x00000000, 0x00000200, 0x00140013, 0x43900013, 0x00140018, 0x43900018, 0x00000000, 0x00000200,
++	0x00130011, 0x42100011, 0x00180012, 0x42100012, 0x00000000, 0x00000200, 0x00150011, 0x42100011,
++	0x00150012, 0x42100012, 0x00000000, 0x00000200, 0x20080011, 0x46f00011, 0x20080012, 0x46f00012,
++	0x00000000, 0x00000200, 0x00140011, 0x43900011, 0x00140012, 0x43900012, 0x00000000, 0x00000200,
++	0x20080012, 0x46d00012, 0x00000000, 0x00000200, 0x00120011, 0x43b00011, 0x00000000, 0x00000200,
++	0x0011000c, 0x4210000c, 0x00000000, 0x00000500, 0x04000619, 0xc7260208, 0x00000000, 0x03000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++static const struct sweet_kernel k_blend = {
++	.bin = k_blend_bin, .size = sizeof(k_blend_bin),
++	.instrlen = 3, .constlen = 0, .max_reg = 6, .max_half_reg = -1,
++	.double_threadsize = 1, .branchstack = 0,
++	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 2,
++};
