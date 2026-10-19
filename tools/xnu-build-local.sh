@@ -2,22 +2,17 @@
 # Local replacement for .github/workflows/xnu.yml (the repo stays local):
 # blacktop/darwin-xnu-build at the CI's pinned commit, our xnu/patches, the
 # Xcode 15 toolchain (Xcode 16+ iig emits IORPC.kernelContent that xnu-8796
-# lacks) and the KDK.
+# lacks) and the KDK unpacked in research/.
 # Usage: tools/xnu-build-local.sh OUTDIR     (log in OUTDIR/build.log)
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$(mkdir -p "$1" && cd "$1" && pwd)
 rm -rf "$OUT"/kernel.* "$OUT/SHA256SUMS"	# a failed build must not leave an old kernel
-# The repo lives on "/Volumes/Samsung SSD" and xnu's make cannot handle a space
-# in the path, so the build tree, Xcode 15 and the KDK sit in a disk image that
-# mounts at a space-free path.
-VOL=/Volumes/ios-sweet-build
-[ -d "$VOL/xnu-build" ] || hdiutil attach -nobrowse "$REPO/research/build.sparsebundle" >/dev/null
-WORK=$VOL/xnu-build
+WORK=$REPO/research/xnu-build
 DXB_REPO=https://github.com/blacktop/darwin-xnu-build
 DXB_SHA=663906528d1cd5ea8fde7de6f16de73db9511549
-XCODE=${XCODE:-$VOL/xcode15/Xcode.app}
-KDK=${KDK:-$VOL/kdk/KDK_13.5_22G74.kdk}
+XCODE=${XCODE:-$REPO/research/xcode15/Xcode.app}
+KDK=${KDK:-$REPO/research/kdk/KDK_13.5_22G74.kdk}
 [ -d "$XCODE" ] || { echo "no Xcode 15 at $XCODE" >&2; exit 1; }
 [ -d "$KDK" ] || { echo "no KDK at $KDK" >&2; exit 1; }
 
