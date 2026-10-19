@@ -1,0 +1,189 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
++bsd/dev/sweet_perf.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -51,6 +51,7 @@
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
++extern void sweet_perf_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_perf_init();
+ 	return 0;
+ }
+ 
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -87,6 +87,9 @@
+ 
+ extern "C" void sweet_fbcon_kick(bool force);           /* pexpert/arm/pe_serial.c */
+ extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++/* Read by bsd/dev/sweet_perf.c. */
++extern "C" uint64_t sweet_fb_stat_swaps, sweet_fb_stat_presents, sweet_fb_stat_present_abs;
++uint64_t sweet_fb_stat_swaps, sweet_fb_stat_presents, sweet_fb_stat_present_abs;
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -321,7 +324,10 @@
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		uint64_t t0 = mach_absolute_time();
+ 		fb->present(rec);
++		sweet_fb_stat_present_abs += mach_absolute_time() - t0;
++		sweet_fb_stat_presents++;
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -370,6 +376,7 @@
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	sweet_fb_stat_swaps++;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+--- /dev/null
++++ b/bsd/dev/sweet_perf.c
+@@ -0,0 +1,127 @@
++/*
++ * Performance probe (diagnostic, boot-arg sweetperf=0 turns it off). Every
++ * 10 s it logs:
++ *   per-CPU clock  a chain of dependent adds (1 cycle each on Kryo) timed
++ *                  against the 19.2 MHz timer, interrupts off, CPU-bound
++ *   framebuffer    swaps (backboardd frames), presents (panel copies) and the
++ *                  average present() time from SweetFramebuffer.cpp
++ * and once at start the cached memcpy bandwidth.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern struct processor *cpu_to_processor(int cpu);
++extern struct processor *thread_bind(struct processor *processor);
++extern uint64_t sweet_fb_stat_swaps, sweet_fb_stat_presents, sweet_fb_stat_present_abs;
++void sweet_perf_init(void);
++
++static int perf_sleep_chan;
++
++static uint64_t
++perf_ns(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns;
++}
++
++/* MHz of the current CPU: 16 dependent adds per iteration. */
++static uint64_t
++perf_mhz(void)
++{
++	uint64_t n = 1u << 18, x = 0;	/* 4M cycles: 2 ms at 2 GHz, 14 ms at 300 MHz */
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	uint64_t t0 = mach_absolute_time();
++	__asm__ volatile(
++		"1:\n"
++		".rept 16\n"
++		"add %0, %0, #1\n"
++		".endr\n"
++		"subs %1, %1, #1\n"
++		"b.ne 1b\n"
++		: "+r"(x), "+r"(n) :: "cc");
++	uint64_t ns = perf_ns(mach_absolute_time() - t0);
++	ml_set_interrupts_enabled(istate);
++	return ns ? (16ull << 18) * 1000 / ns : 0;
++}
++
++static void
++perf_bandwidth(void)
++{
++	const size_t sz = 4u << 20;
++	void *a = kalloc_data(sz, Z_WAITOK | Z_ZERO), *b = kalloc_data(sz, Z_WAITOK | Z_ZERO);
++	if (a != NULL && b != NULL) {
++		memcpy(b, a, sz);	/* fault in / warm up */
++		uint64_t t0 = mach_absolute_time();
++		for (int i = 0; i < 8; i++) {
++			memcpy((i & 1) ? a : b, (i & 1) ? b : a, sz);
++		}
++		uint64_t ns = perf_ns(mach_absolute_time() - t0);
++		printf("SWEET PERF: memcpy %llu MB/s (8 x 4 MiB, cached kalloc)\n",
++		    ns ? (8ull * sz * 1000) / ns : 0);
++	}
++	kfree_data(a, sz);
++	kfree_data(b, sz);
++}
++
++static void
++perf_wait(unsigned secs)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(secs, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&perf_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++perf_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	perf_bandwidth();
++	uint64_t swaps = 0, presents = 0, pabs = 0, t = mach_absolute_time();
++	for (;;) {
++		uint64_t mhz[4] = {0, 0, 0, 0};
++		for (int c = 0; c < 4 && c < (int)ml_get_cpu_count(); c++) {
++			thread_bind(cpu_to_processor(c));
++			thread_block(THREAD_CONTINUE_NULL);	/* migrate */
++			mhz[c] = perf_mhz();
++		}
++		thread_bind(NULL);
++		uint64_t now = mach_absolute_time(), ms = perf_ns(now - t) / NSEC_PER_MSEC;
++		uint64_t ds = sweet_fb_stat_swaps - swaps, dp = sweet_fb_stat_presents - presents;
++		uint64_t dabs = sweet_fb_stat_present_abs - pabs;
++		printf("SWEET PERF: MHz %llu/%llu/%llu/%llu  swaps %llu.%llu/s  presents %llu.%llu/s  present avg %llu us\n",
++		    mhz[0], mhz[1], mhz[2], mhz[3],
++		    ms ? ds * 1000 / ms : 0, ms ? ds * 10000 / ms % 10 : 0,
++		    ms ? dp * 1000 / ms : 0, ms ? dp * 10000 / ms % 10 : 0,
++		    dp ? perf_ns(dabs) / 1000 / dp : 0);
++		swaps = sweet_fb_stat_swaps;
++		presents = sweet_fb_stat_presents;
++		pabs = sweet_fb_stat_present_abs;
++		t = now;
++		perf_wait(10);
++	}
++}
++
++void
++sweet_perf_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	(void)PE_parse_boot_argn("sweetperf", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	if (kernel_thread_start(perf_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
