@@ -1,0 +1,21 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -100,12 +100,15 @@
+ 	return v;
+ }
+ 
++/*
++ * The value always goes through a real register ("r", never wzr): firmware
++ * traps and emulates some SMMU writes (S2CR), and a trapped `str wzr`
++ * stalled the CPU (0121a-0123a).
++ */
+ static void
+ wr(vm_offset_t base, uint32_t off, uint32_t v)
+ {
+-	__asm__ volatile("dmb sy" ::: "memory");
+-	*(volatile uint32_t *)(base + off) = v;
+-	__asm__ volatile("dsb sy" ::: "memory");
++	__asm__ volatile("dmb sy\n\tstr %w0, [%1]\n\tdsb sy" : : "r"(v), "r"(base + off) : "memory");
+ }
+ 
+ /* Poll until (reg & mask) == want, up to ms milliseconds. */
