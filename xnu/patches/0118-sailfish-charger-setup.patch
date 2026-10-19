@@ -1,0 +1,212 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -6,8 +6,9 @@
+  *   volume up    TLMM GPIO 126, active low
+  *   volume down  TLMM GPIO 121, active low -> reported as Home (the iPhone 8
+  *                userland needs a Home button; the Pixel has none)
+- * PMIC access is READ ONLY: the sole PMIC-side write issues EXT_READL on an
+- * observer channel. The volume GPIOs only get their pull-up (as Linux's
++ * Keys only read the PMIC (EXT_READL on an observer channel);
++ * sweet_pmic_write (the battery's charger setup) writes through the
++ * peripheral's own channel. The volume GPIOs only get their pull-up (as Linux's
+  * tlmm_gpio_key_active pinctrl) if the bootloader left them without one.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -24,11 +25,13 @@
+ extern void sweet_hid_key(int key, int down);
+ void sweet_keys_init(void);
+ bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
+ 
+ /* qcom,spmi@400f000: core, obsrvr, cnfg */
+ #define KEYS_CORE_PA     0x0400f000u
+ #define KEYS_OBS_PA      0x04c00000u
+ #define KEYS_CNFG_PA     0x0400a000u
++#define KEYS_CHNLS_PA    0x04400000u     /* write channels, EE 0 */
+ #define KEYS_APIDS       256u            /* core is 0xc00: map 0x800 + 4n */
+ #define KEYS_PON_RT      0x0810u
+ #define KEYS_NO_APID     0xffffu
+@@ -148,6 +151,56 @@
+ 	return ok;
+ }
+ 
++/*
++ * One-byte PMIC write (Linux pmic_arb v2 EXT_WRITEL on the APID's channel
++ * page: WDATA0 +0x10, CMD +0x00, STATUS +0x08). Only for peripherals owned
++ * by EE 0 (apps). Callers must never use it on RPM-owned regulators.
++ */
++bool
++sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val)
++{
++	static vm_offset_t ch[8];
++	static uint16_t ch_ppid[8];
++	static unsigned ch_n;
++	bool ok = false;
++	if (keys_core == 0 || keys_cnfg == 0) {
++		return false;
++	}
++	lck_mtx_lock(&sweet_pmic_lock);
++	unsigned i;
++	for (i = 0; i < ch_n && ch_ppid[i] != ppid; i++) {
++	}
++	if (i == ch_n && i < 8) {
++		uint16_t apid = keys_find_apid(ppid);
++		ch[i] = apid == KEYS_NO_APID || (keys_rd(keys_cnfg, 0x700u + 4u * apid) & 7u) != 0 ? 0 :
++		    ml_io_map(KEYS_CHNLS_PA + 0x8000u * apid, 0x1000);
++		if (ch[i] != 0) {
++			ch_ppid[i] = ppid;
++			ch_n++;
++		}
++	}
++	if (i < ch_n) {
++		vm_offset_t c = ch[i];
++		*(volatile uint32_t *)(c + 0x10) = val;
++		__asm__ volatile("dmb oshst" ::: "memory");
++		*(volatile uint32_t *)c = (uint32_t)addr << 4;	/* EXT_WRITEL, one byte */
++		__asm__ volatile("dsb osh" ::: "memory");
++		for (unsigned t = 0; t < 1000; ++t) {
++			uint32_t st = keys_rd(c, 0x08u);
++			if (st & 1u) {
++				ok = (st & 0x0eu) == 0;
++				break;
++			}
++			delay(1);
++		}
++	}
++	lck_mtx_unlock(&sweet_pmic_lock);
++	if (!ok) {
++		printf("SWEET PMIC: write ppid 0x%03x addr 0x%02x = 0x%02x failed\n", ppid, addr, val);
++	}
++	return ok;
++}
++
+ static vm_offset_t
+ keys_gpio_map(uint32_t gpio)
+ {
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -1,12 +1,18 @@
+ /*
+  * Built-in iOS battery service for the Pixel 1, read-only PMI8994 (SID 2)
+- * polling every 30 s (Linux qpnp-fg.c / qpnp-smbcharger.c):
++ * polling every 5 s (Linux qpnp-fg.c / qpnp-smbcharger.c):
+  *   percent   FG_SOC 0x4009 SOC_MONOTONIC_SOC (0x400a shadow), as Linux
+  *             get_prop_capacity
+  *   plugged   USB_CHGPTH RT_STS 0x1310 SRC_DET and not OV, INPUT_STS 0x130d
+  *   charging  CHGR RT_STS 0x1010 (TCC / inhibit = full), CHGR_STS 0x100e
+  *             charge type (none/pre/fast/taper), hold-off = not charging
+  * Voltage and current live in FG SRAM (memif, needs writes): not read.
++ * Charging: on every plug-in, as Linux smbchg_set_high_usb_chg_current /
++ * smbchg_set_fastchg_current_raw: USB input limit IL_CFG 0x13f2 (secure,
++ * unlock 0xa5 at 0x13d0) = boot-arg sweetcharge mA (default 1500, 0 = no
++ * writes), CMD_IL 0x1340 HC mode, fast-charge current FCC_CFG 0x10f2 =
++ * 2000 mA (Pixel DT). The bootloader leaves USB 500 mA mode. Hardware AICL
++ * still lowers the input limit if the source sags.
+  * Until the PMIC is readable (sweet_keys_init runs later): 100%, AC.
+  * Boot-arg sweetbattery=0: static fallback only.
+  */
+@@ -20,6 +26,7 @@
+ #include <pexpert/pexpert.h>
+ /* bsd/dev/sweet_keys.c */
+ extern "C" bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++extern "C" bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
+ 
+ #define SWEET_BATTERY_MAH       2770    /* Pixel 1 */
+ 
+@@ -36,6 +43,10 @@
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
+ 	uint8_t fLastRegs[6];
++	bool fWasExternal;
++	unsigned fChargeMA;
++	void setupCharger(void);
++	static bool secWrite(uint16_t address, uint8_t mask, uint8_t value);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -172,6 +183,47 @@
+ SweetBattery::reg(uint16_t address, uint8_t *value)
+ {
+ 	return sweet_pmic_read((uint16_t)(0x200 | (address >> 8)), (uint8_t)address, value);
++}
++
++/* Masked write; secure registers (0xf0+) get the SEC_ACCESS unlock first. */
++bool
++SweetBattery::secWrite(uint16_t address, uint8_t mask, uint8_t value)
++{
++	uint16_t ppid = (uint16_t)(0x200 | (address >> 8));
++	uint8_t old;
++	if (!reg(address, &old)) {
++		return false;
++	}
++	if ((address & 0xff) >= 0xf0 && !sweet_pmic_write(ppid, 0xd0, 0xa5)) {
++		return false;
++	}
++	return sweet_pmic_write(ppid, (uint8_t)address, (uint8_t)((old & ~mask) | (value & mask)));
++}
++
++void
++SweetBattery::setupCharger(void)
++{
++	/* usb_ilim_ma_table_8996 (FCC uses the same table). */
++	static const uint16_t ma[] = {300, 400, 500, 600, 700, 800, 900, 1000, 1100,
++	    1200, 1300, 1400, 1450, 1500, 1550, 1600, 1700, 1800, 1900, 1950, 2000,
++	    2050, 2100, 2200, 2300, 2400, 2500, 2600, 2700, 2800, 2900, 3000};
++	uint8_t icl = 0, fcc = 0;
++	for (uint8_t i = 0; i < sizeof(ma) / sizeof(ma[0]); i++) {
++		if (ma[i] <= fChargeMA) {
++			icl = i;
++		}
++		if (ma[i] <= 2000) {
++			fcc = i;
++		}
++	}
++	bool ok = secWrite(0x13f2, 0x1f, icl) &&
++	    secWrite(0x1340, 0x01, 0x01) &&
++	    secWrite(0x10f2, 0x1f, fcc);
++	uint8_t cmd = 0, il = 0, fc = 0, s1 = 0, s2 = 0;
++	(void)(reg(0x1340, &cmd) && reg(0x13f2, &il) && reg(0x10f2, &fc) &&
++	    reg(0x1307, &s1) && reg(0x1309, &s2));
++	IOLog("SWEET BATTERY: charger setup %s: input %u mA, fast charge %u mA; readback CMD_IL %02x IL_CFG %02x FCC %02x ICL_STS %02x/%02x\n",
++	    ok ? "ok" : "FAILED", ma[icl], ma[fcc], cmd, il, fc, s1, s2);
+ }
+ 
+ void
+@@ -202,6 +254,10 @@
+ 	unsigned percent = soc == 0xff ? 100 : soc == 0 ? 0 :
+ 	    ((unsigned)(soc - 1) * 98 + 126) / 253 + 1;
+ 	bool external = (usb & 0x04u) && !(usb & 0x02u) && (input & 0x38u);
++	if (external && !fWasExternal && fChargeMA != 0) {
++		setupCharger();
++	}
++	fWasExternal = external;
+ 	bool full = external && (chgr_rt & 0x82u);
+ 	bool charging = external && !full && !(chgr & 0x08u) && ((chgr >> 1) & 3u) != 0;
+ 	if (fLastRegs[5] == 0xff) {
+@@ -233,7 +289,7 @@
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(30000);
++		sender->setTimeoutMS(5000);
+ 	}
+ }
+ 
+@@ -246,6 +302,8 @@
+ 	int real = 1;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real != 0;
++	fChargeMA = 1500;
++	(void)PE_parse_boot_argn("sweetcharge", &fChargeMA, sizeof(fChargeMA));
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -254,7 +312,7 @@
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(5000);
+ 		} else {
+ 			fReal = false;
+ 			poll();
