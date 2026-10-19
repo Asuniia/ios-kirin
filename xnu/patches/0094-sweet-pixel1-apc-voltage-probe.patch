@@ -1,0 +1,128 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -22,6 +22,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ void sweet_keys_init(void);
++bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+ 
+ /* qcom,spmi@400f000: core, obsrvr, cnfg */
+ #define KEYS_CORE_PA     0x0400f000u
+@@ -69,24 +70,21 @@
+ 	return found;
+ }
+ 
++/* obs maps one APID's observer channel page. */
+ static bool
+-keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
++keys_obs_read(vm_offset_t obs, uint16_t addr, uint8_t *out)
+ {
+-	if (apid == KEYS_NO_APID) {
+-		return false;
+-	}
+-	uint32_t off = 0;	/* keys_obs maps only this APID's channel (see init) */
+ 	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
++	*(volatile uint32_t *)obs = cmd;	/* EXT_READL, one byte */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ 	for (unsigned i = 0; i < 1000; ++i) {
+-		keys_last_status = keys_rd(keys_obs, off + 0x08u);
++		keys_last_status = keys_rd(obs, 0x08u);
+ 		if (keys_last_status & 1u) {
+ 			if (keys_last_status & 0x0eu) {
+ 				return false;
+ 			}
+-			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
++			*out = (uint8_t)keys_rd(obs, 0x18u);
+ 			return true;
+ 		}
+ 		delay(1);
+@@ -94,6 +92,37 @@
+ 	return false;
+ }
+ 
++static bool
++keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
++{
++	return apid != KEYS_NO_APID && keys_obs_read(keys_obs, addr, out);
++}
++
++/*
++ * Read-only PMIC register access for other drivers (after sweet_keys_init),
++ * ppid = SID << 8 | peripheral. ponytail: maps the observer page on every
++ * call (io map space is small); fine for a few reads at boot, cache the
++ * mapping before polling.
++ */
++bool
++sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out)
++{
++	static vm_offset_t obs;
++	static uint16_t obs_ppid = KEYS_NO_APID;
++	if (keys_core == 0 || keys_cnfg == 0) {
++		return false;
++	}
++	if (obs == 0 || obs_ppid != ppid) {
++		uint16_t apid = keys_find_apid(ppid);
++		if (apid == KEYS_NO_APID) {
++			return false;
++		}
++		obs = ml_io_map(KEYS_OBS_PA + 0x8000u * apid, 0x1000);
++		obs_ppid = ppid;
++	}
++	return obs != 0 && keys_obs_read(obs, addr, out);
++}
++
+ static vm_offset_t
+ keys_gpio_map(uint32_t gpio)
+ {
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -29,6 +29,7 @@
+ void sweet_perf_init(void);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+ 
+ static int perf_sleep_chan;
+ 
+@@ -39,6 +40,9 @@
+ #define CLK_MUX         0x40u           /* [1:0] hf: 0 lf, 1 PLL, 2 PLL via ACD, 3 alt PLL; [3:2] lf */
+ #define CLK_PLL_MODE    0x00u           /* bit 31 locked */
+ #define CLK_PLL_L       0x04u
++#define KRYO0_PA        0x099a2000u     /* pm-apc of the kryo regulators: +0x08 LDO vref, +0x18 bit 0 BHS */
++#define KRYO1_PA        0x099d2000u
++#define PMIC_S11        0x132u          /* PM8994 SID 1 S11 (APC rail, spm-regulator) */
+ 
+ static uint32_t
+ clk_rd(vm_offset_t base, uint32_t off)
+@@ -69,7 +73,7 @@
+ static void
+ clk_perf_pll(vm_offset_t b, uint32_t mhz)
+ {
+-	uint32_t l = mhz * 10 / 192;    /* 19.2 MHz steps */
++	uint32_t l = (mhz * 10 + 96) / 192;    /* nearest 19.2 MHz step */
+ 	uint32_t mux = clk_rd(b, CLK_MUX);
+ 	if ((mux & 3u) != 0) {
+ 		printf("SWEET CLK: perf cluster not on the low mux (mux=%#x), left alone\n", mux);
+@@ -115,6 +119,20 @@
+ 	clk_dump("perfcl", apc1);
+ 	printf("SWEET CLK: cbf mux=%#x pll mode=%#x l=%u user=%#x\n",
+ 	    clk_rd(cbf, 0x18), clk_rd(cbfpll, 0), clk_rd(cbfpll, 8), clk_rd(cbfpll, 0x18));
++	vm_offset_t k0 = ml_io_map(KRYO0_PA, 0x1000), k1 = ml_io_map(KRYO1_PA, 0x1000);
++	if (k0 && k1) {
++		printf("SWEET CLK: kryo0 gate=%#x vref=%#x  kryo1 gate=%#x vref=%#x (gate bit 0: 1 BHS, 0 LDO)\n",
++		    clk_rd(k0, 0x18), clk_rd(k0, 0x08), clk_rd(k1, 0x18), clk_rd(k1, 0x08));
++	}
++	/* type 0x1c: subtype 8 FTS2 (range 0: 5 mV steps from 0), 9 FTS2.5 (5 mV from 80 mV) */
++	uint8_t r[6] = {0};
++	static const uint8_t regs[6] = {0x04, 0x05, 0x40, 0x41, 0x45, 0x46};
++	bool ok = true;
++	for (int i = 0; i < 6; i++) {
++		ok = ok && sweet_pmic_read(PMIC_S11, regs[i], &r[i]);
++	}
++	printf("SWEET CLK: S11 %s type=%#x subtype=%#x range=%#x vset=%#x (%u) mode=%#x en=%#x\n",
++	    ok ? "ok" : "READ FAILED", r[0], r[1], r[2], r[3], r[3], r[4], r[5]);
+ 	int on = 0;
+ 	uint32_t mhz = 883;
+ 	(void)PE_parse_boot_argn("sweetclk", &on, sizeof(on));
