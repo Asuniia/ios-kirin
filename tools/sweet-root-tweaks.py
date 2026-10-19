@@ -15,7 +15,8 @@ screen (image versions v8-v14 in NOTES.md):
                   fairplayd.H2 removed (no FairPlay kext: it exits at launch,
                   launchd relaunches it every ~10 s and MIG requests queued on
                   its port never get a reply; locationd blocks on one and with
-                  it the CoreLocation data migrator)
+                  it the CoreLocation data migrator); voicemail vmd removed (it
+                  retries the missing CommCenter XPC ~29k times per boot)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       /private/var/datamigrator/migrate sentinel: DataMigration
@@ -77,7 +78,8 @@ def launchd(root):
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
     removed = [k for k, j in jobs.items()
-               if j.get('Label') in ('com.apple.CommCenter', 'com.apple.fairplayd.H2')]
+               if j.get('Label') in ('com.apple.CommCenter', 'com.apple.fairplayd.H2',
+                                      'com.apple.voicemail.vmd')]
     for k in removed:
         del jobs[k]
     # CoreAnimation's CPU renderer (no GPU) copies a backdrop 1:1 into the
@@ -88,7 +90,7 @@ def launchd(root):
         if j.get('Label') == 'com.apple.backboardd':
             j.setdefault('EnvironmentVariables', {})['CA_BACKDROP_SCALE'] = '1'
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} jobs removed (CommCenter, fairplayd), '
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} jobs removed (CommCenter, fairplayd, vmd), '
           'backboardd CA_BACKDROP_SCALE=1')
 
 
