@@ -1,0 +1,109 @@
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -758,26 +758,62 @@
+ }
+ 
+ /*
+- * Command-mode panel (Pixel 1): send the frame. A kickoff while the previous
+- * transfer (~16 ms) still runs leaves a torn mix of frames in the panel's
+- * memory, so console kickoffs are spaced >= 20 ms apart (the last lines show
+- * with the next one); force is for whole frames (AppleCLCD, 10 Hz).
++ * Command-mode panel (Pixel 1): send the frame. CTL0 START waits for the
++ * panel's TE and then streams the frame, up to ~32 ms in all; a START while
++ * that runs desyncs the panel's memory pointer (picture rolled, stripes,
++ * frozen until another full frame happens to land) and can survive a warm
++ * reset. So a START only goes out once the previous frame reported
++ * PING_PONG_0_DONE (MDP INTR_STATUS bit 8, latched without INTR_EN, as
++ * Linux mdss reads it), or 50 ms passed. Console kickoffs skip while a frame
++ * is out (their lines show with the next one); force (whole AppleCLCD frames)
++ * waits for it.
+  */
+-void
+-sweet_fbcon_kick(bool force)
++#define FBCON_PP0_DONE  (1u << 8)
++static volatile uint32_t *fbcon_intr;   /* MDP INTR_STATUS; CLEAR is the next word */
++uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
++
++static bool
++fbcon_try_kick(void)
+ {
++	static uint32_t lock;
+ 	static uint64_t last;
++	static bool pending = true;     /* the shim's last frame may still be out */
+ 
+-	if (fbcon_kickoff == NULL) {
+-		return;
++	if (!os_atomic_cmpxchg(&lock, 0u, 1u, acquire)) {
++		return false;
+ 	}
+ 	uint64_t now = mach_absolute_time();
+-	if (!force && now - last < gPEClockFrequencyInfo.timebase_frequency_hz / 50) {
++	bool ok = !pending;
++	if (pending && fbcon_intr != NULL && (*fbcon_intr & FBCON_PP0_DONE)) {
++		ok = true;
++		sweet_fbcon_stat_done++;
++	} else if (pending && now - last >= gPEClockFrequencyInfo.timebase_frequency_hz / 20) {
++		ok = true;
++		sweet_fbcon_stat_timeout++;
++	}
++	if (ok) {
++		if (fbcon_intr != NULL) {
++			fbcon_intr[1] = FBCON_PP0_DONE;
++		}
++		__builtin_arm_dsb(DSB_SY);
++		*fbcon_kickoff = 1;
++		last = now;
++		pending = true;
++		sweet_fbcon_stat_kicks++;
++	}
++	os_atomic_store(&lock, 0u, release);
++	return ok;
++}
++
++void
++sweet_fbcon_kick(bool force)
++{
++	if (fbcon_kickoff == NULL) {
+ 		return;
+ 	}
+-	last = now;
+-	__builtin_arm_dsb(DSB_SY);
+-	*fbcon_kickoff = 1;
++	while (!fbcon_try_kick() && force) {
++		delay(500);
++	}
+ }
+ 
+ static void
+@@ -885,6 +921,12 @@
+ 		if (page != 0) {
+ 			fbcon_kickoff = (volatile uint32_t *)(page + (*kick & PAGE_MASK));
+ 		}
++		/* MDP top (mdss base + 0x1000) INTR_STATUS +0x14, CLEAR +0x18 */
++		uint64_t intr = (*kick & ~0xffffull) + 0x1014;
++		page = ml_io_map(trunc_page_64(intr), PAGE_SIZE);
++		if (page != 0) {
++			fbcon_intr = (volatile uint32_t *)(page + (intr & PAGE_MASK));
++		}
+ 	}
+ 	fbcon_base = (volatile uint8_t *)ml_io_map_wcomb(reg[0], reg[1]);
+ 	sweet_early_mark(18, "fbcon mapping returned");
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -33,6 +33,7 @@
+ extern struct processor *cpu_to_processor(int cpu);
+ extern struct processor *thread_bind(struct processor *processor);
+ extern uint64_t sweet_fb_stat_swaps, sweet_fb_stat_presents, sweet_fb_stat_present_abs;
++extern uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
+ void sweet_perf_init(void);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -264,6 +265,8 @@
+ 		    ms ? ds * 1000 / ms : 0, ms ? ds * 10000 / ms % 10 : 0,
+ 		    ms ? dp * 1000 / ms : 0, ms ? dp * 10000 / ms % 10 : 0,
+ 		    dp ? perf_ns(dabs) / 1000 / dp : 0);
++		printf("SWEET PERF: panel kicks %llu (after done %llu, after 50 ms timeout %llu)\n",
++		    sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout);
+ 		swaps = sweet_fb_stat_swaps;
+ 		presents = sweet_fb_stat_presents;
+ 		pabs = sweet_fb_stat_present_abs;
