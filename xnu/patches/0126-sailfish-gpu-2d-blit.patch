@@ -1,0 +1,387 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -24,6 +24,12 @@
+  * (works, 0124a). The GPU stays in secure mode (TRUST_CNTL 1): writing
+  * RBBM_SECVID_TRUST_CNTL = 0 (mainline's no-zap-shader path) reset the
+  * phone; leaving it needs the zap shader loaded through TZ.
++ *
++ * sweetgpu=3 adds step 3, the 2D blitter (Mesa fd5_blitter.c emit_setup /
++ * emit_blit): after the CP test, three blits between kernel pages, checked
++ * by the CPU: RGBA8 64x64 copy, RGBA8 -> RGB888 (the panel format, alpha
++ * dropped) and a BLIT_OP_SCALE 32x32 -> 46x46 (1.44x, the AppleCLCD
++ * present() scale) into RGB888.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -77,10 +83,48 @@
+ #define R_SECVID_TSB_SIZE       0xf802
+ #define R_SECVID_TSB_CNTL       0xf803
+ #define R_SECVID_TSB_ADDR_MODE  0xf810
++#define R_RBBM_PERFCTR_GPU_BUSY_MASKED 0x046f
++#define R_RB_MODE_CNTL          0x0cc6
++#define R_PC_DBG_ECO_CNTL       0x0d00
++#define R_VPC_DBG_ECO_CNTL      0x0e60
++#define R_UCHE_MODE_CNTL        0x0e81
++#define R_UCHE_WRITE_THRU_BASE  0x0e87
++#define R_UCHE_TRAP_BASE        0x0e89
++#define R_UCHE_GMEM_RANGE_MIN   0x0e8b
++#define R_UCHE_GMEM_RANGE_MAX   0x0e8d
++#define R_UCHE_CACHE_INVALIDATE_MIN 0x0e91
++#define R_UCHE_CACHE_WAYS       0x0e96
++#define R_SP_MODE_CNTL          0x0ec2
++#define R_HLSQ_MODE_CNTL        0x0e06
++#define R_TPL1_MODE_CNTL        0x0f02
++#define R_RB_2D_BLIT_CNTL       0x2100
++#define R_RB_2D_SRC_INFO        0x2107
++#define R_RB_2D_DST_INFO        0x2110
++#define R_GRAS_2D_BLIT_CNTL     0x2180
++#define R_GRAS_2D_SRC_INFO      0x2181
++#define R_GRAS_2D_DST_INFO      0x2182
++#define R_UNKNOWN_2184          0x2184
++#define R_GRAS_CL_CNTL          0xe000
++#define R_RB_CNTL               0xe140
++#define R_RB_RENDER_CNTL        0xe141
++/* a5xx_color_fmt */
++#define RB5_R8G8B8A8_UNORM      0x30
++#define RB5_R8G8B8_UNORM        0x31
+ /* adreno_pm4.xml opcodes */
+ #define CP_NOP                  0x10
+ #define CP_MEM_WRITE            0x3d
+ #define CP_ME_INIT              0x48
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_BLIT                 0x2c
++#define CP_EVENT_WRITE          0x46
++#define CP_SET_RENDER_MODE      0x6c
++#define BLIT2D                  5
++#define BLIT2DSCALE             7
++#define END2D                   8
++#define BLIT_OP_COPY            1
++#define BLIT_OP_SCALE           3
++#define CACHE_FLUSH_TS          0x04
++#define PC_CCU_FLUSH_COLOR_TS   0x1d
+ 
+ static int gpu_chan;
+ 
+@@ -166,7 +210,23 @@
+ 	return (7u << 28) | cnt | (parity(cnt) << 15) | ((op & 0x7fu) << 16) | (parity(op) << 23);
+ }
+ 
++static uint32_t
++pkt4(uint32_t reg, uint32_t cnt)
++{
++	return (4u << 28) | cnt | (parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (parity(reg) << 27);
++}
++
++/* The ring (one 16 KB page, never wraps in these tests). */
++static uint32_t *rb, rb_n;
++static uint64_t rb_pa;
++
+ static void
++emit(uint32_t v)
++{
++	rb[rb_n++] = v;
++}
++
++static void
+ gw(vm_offset_t gpu, uint32_t reg, uint32_t v)
+ {
+ 	wr(gpu, reg * 4, v);
+@@ -286,11 +346,168 @@
+ 	vm_offset_t cb = smmu + 0x8000;
+ 	printf("SWEET GPU: %s SMMU sGFSR %08x CB0 FSR %08x FAR %08x%08x FSYNR0 %08x\n", when,
+ 	    rd(smmu, 0x48), rd(cb, 0x58), rd(cb, 0x64), rd(cb, 0x60), rd(cb, 0x68));
++}
++
++/* Submit everything emitted so far; true once the CP has read it all. */
++static bool
++kick(vm_offset_t gpu)
++{
++	flush_dcache64((addr64_t)rb_pa, PAGE_SIZE, TRUE);
++	gw(gpu, R_CP_RB_WPTR, rb_n);
++	for (unsigned ms = 0; ms < 200; ms++) {
++		if (gr(gpu, R_CP_RB_RPTR) == rb_n) {
++			return true;
++		}
++		delay(1000);
++	}
++	return false;
+ }
+ 
++/* Mesa fd5_blitter.c: one 2D blit, then flush the CCU/UCHE and write fence. */
++static void
++emit_blit(uint32_t op, uint32_t sfmt, uint64_t src, uint32_t spitch, uint32_t sw, uint32_t sh,
++    uint32_t dfmt, uint64_t dst, uint32_t dpitch, uint32_t dw, uint32_t dh, uint64_t fence, uint32_t seq)
++{
++	emit(pkt4(R_UCHE_CACHE_INVALIDATE_MIN, 5));
++	emit(0); emit(0); emit(0); emit(0);
++	emit(0x12);                             /* UCHE_CACHE_INVALIDATE */
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	/* emit_setup */
++	emit(pkt4(R_RB_RENDER_CNTL, 1)); emit(0x8);
++	emit(pkt4(R_RB_2D_BLIT_CNTL, 1)); emit(0x86000000);
++	emit(pkt4(R_GRAS_2D_BLIT_CNTL, 1)); emit(0x86000000);
++	emit(pkt4(R_UNKNOWN_2184, 1)); emit(0x9);
++	emit(pkt4(R_RB_CNTL, 1)); emit(1u << 17);       /* BYPASS */
++	emit(pkt4(R_RB_MODE_CNTL, 1)); emit(0x4);
++	emit(pkt4(R_SP_MODE_CNTL, 1)); emit(0xc);
++	emit(pkt4(R_TPL1_MODE_CNTL, 1)); emit(0x344);
++	emit(pkt4(R_HLSQ_MODE_CNTL, 1)); emit(0x2);
++	emit(pkt4(R_GRAS_CL_CNTL, 1)); emit(0x181);
++	/* emit_blit; linear, swap WZYX, size = pitch | array pitch, in 64-byte units */
++	emit(pkt7(CP_SET_RENDER_MODE, 1)); emit(op == BLIT_OP_SCALE ? BLIT2DSCALE : BLIT2D);
++	emit(pkt4(R_RB_2D_SRC_INFO, 9));
++	emit(sfmt);
++	emit((uint32_t)src); emit((uint32_t)(src >> 32));
++	emit((spitch >> 6) | (((spitch * sh) >> 6) << 16));
++	emit(0); emit(0); emit(0); emit(0); emit(0);
++	emit(pkt4(R_GRAS_2D_SRC_INFO, 1)); emit(sfmt);
++	emit(pkt4(R_RB_2D_DST_INFO, 9));
++	emit(dfmt);
++	emit((uint32_t)dst); emit((uint32_t)(dst >> 32));
++	emit((dpitch >> 6) | (((dpitch * dh) >> 6) << 16));
++	emit(0); emit(0); emit(0); emit(0); emit(0);
++	emit(pkt4(R_GRAS_2D_DST_INFO, 1)); emit(dfmt);
++	emit(pkt7(CP_BLIT, 5));
++	emit(op);
++	emit(0);                                /* SRC_X1/Y1 */
++	emit((sw - 1) | ((sh - 1) << 16));      /* SRC_X2/Y2 */
++	emit(0);                                /* DST_X1/Y1 */
++	emit((dw - 1) | ((dh - 1) << 16));      /* DST_X2/Y2 */
++	emit(pkt7(CP_SET_RENDER_MODE, 1)); emit(END2D);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(pkt7(CP_EVENT_WRITE, 4)); emit(PC_CCU_FLUSH_COLOR_TS);
++	emit((uint32_t)fence); emit((uint32_t)(fence >> 32)); emit(0);
++	emit(pkt7(CP_EVENT_WRITE, 4)); emit(CACHE_FLUSH_TS);
++	emit((uint32_t)fence); emit((uint32_t)(fence >> 32)); emit(seq);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++}
++
++/* Source pixel (x, y) of the RGBA8 test pattern, byte c. */
++static uint8_t
++pat(uint32_t x, uint32_t y, uint32_t c)
++{
++	return (uint8_t)(c == 0 ? x * 4 + 1 : c == 1 ? y * 4 + 2 : c == 2 ? (x + y) * 2 + 3 : 0x80);
++}
++
++/* Step 3: three 2D blits (see the header). */
++static void
++blit_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
++{
++	vm_offset_t sva, d1va, d2va, d3va;
++	uint64_t src = gpu_page(&sva), d1 = gpu_page(&d1va), d2 = gpu_page(&d2va), d3 = gpu_page(&d3va);
++	if (src == 0 || d1 == 0 || d2 == 0 || d3 == 0) {
++		printf("SWEET GPU: no blit pages\n");
++		return;
++	}
++	uint8_t *s = (uint8_t *)sva, *o1 = (uint8_t *)d1va, *o2 = (uint8_t *)d2va, *o3 = (uint8_t *)d3va;
++	for (uint32_t y = 0; y < 64; y++) {
++		for (uint32_t x = 0; x < 64; x++) {
++			for (uint32_t c = 0; c < 4; c++) {
++				s[y * 256 + x * 4 + c] = pat(x, y, c);
++			}
++		}
++	}
++	flush_dcache64((addr64_t)src, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)d1, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)d2, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)d3, PAGE_SIZE, TRUE);
++	uint64_t fence = scratch + 16;
++	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 16);
++	printf("SWEET GPU: blit pages src %llx dst %llx %llx %llx\n", src, d1, d2, d3);
++
++	static const char *const name[3] = {"copy RGBA8 64x64", "RGBA8 -> RGB888 64x64", "scale RGBA8 32x32 -> RGB888 46x46"};
++	for (uint32_t t = 0; t < 3; t++) {
++		gpu_wait(2);
++		if (t == 0) {
++			emit_blit(BLIT_OP_COPY, RB5_R8G8B8A8_UNORM, src, 256, 64, 64,
++			    RB5_R8G8B8A8_UNORM, d1, 256, 64, 64, fence, 0x100 + t);
++		} else if (t == 1) {
++			emit_blit(BLIT_OP_COPY, RB5_R8G8B8A8_UNORM, src, 256, 64, 64,
++			    RB5_R8G8B8_UNORM, d2, 192, 64, 64, fence, 0x100 + t);
++		} else {
++			emit_blit(BLIT_OP_SCALE, RB5_R8G8B8A8_UNORM, src, 256, 32, 32,
++			    RB5_R8G8B8_UNORM, d3, 192, 46, 46, fence, 0x100 + t);
++		}
++		bool read = kick(gpu);
++		delay(5000);
++		flush_dcache64((addr64_t)scratch, 64, TRUE);
++		flush_dcache64((addr64_t)d1, PAGE_SIZE, TRUE);
++		flush_dcache64((addr64_t)d2, PAGE_SIZE, TRUE);
++		flush_dcache64((addr64_t)d3, PAGE_SIZE, TRUE);
++		uint32_t bad = 0, nonzero = 0, first = ~0u;
++		for (uint32_t y = 0; y < 64; y++) {
++			for (uint32_t x = 0; x < 64; x++) {
++				for (uint32_t c = 0; c < 4; c++) {
++					uint32_t got, want;
++					if (t == 0) {
++						got = o1[y * 256 + x * 4 + c];
++						want = pat(x, y, c);
++					} else if (t == 1 && c < 3) {
++						got = o2[y * 192 + x * 3 + c];
++						want = pat(x, y, c);
++					} else if (t == 2 && c < 3 && x < 46 && y < 46) {
++						/* nearest; the GPU may sample at pixel centres, so only count */
++						got = o3[y * 192 + x * 3 + c];
++						want = pat(x * 32 / 46, y * 32 / 46, c);
++					} else {
++						continue;
++					}
++					nonzero += got != 0;
++					if (got != want) {
++						if (bad++ == 0) {
++							first = (y << 16) | (x << 4) | c;
++						}
++					}
++				}
++			}
++		}
++		uint8_t *o = t == 0 ? o1 : t == 1 ? o2 : o3;
++		cp_state(gpu, read ? "blit read:" : "blit NOT read (200 ms):");
++		smmu_faults(smmu, "after blit:");
++		printf("SWEET GPU: blit %s: fence %x (want %x), %u nonzero, %u mismatches (first y %u x %u c %u); "
++		    "dst[0..7] %02x %02x %02x %02x %02x %02x %02x %02x -> %s\n",
++		    name[t], *fv, 0x100 + t, nonzero, bad, first >> 16, (first >> 4) & 0xfff, first & 0xf,
++		    o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7],
++		    bad == 0 ? "GPU 2D BLIT WORKS" : nonzero ? "partly written" : "nothing written");
++		if (!read) {
++			return;
++		}
++	}
++}
++
+ /* Step 2: command processor. */
+ static void
+-cp_test(vm_offset_t gpu)
++cp_test(vm_offset_t gpu, int level)
+ {
+ 	uint64_t pm4, pfp;
+ 	uint32_t pm4_len, pfp_len;
+@@ -302,36 +519,47 @@
+ 	if (smmu == 0) {
+ 		return;
+ 	}
+-	uint32_t cr0 = rd(smmu, 0);
+ 	printf("SWEET GPU: SMMU sCR0 %08x IDR0 %08x IDR1 %08x SMR0 %08x S2CR0 %08x CB0 SCTLR %08x\n",
+-	    cr0, rd(smmu, 0x20), rd(smmu, 0x24), rd(smmu, 0x800), rd(smmu, 0xc00), rd(smmu, 0x8000));
+-	(void)cr0;
++	    rd(smmu, 0), rd(smmu, 0x20), rd(smmu, 0x24), rd(smmu, 0x800), rd(smmu, 0xc00), rd(smmu, 0x8000));
+ 	if (!smmu_identity(smmu)) {
+ 		printf("SWEET GPU: no GPU memory access without the SMMU set up, stop\n");
+ 		return;
+ 	}
+ 	vm_offset_t ring_va, scratch_va;
+-	uint64_t ring = gpu_page(&ring_va), scratch = gpu_page(&scratch_va);
+-	if (ring == 0 || scratch == 0) {
++	uint64_t scratch = gpu_page(&scratch_va);
++	rb_pa = gpu_page(&ring_va);
++	if (rb_pa == 0 || scratch == 0) {
+ 		printf("SWEET GPU: no ring/scratch page\n");
+ 		return;
+ 	}
++	rb = (uint32_t *)ring_va;
+ 	printf("SWEET GPU: pm4 %llx (%u) pfp %llx (%u) ring %llx scratch %llx\n",
+-	    pm4, pm4_len, pfp, pfp_len, ring, scratch);
++	    pm4, pm4_len, pfp, pfp_len, rb_pa, scratch);
+ 	flush_dcache64((addr64_t)pm4, pm4_len, TRUE);
+ 	flush_dcache64((addr64_t)pfp, pfp_len, TRUE);
+ 	gpu_wait(11);
+ 
+-	/* Subset of a5xx_hw_init (A530 values). */
++	/* Subset of a5xx_hw_init (A530 values; HWCG, GPMU, CP_PROTECT left out). */
+ 	gw(gpu, R_VBIF_RR_QOS_ARB, 3);
++	gw(gpu, R_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
+ 	gw(gpu, R_RBBM_AHB_CNTL0, 1);
++	gw(gpu, R_UCHE_CACHE_WAYS, 2);
++	gw64(gpu, R_UCHE_TRAP_BASE, 0x0001ffffffff0000ull);
++	gw64(gpu, R_UCHE_WRITE_THRU_BASE, 0x0001ffffffff0000ull);
++	gw64(gpu, R_UCHE_GMEM_RANGE_MIN, 0x00100000);
++	gw64(gpu, R_UCHE_GMEM_RANGE_MAX, 0x00100000 + 0x100000 - 1);   /* 1 MB GMEM */
+ 	gw(gpu, R_CP_MEQ_THRESHOLDS, 0x40);
+ 	gw(gpu, R_CP_MERCIU_SIZE, 0x40);
+ 	gw(gpu, R_CP_ROQ_THRESHOLDS_2, 0x80000060);
+ 	gw(gpu, R_CP_ROQ_THRESHOLDS_1, 0x40201b16);
++	gw(gpu, R_PC_DBG_ECO_CNTL, (0x400u << 11) | (0x300u << 22));
++	gw(gpu, R_UCHE_MODE_CNTL, 1u << 29);
+ 	gw(gpu, R_CP_CHICKEN_DBG, 0x02000000);
+ 	gw(gpu, R_RBBM_AHB_CNTL1, 0xa6ffffff);
+ 	gw(gpu, R_RBBM_AHB_CNTL2, 0x3f);
++	gw(gpu, R_TPL1_MODE_CNTL, 2u << 7);     /* highest bank bit 15 */
++	gw(gpu, R_RB_MODE_CNTL, 2u << 1);
++	gw(gpu, R_VPC_DBG_ECO_CNTL, gr(gpu, R_VPC_DBG_ECO_CNTL) | (1u << 10));
+ 	gw(gpu, R_SECVID_TSB_CNTL, 0);
+ 	gw64(gpu, R_SECVID_TSB_BASE, 0);
+ 	gw(gpu, R_SECVID_TSB_SIZE, 0);
+@@ -339,42 +567,41 @@
+ 	gw(gpu, R_SECVID_TSB_ADDR_MODE, 1);
+ 	gw64(gpu, R_CP_ME_INSTR_BASE, pm4);
+ 	gw64(gpu, R_CP_PFP_INSTR_BASE, pfp);
+-	gw64(gpu, R_CP_RB_BASE, ring);
++	gw64(gpu, R_CP_RB_BASE, rb_pa);
+ 	/* BUFSZ log2(16 KB / 8) = 11, BLKSZ log2(32 / 8) = 2 (mainline), NO_UPDATE */
+ 	gw(gpu, R_CP_RB_CNTL, 11u | (2u << 8) | (1u << 27));
+ 	cp_state(gpu, "before ME start:");
+ 
+-	uint32_t *rb = (uint32_t *)ring_va, n = 0;
+-	rb[n++] = pkt7(CP_ME_INIT, 8);
+-	rb[n++] = 0x2f;
+-	rb[n++] = 0x3;
+-	rb[n++] = 0x20000000;
+-	rb[n++] = 0;
+-	rb[n++] = 0;
+-	rb[n++] = 0xb;          /* A530 token-end-sync workaround */
+-	rb[n++] = 0;
+-	rb[n++] = 0;
+-	rb[n++] = pkt7(CP_MEM_WRITE, 3);
+-	rb[n++] = (uint32_t)scratch;
+-	rb[n++] = (uint32_t)(scratch >> 32);
+-	rb[n++] = 0xc0ffee01;
+-	rb[n++] = pkt7(CP_NOP, 0);
+-	flush_dcache64((addr64_t)ring, PAGE_SIZE, TRUE);
++	rb_n = 0;
++	emit(pkt7(CP_ME_INIT, 8));
++	emit(0x2f);
++	emit(0x3);
++	emit(0x20000000);
++	emit(0);
++	emit(0);
++	emit(0xb);              /* A530 token-end-sync workaround */
++	emit(0);
++	emit(0);
++	emit(pkt7(CP_MEM_WRITE, 3));
++	emit((uint32_t)scratch);
++	emit((uint32_t)(scratch >> 32));
++	emit(0xc0ffee01);
++	emit(pkt7(CP_NOP, 0));
+ 	flush_dcache64((addr64_t)scratch, PAGE_SIZE, TRUE);
+ 
+ 	gw(gpu, R_CP_PFP_ME_CNTL, 0);   /* clear ME_HALT */
+-	gw(gpu, R_CP_RB_WPTR, n);
+-	unsigned ms;
+-	for (ms = 0; ms < 200 && gr(gpu, R_CP_RB_RPTR) != n; ms++) {
+-		delay(1000);
+-	}
++	bool read = kick(gpu);
+ 	delay(1000);
+ 	flush_dcache64((addr64_t)scratch, 64, TRUE);
+ 	uint32_t got = *(volatile uint32_t *)scratch_va;
+-	cp_state(gpu, ms < 200 ? "ring consumed:" : "ring NOT consumed (200 ms):");
++	cp_state(gpu, read ? "ring consumed:" : "ring NOT consumed (200 ms):");
+ 	smmu_faults(smmu, "after ring:");
+ 	printf("SWEET GPU: scratch %08x -> %s\n", got,
+ 	    got == 0xc0ffee01 ? "CP_MEM_WRITE landed: COMMAND PROCESSOR WORKS" : "no write");
++	if (level >= 3 && read && got == 0xc0ffee01) {
++		gpu_wait(11);
++		blit_test(gpu, smmu, scratch_va, scratch);
++	}
+ }
+ 
+ static void
+@@ -474,7 +701,7 @@
+ 	    vbif, status, aon0, aon1, aon1 != aon0 ? "counting: GPU alive" : "not counting");
+ 	if ((int)(uintptr_t)arg >= 2 && aon1 != aon0) {
+ 		gpu_wait(11);
+-		cp_test(gpu);
++		cp_test(gpu, (int)(uintptr_t)arg);
+ 	}
+ }
+ 
