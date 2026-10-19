@@ -1,0 +1,307 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -1,8 +1,14 @@
+ /*
+- * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+- * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+- * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+- * See report.md for binary evidence, register provenance and integration.
++ * Built-in iOS battery service for the Pixel 1, read-only PMI8994 (SID 2)
++ * polling every 30 s (Linux qpnp-fg.c / qpnp-smbcharger.c):
++ *   percent   FG_SOC 0x4009 SOC_MONOTONIC_SOC (0x400a shadow), as Linux
++ *             get_prop_capacity
++ *   plugged   USB_CHGPTH RT_STS 0x1310 SRC_DET and not OV, INPUT_STS 0x130d
++ *   charging  CHGR RT_STS 0x1010 (TCC / inhibit = full), CHGR_STS 0x100e
++ *             charge type (none/pre/fast/taper), hold-off = not charging
++ * Voltage and current live in FG SRAM (memif, needs writes): not read.
++ * Until the PMIC is readable (sweet_keys_init runs later): 100%, AC.
++ * Boot-arg sweetbattery=0: static fallback only.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -12,10 +18,11 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+-/* bsd/dev/sweet_spmi.c */
+-extern "C" int sweet_spmi_init(void);
+-extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/sweet_keys.c */
++extern "C" bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+ 
++#define SWEET_BATTERY_MAH       2770    /* Pixel 1 */
++
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+ public:
+@@ -28,6 +35,7 @@
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	uint8_t fLastRegs[6];
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -35,8 +43,7 @@
+ 	void poll(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+-	static bool readWord(unsigned address, uint16_t *value);
+-	static unsigned estimatePercent(unsigned mv);
++	static bool reg(uint16_t address, uint8_t *value);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
+@@ -72,6 +79,7 @@
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fLastRegs[5] = 0xff;
+ 	return true;
+ }
+ 
+@@ -101,11 +109,11 @@
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (Pixel 1: 2770 mAh). powerd computes C*100/M. */
++	const unsigned capacity = (SWEET_BATTERY_MAH * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(SWEET_BATTERY_MAH);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,8 +127,8 @@
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", SWEET_BATTERY_MAH);
++	putNumber("DesignCapacity", SWEET_BATTERY_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -137,7 +145,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, SWEET_BATTERY_MAH, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -154,96 +162,63 @@
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    measured ? "PMI8994 fuel gauge" : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+ }
+ 
+-/* Keep the proven single-byte observer command. Read two matching whole
+- * words to reject most torn ADC samples without writing the QG HOLD bit.
+- * This is a bounded consistency check, not a hardware snapshot guarantee. */
+ bool
+-SweetBattery::readWord(unsigned address, uint16_t *value)
++SweetBattery::reg(uint16_t address, uint8_t *value)
+ {
+-	uint16_t previous = 0;
+-	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+-		uint8_t lo, hi;
+-		if (sweet_spmi_read(0, address, &lo) ||
+-		    sweet_spmi_read(0, address + 1, &hi)) {
+-			return false;
+-		}
+-		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+-		if (attempt && next == previous) {
+-			*value = next;
+-			return true;
+-		}
+-		previous = next;
+-	}
+-	return false;
+-}
+-
+-unsigned
+-SweetBattery::estimatePercent(unsigned mv)
+-{
+-	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
+-	 * Load sag, temperature, aging and charging introduce large errors. */
+-	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
+-	    4000, 4100, 4200, 4350};
+-	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
+-	if (mv <= volts[0]) {
+-		return soc[0];
+-	}
+-	for (unsigned i = 1; i < sizeof(volts) / sizeof(volts[0]); ++i) {
+-		if (mv < volts[i]) {
+-			return soc[i - 1] + (mv - volts[i - 1]) * (soc[i] - soc[i - 1]) /
+-			       (volts[i] - volts[i - 1]);
+-		}
+-	}
+-	return 100;
++	return sweet_pmic_read((uint16_t)(0x200 | (address >> 8)), (uint8_t)address, value);
+ }
+ 
+ void
+ SweetBattery::poll(void)
+ {
+-	uint8_t type, present, usb, path, charger, error, temperature;
+-	uint16_t rawVoltage;
+-	bool valid = fReal &&
+-	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
+-	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
+-	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
+-	    !sweet_spmi_read(0, 0x1310, &usb) &&
+-	    !sweet_spmi_read(0, 0x110b, &path) &&
+-	    !sweet_spmi_read(0, 0x1006, &charger) &&
+-	    !sweet_spmi_read(0, 0x1007, &error) &&
+-	    !sweet_spmi_read(0, 0x100d, &temperature);
+-	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
+-	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+-	valid = valid && mv >= 2800 && mv <= 4600;
++	uint8_t soc, shadow, usb, input, chgr_rt, chgr;
++	bool valid = fReal;
++	/* Linux get_monotonic_soc_raw: the two copies must match. */
++	for (int i = 0; valid && i < 5; i++) {
++		valid = reg(0x4009, &soc) && reg(0x400a, &shadow);
++		if (valid && soc == shadow) {
++			break;
++		}
++		valid = valid && i < 4;
++	}
++	valid = valid && reg(0x1310, &usb) && reg(0x130d, &input) &&
++	    reg(0x1010, &chgr_rt) && reg(0x100e, &chgr);
+ 	if (!valid) {
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
+ 	}
+-	bool external = (usb & 0x10u) != 0;
+-	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+-	unsigned state = charger & 7u;
+-	bool charging = capable && state >= 1 && state <= 4 &&
+-	    !(error & 2u) && !(temperature & 0x0cu);
+-	/* Inhibit (0) does not by itself establish full capacity. */
+-	bool full = external && state == 5 && !(error & 2u);
+-	int ma = 0;
+-	uint8_t subtype;
+-	uint16_t rawCurrent;
+-	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
+-	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
+-	    rawCurrent != 0x8000;
+-	if (currentValid) {
+-		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+-		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+-		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
++	unsigned percent = soc == 0xff ? 100 : soc == 0 ? 0 :
++	    ((unsigned)(soc - 1) * 98 + 126) / 253 + 1;
++	bool external = (usb & 0x04u) && !(usb & 0x02u) && (input & 0x38u);
++	bool full = external && (chgr_rt & 0x82u);
++	bool charging = external && !full && !(chgr & 0x08u) && ((chgr >> 1) & 3u) != 0;
++	if (fLastRegs[5] == 0xff) {
++		/* Charger setup as left by the bootloader (for the charging work). */
++		static const uint16_t cfg[] = {0x1340, 0x13f2, 0x13f4, 0x1307, 0x1309,
++		    0x1308, 0x10f2, 0x10f4, 0x10fc, 0x100c, 0x1242, 0x1208, 0x1210, 0x1610};
++		char line[256];
++		int m = snprintf(line, sizeof(line), "SWEET BATTERY: cfg");
++		for (unsigned i = 0; i < sizeof(cfg) / sizeof(cfg[0]); i++) {
++			uint8_t v = 0;
++			bool ok = reg(cfg[i], &v);
++			m += snprintf(line + m, sizeof(line) - m, ok ? " %04x=%02x" : " %04x=??", cfg[i], v);
++		}
++		IOLog("%s\n", line);
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+-	    charging, full, true, currentValid);
++	uint8_t regs[6] = {soc, usb, input, chgr_rt, chgr, 0};
++	if (memcmp(regs, fLastRegs, sizeof(regs)) != 0) {
++		IOLog("SWEET BATTERY: soc 0x%02x = %u%% usb rt 0x%02x input 0x%02x chgr rt 0x%02x sts 0x%02x -> external %d charging %d full %d\n",
++		    soc, percent, usb, input, chgr_rt, chgr, external, charging, full);
++		memcpy(fLastRegs, regs, sizeof(regs));
++	}
++	/* The 3.7 V nominal: the real voltage is in FG SRAM. */
++	publish(percent, 3700, 0, external, external, charging, full, true, false);
+ }
+ 
+ void
+@@ -262,9 +237,9 @@
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	int real = 1;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	fReal = real != 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -16,6 +16,7 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -100,27 +101,39 @@
+ 
+ /*
+  * Read-only PMIC register access for other drivers (after sweet_keys_init),
+- * ppid = SID << 8 | peripheral. ponytail: maps the observer page on every
+- * call (io map space is small); fine for a few reads at boot, cache the
+- * mapping before polling.
++ * ppid = SID << 8 | peripheral. Observer pages are mapped once per
++ * peripheral (io map space is small); 8 peripherals at most.
+  */
++static LCK_GRP_DECLARE(sweet_pmic_grp, "sweet_pmic");
++static LCK_MTX_DECLARE(sweet_pmic_lock, &sweet_pmic_grp);
++
+ bool
+ sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out)
+ {
+-	static vm_offset_t obs;
+-	static uint16_t obs_ppid = KEYS_NO_APID;
++	static vm_offset_t obs[8];
++	static uint16_t obs_ppid[8];
++	static unsigned obs_n;
++	bool ok = false;
+ 	if (keys_core == 0 || keys_cnfg == 0) {
+ 		return false;
+ 	}
+-	if (obs == 0 || obs_ppid != ppid) {
++	lck_mtx_lock(&sweet_pmic_lock);
++	unsigned i;
++	for (i = 0; i < obs_n && obs_ppid[i] != ppid; i++) {
++	}
++	if (i == obs_n && i < 8) {
+ 		uint16_t apid = keys_find_apid(ppid);
+-		if (apid == KEYS_NO_APID) {
+-			return false;
++		obs[i] = apid == KEYS_NO_APID ? 0 : ml_io_map(KEYS_OBS_PA + 0x8000u * apid, 0x1000);
++		if (obs[i] != 0) {
++			obs_ppid[i] = ppid;
++			obs_n++;
+ 		}
+-		obs = ml_io_map(KEYS_OBS_PA + 0x8000u * apid, 0x1000);
+-		obs_ppid = ppid;
+ 	}
+-	return obs != 0 && keys_obs_read(obs, addr, out);
++	if (i < obs_n) {
++		ok = keys_obs_read(obs[i], addr, out);
++	}
++	lck_mtx_unlock(&sweet_pmic_lock);
++	return ok;
+ }
+ 
+ static vm_offset_t
