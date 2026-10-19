@@ -22,6 +22,12 @@ screen (image versions v8-v14 in NOTES.md):
                   runs once on first boot (it registers the app extensions;
                   without it no wallpapers or widgets). Skipping it via
                   LastSystemVersion left LaunchServices with 1 of 524 appex.
+  feature flags   ExtensionKit enforce_xpc_cache_code_signing off: the
+                  extension point definitions (System/Library/xpc/extensions.plist)
+                  are read through their detached .sig, which needs trust
+                  caches our kernel does not have; without them every app
+                  extension (wallpapers, widgets, ...) is rejected by installd
+                  ("does not correspond to a known extension point")
   audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
@@ -114,6 +120,14 @@ def activation(root):
     print('data ark', d)
 
 
+def feature_flags(root):
+    d = os.path.join(root, 'private/var/preferences/FeatureFlags/Domain')
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, 'ExtensionKit.plist')
+    save(path, {'enforce_xpc_cache_code_signing': {'Enabled': False}}, 0, 0, 0o644, plistlib.FMT_XML)
+    print('feature flag ExtensionKit/enforce_xpc_cache_code_signing off')
+
+
 def audio(root):
     src = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
     dst_dir = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
@@ -136,6 +150,7 @@ def main():
     launchd(root)
     containers(root)
     activation(root)
+    feature_flags(root)
     audio(root)
     sentinel = os.path.join(root, 'private/var/datamigrator/migrate')
     os.makedirs(os.path.dirname(sentinel), exist_ok=True)
