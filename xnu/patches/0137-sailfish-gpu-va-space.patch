@@ -1,0 +1,309 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -59,6 +59,14 @@
+  * bilinear sample through the texture unit, opacity, source-over), checked
+  * against integer CPU references: an identity placement and a 2x upscale at
+  * opacity 0.5.
++ *
++ * GPU address space (for buffers that are not physically contiguous, like
++ * IOSurfaces and user memory): context bank 0's L1 entries 8-15 point to L2
++ * tables, so GPU VA 8-16 GB is mapped with 4 KB pages, handed out in 2 MB
++ * chunks (sweet_gpu_vm_map / sweet_gpu_vm_unmap; the identity map below
++ * 8 GB stays for the kernel's own buffers). sweetgpu=7 brings the GPU up
++ * (CP, zap shader, non-secure) and runs the textured-quad checks on
++ * non-contiguous kernel memory through GPU VAs.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -66,6 +74,7 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/locks.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <arm/caches_internal.h>
+@@ -293,14 +302,16 @@
+ 	return (4u << 28) | cnt | (parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (parity(reg) << 27);
+ }
+ 
+-/* The ring (one 16 KB page, never wraps in these tests). */
++/* The ring: one 16 KB page (4096 dwords), wraps; rb_n is the next slot. */
++#define RB_DWORDS       4096u
+ static uint32_t *rb, rb_n;
+ static uint64_t rb_pa;
+ 
+ static void
+ emit(uint32_t v)
+ {
+-	rb[rb_n++] = v;
++	rb[rb_n] = v;
++	rb_n = (rb_n + 1) & (RB_DWORDS - 1);
+ }
+ 
+ static void
+@@ -382,6 +393,8 @@
+ 	wr(base, off, val); \
+ } while (0)
+ 
++static uint64_t *g_l1, g_l1_pa;  /* context bank 0 L1 table (64 x 1 GB) */
++
+ static bool
+ smmu_identity(vm_offset_t smmu)
+ {
+@@ -393,6 +406,8 @@
+ 	}
+ 	printf("SWEET GPU: page table at %llx\n", pt);
+ 	uint64_t *l1 = (uint64_t *)pt_va;
++	g_l1 = l1;
++	g_l1_pa = pt;
+ 	for (uint64_t gb = 2; gb < 8; gb++) {
+ 		/* block | AttrIndx 0 | AP[1] (EL0 too) | SH outer | AF */
+ 		l1[gb] = (gb << 30) | 1u | (1u << 6) | (2u << 8) | (1u << 10);
+@@ -694,8 +709,140 @@
+ 		    bad == 0 ? "GPU 2D BLIT WORKS" : nonzero ? "partly written" : "nothing written");
+ 		if (!read) {
+ 			return;
++		}
++	}
++}
++
++/*
++ * GPU VA window 8-16 GB: L1[8..15] -> L2 (512 x 2 MB) -> L3 (512 x 4 KB).
++ * L2/L3 tables are 4 KB, carved from 16 KB pages; L3 tables are allocated
++ * on first use of a 2 MB chunk and kept. A mapping takes whole chunks.
++ */
++#define GVA_BASE        0x200000000ull
++#define GVA_CHUNKS      4096u                   /* 8 GB / 2 MB */
++#define PTE_ATTRS       ((1u << 6) | (2u << 8) | (1u << 10))    /* AP[1], SH outer, AF; AttrIndx 0 */
++static LCK_GRP_DECLARE(sweet_gpu_grp, "sweet_gpu");
++static LCK_MTX_DECLARE(sweet_gpu_vm_lock, &sweet_gpu_grp);
++static vm_offset_t g_smmu;
++static uint64_t *g_l2[8];
++static uint64_t *g_l3[GVA_CHUNKS];
++static uint16_t g_chunk_len[GVA_CHUNKS];        /* run length at a mapping's first chunk */
++static uint8_t g_chunk_used[GVA_CHUNKS];
++
++/* A 4 KB table from the current 16 KB pool page; *pa gets its PA. */
++static uint64_t *
++pt4k(uint64_t *pa)
++{
++	static vm_offset_t pool_va;
++	static uint64_t pool_pa;
++	static unsigned pool_left;
++	if (pool_left == 0) {
++		pool_pa = gpu_page(&pool_va);
++		if (pool_pa == 0) {
++			return NULL;
++		}
++		pool_left = PAGE_SIZE / 4096;
++	}
++	unsigned i = PAGE_SIZE / 4096 - pool_left--;
++	*pa = pool_pa + i * 4096;
++	return (uint64_t *)(pool_va + i * 4096);
++}
++
++static void
++smmu_tlb_flush(void)
++{
++	wr(g_smmu, 0x68, 0);    /* TLBIALLNSNH */
++	wr(g_smmu, 0x70, 0);    /* sTLBGSYNC */
++	(void)poll(g_smmu, 0x74, 1u, 0, 10);
++}
++
++static bool
++vm_init(vm_offset_t smmu)
++{
++	g_smmu = smmu;
++	for (unsigned gb = 0; gb < 8; gb++) {
++		uint64_t pa;
++		g_l2[gb] = pt4k(&pa);
++		if (g_l2[gb] == NULL) {
++			return false;
++		}
++		g_l1[8 + gb] = pa | 3u;                 /* table */
++	}
++	flush_dcache64((addr64_t)g_l1_pa, 4096, TRUE);
++	smmu_tlb_flush();
++	return true;
++}
++
++/*
++ * Map npages kernel pages (16 KB each, physical addresses in pa[]) at a new
++ * GPU VA; returns it, or 0 if out of VA or table memory.
++ */
++uint64_t sweet_gpu_vm_map(const uint64_t *pa, uint32_t npages);
++uint64_t
++sweet_gpu_vm_map(const uint64_t *pa, uint32_t npages)
++{
++	uint64_t bytes = (uint64_t)npages * PAGE_SIZE;
++	uint32_t n = (uint32_t)((bytes + (2u << 20) - 1) >> 21), first = 0, run = 0;
++	if (g_l1 == NULL || n == 0 || n > GVA_CHUNKS) {
++		return 0;
++	}
++	lck_mtx_lock(&sweet_gpu_vm_lock);
++	for (uint32_t c = 0; c < GVA_CHUNKS && run < n; c++) {
++		run = g_chunk_used[c] ? 0 : run + 1;
++		first = c + 1 - run;
++	}
++	if (run < n) {
++		lck_mtx_unlock(&sweet_gpu_vm_lock);
++		return 0;
++	}
++	for (uint32_t c = first; c < first + n; c++) {
++		if (g_l3[c] == NULL) {
++			uint64_t l3pa;
++			g_l3[c] = pt4k(&l3pa);
++			if (g_l3[c] == NULL) {
++				lck_mtx_unlock(&sweet_gpu_vm_lock);
++				return 0;
++			}
++			uint64_t *l2 = g_l2[c / 512];
++			l2[c % 512] = l3pa | 3u;
++			flush_dcache64((addr64_t)&l2[c % 512], 8, FALSE);
+ 		}
++		g_chunk_used[c] = 1;
++	}
++	g_chunk_len[first] = (uint16_t)n;
++	uint32_t sub = PAGE_SIZE / 4096;
++	for (uint64_t i = 0; i < (uint64_t)npages * sub; i++) {
++		uint32_t c = first + (uint32_t)(i / 512);
++		g_l3[c][i % 512] = (pa[i / sub] + (i % sub) * 4096) | 3u | PTE_ATTRS;
++	}
++	for (uint32_t c = first; c < first + n; c++) {
++		flush_dcache64((addr64_t)g_l3[c], 4096, FALSE);
++	}
++	smmu_tlb_flush();
++	lck_mtx_unlock(&sweet_gpu_vm_lock);
++	return GVA_BASE + ((uint64_t)first << 21);
++}
++
++void sweet_gpu_vm_unmap(uint64_t va);
++void
++sweet_gpu_vm_unmap(uint64_t va)
++{
++	if (va < GVA_BASE || va >= GVA_BASE + ((uint64_t)GVA_CHUNKS << 21) || (va & ((2u << 20) - 1))) {
++		return;
++	}
++	uint32_t first = (uint32_t)((va - GVA_BASE) >> 21);
++	lck_mtx_lock(&sweet_gpu_vm_lock);
++	uint32_t n = g_chunk_used[first] ? g_chunk_len[first] : 0;
++	for (uint32_t c = first; c < first + n; c++) {
++		bzero(g_l3[c], 4096);
++		flush_dcache64((addr64_t)g_l3[c], 4096, FALSE);
++		g_chunk_used[c] = 0;
+ 	}
++	g_chunk_len[first] = 0;
++	if (n) {
++		smmu_tlb_flush();
++	}
++	lck_mtx_unlock(&sweet_gpu_vm_lock);
+ }
+ 
+ /* Optional dispatch state: constants, textures + samplers, 2-D grid. */
+@@ -992,12 +1139,39 @@
+  * quarters, so out = (sum16 * 255 + d * (8160 - sum16_a)) / 8160 exactly in
+  * integers (sum16 = 16x the bilinear sum; 8160 = 255 * 32); expect +-2.
+  */
++/* Kernel memory from kernel_memory_allocate (pages not contiguous), mapped at a GPU VA. */
++static uint64_t
++vm_buffer(vm_offset_t *va, uint32_t bytes)
++{
++	uint64_t pa[16];
++	uint32_t npages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
++	if (npages > 16 || kmem_alloc(kernel_map, va, npages * PAGE_SIZE, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	bool contiguous = true;
++	for (uint32_t i = 0; i < npages; i++) {
++		pa[i] = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(*va + i * PAGE_SIZE)));
++		contiguous = contiguous && (i == 0 || pa[i] == pa[i - 1] + PAGE_SIZE);
++	}
++	uint64_t gva = sweet_gpu_vm_map(pa, npages);
++	printf("SWEET GPU: vm buffer %u pages (%s) pa[0] %llx pa[1] %llx -> GPU VA %llx\n", npages,
++	    contiguous ? "contiguous" : "scattered", pa[0], npages > 1 ? pa[1] : 0, gva);
++	return gva;
++}
++
+ static void
+-sample_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
++sample_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch, bool vm)
+ {
+ 	const uint32_t W = 128, H = 128, SW = 64, SH = 64;
+ 	vm_offset_t sva, dva;
+-	uint64_t src = gpu_page(&sva), dst = gpu_alloc(&dva, W * H * 4), ks = kernel_page(&k_sample);
++	uint64_t ks = kernel_page(&k_sample), src, dst;
++	if (vm) {
++		src = vm_buffer(&sva, SW * SH * 4);
++		dst = vm_buffer(&dva, W * H * 4);
++	} else {
++		src = gpu_page(&sva);
++		dst = gpu_alloc(&dva, W * H * 4);
++	}
+ 	if (src == 0 || dst == 0 || ks == 0) {
+ 		printf("SWEET GPU: sample: no pages\n");
+ 		return;
+@@ -1014,8 +1188,8 @@
+ 			d[i] = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
+ 		}
+ 		uint32_t orig_d0 = d[0];
+-		flush_dcache64((addr64_t)src, PAGE_SIZE, TRUE);
+-		flush_dcache64((addr64_t)dst, W * H * 4, TRUE);
++		flush_dcache64((addr64_t)sva, SW * SH * 4, FALSE);
++		flush_dcache64((addr64_t)dva, W * H * 4, FALSE);
+ 		/* floats as bits: 1.0 3f800000, 0.5 3f000000, 255.0 437f0000, -16.0 c1800000 */
+ 		uint32_t x0 = t == 0 ? 16 : 0, y0 = x0, w = t == 0 ? SW : W, h = t == 0 ? SH : H;
+ 		uint32_t consts[16] = {
+@@ -1036,7 +1210,7 @@
+ 		bool read = compute_run(gpu, &k_sample, ks, bufs, sizes, (w + 63) / 64, scratch + 56, 0x600 + t, &x);
+ 		delay(5000);
+ 		flush_dcache64((addr64_t)scratch, 64, TRUE);
+-		flush_dcache64((addr64_t)dst, W * H * 4, TRUE);
++		flush_dcache64((addr64_t)dva, W * H * 4, FALSE);
+ 		uint32_t bad = 0, first = ~0u, maxdiff = 0, want_first = 0;
+ 		for (uint32_t py = 0; py < H; py++) {
+ 			for (uint32_t px = 0; px < W; px++) {
+@@ -1083,8 +1257,8 @@
+ 		}
+ 		cp_state(gpu, read ? "sample read:" : "sample NOT read (200 ms):");
+ 		smmu_faults(smmu, "after sample:");
+-		printf("SWEET GPU: sample %s: fence %x (want %x), max channel diff %u, %u bad (first [%u] = %08x want %08x, "
+-		    "d[0] %08x was %08x) -> %s\n", t == 0 ? "A identity 64x64 at (16,16)" : "B 2x upscale, opacity 0.5",
++		printf("SWEET GPU: sample%s %s: fence %x (want %x), max channel diff %u, %u bad (first [%u] = %08x want %08x, "
++		    "d[0] %08x was %08x) -> %s\n", vm ? " (GPU VA)" : "", t == 0 ? "A identity 64x64 at (16,16)" : "B 2x upscale, opacity 0.5",
+ 		    *fv, 0x600 + t, maxdiff, bad, first, first < W * H ? d[first] : 0, want_first, d[0], orig_d0,
+ 		    bad == 0 ? "GPU TEXTURED QUAD MATCHES THE CPU" : "wrong");
+ 		if (!read) {
+@@ -1168,6 +1342,7 @@
+ 	if (smmu == 0) {
+ 		return;
+ 	}
++	g_smmu = smmu;
+ 	printf("SWEET GPU: SMMU sCR0 %08x IDR0 %08x IDR1 %08x SMR0 %08x S2CR0 %08x CB0 SCTLR %08x\n",
+ 	    rd(smmu, 0), rd(smmu, 0x20), rd(smmu, 0x24), rd(smmu, 0x800), rd(smmu, 0xc00), rd(smmu, 0x8000));
+ 	if (!smmu_identity(smmu)) {
+@@ -1290,6 +1465,15 @@
+ 		printf("SWEET GPU: marker after secure-mode packet %08x (want 5ec0de00)\n",
+ 		    *(volatile uint32_t *)(scratch_va + 8));
+ 		gpu_wait(2);
++		if (level >= 7) {
++			(void)gfx_clock(3);     /* 300 MHz */
++			bool vm = vm_init(smmu);
++			printf("SWEET GPU: GPU VA window 8-16 GB %s\n", vm ? "ready" : "FAILED");
++			if (vm) {
++				sample_test(gpu, smmu, scratch_va, scratch, true);
++			}
++			return;
++		}
+ 		blit_test(gpu, smmu, scratch_va, scratch);
+ 		if (level >= 4) {
+ 			gpu_wait(2);
+@@ -1298,7 +1482,7 @@
+ 		if (level >= 6) {
+ 			gpu_wait(2);
+ 			(void)gfx_clock(3);     /* 300 MHz */
+-			sample_test(gpu, smmu, scratch_va, scratch);
++			sample_test(gpu, smmu, scratch_va, scratch, false);
+ 		} else if (level >= 5) {
+ 			gpu_wait(2);
+ 			bench_test(gpu, smmu, scratch_va, scratch);
