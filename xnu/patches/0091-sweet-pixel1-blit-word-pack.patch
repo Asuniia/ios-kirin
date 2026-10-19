@@ -1,0 +1,23 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -283,7 +283,19 @@
+ 		int32_t ly = (int32_t)(y * lh / fPanelH) - dy;
+ 		if (ly != last) {
+ 			memcpy(fRow, (const void *)(src + (uint64_t)(sy + ly) * bpr + (uint64_t)sx * 4), (size_t)w * 4);
+-			for (uint32_t i = 0; i < n; i++) {
++			/* 4 BGRA pixels -> 3 words of BGR (the byte loop took ~48 ms a frame). */
++			uint32_t i = 0;
++			uint32_t *o = (uint32_t *)fOut;
++			for (; i + 4 <= n; i += 4) {
++				uint32_t p0 = *(const uint32_t *)(fRow + fXmap[i]);
++				uint32_t p1 = *(const uint32_t *)(fRow + fXmap[i + 1]);
++				uint32_t p2 = *(const uint32_t *)(fRow + fXmap[i + 2]);
++				uint32_t p3 = *(const uint32_t *)(fRow + fXmap[i + 3]);
++				*o++ = (p0 & 0xffffffu) | (p1 << 24);
++				*o++ = ((p1 >> 8) & 0xffffu) | (p2 << 16);
++				*o++ = ((p2 >> 16) & 0xffu) | (p3 << 8);
++			}
++			for (; i < n; i++) {
+ 				const uint8_t *p = fRow + fXmap[i];
+ 				fOut[3 * i] = p[0];
+ 				fOut[3 * i + 1] = p[1];
