@@ -1,0 +1,72 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -28,6 +28,7 @@
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
++#include <sys/kauth.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+@@ -285,8 +286,50 @@
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++/*
++ * Op 4, container path of a pid: arg -> {int64 pid; 0; char *buf; u64 len; 0}.
++ * PlugInKit's checkEnvironment aborts every app extension ("plugin has
++ * invalid sandbox or container: error 2") without one (speech synthesizer
++ * AUs crash-looped, boot 0109b). App extensions (executable inside a
++ * .appex) running as mobile get the mobile home; everything else still gets
++ * ENOENT, like an uncontainerized process on iOS.
++ */
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_container_path(user_addr_t arg)
++{
++	uint64_t a[5];
++	char path[MAXPATHLEN];
++	int len = sizeof(path), err = ENOENT;
++	static const char home[] = "/private/var/mobile";
++	proc_t p;
++	kauth_cred_t cred;
++	uid_t uid;
++	vnode_t vp;
++
++	if (copyin(arg, a, sizeof(a)) != 0 || a[2] == 0 || a[3] < sizeof(home)) {
++		return ENOENT;
++	}
++	p = proc_find((int)a[0]);
++	if (p == NULL) {
++		return ESRCH;
++	}
++	cred = kauth_cred_proc_ref(p);
++	uid = kauth_cred_getuid(cred);
++	kauth_cred_unref(&cred);
++	vp = proc_getexecutablevnode(p);
++	proc_rele(p);
++	if (vp == NULLVP) {
++		return ENOENT;
++	}
++	if (uid == 501 && vn_getpath(vp, path, &len) == 0 && strnstr(path, ".appex/", sizeof(path)) != NULL) {
++		err = copyout(home, (user_addr_t)a[2], sizeof(home));
++	}
++	vnode_put(vp);
++	return err;
++}
++
++static int
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -295,7 +338,8 @@
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
++	case 4:         /* container path (pid) */
++		return sweet_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
+ 	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */
