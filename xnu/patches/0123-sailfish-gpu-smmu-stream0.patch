@@ -1,0 +1,30 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -223,7 +223,9 @@
+  * mainline (which translates through a context bank on MSM8996), but with
+  * an identity map: context bank 0, stage 1 AArch64, 4 KB granule, 36-bit
+  * VA = PA, 1 GB blocks for 0x80000000-0x1ffffffff (DRAM), normal
+- * non-cacheable; SMR0 matches every stream ID. Returns false (and the GPU
++ * non-cacheable; SMR0 = stream 0 only, as the Pixel kernel (stream 2 is
++ * TZ's gfx3d_secure: an SMR matching every stream stalled the CPU on the
++ * S2CR write in 0122a, the firmware traps it). Returns false (and the GPU
+  * must not touch memory) unless every write reads back.
+  */
+ /* Traced SMMU write: 0121a stalled a CPU on one of them. */
+@@ -259,14 +261,14 @@
+ 	SWR(cb, 0x24, (uint32_t)(pt >> 32));
+ 	SWR(cb, 0x58, 0xffffffffu);              /* FSR: clear */
+ 	SWR(cb, 0x0, (1u << 5) | (1u << 2) | (1u << 1) | 1u);    /* CFRE AFE TRE M */
+-	SWR(smmu, 0x800, (1u << 31) | (0x7fffu << 16));          /* SMR0: any stream */
++	SWR(smmu, 0x800, 1u << 31);             /* SMR0: stream 0 (gfx3d_user), mask 0 */
+ 	SWR(smmu, 0xc00, 0);                     /* S2CR0: translate, context bank 0 */
+ 	SWR(smmu, 0x68, 0);                      /* TLBIALLNSNH */
+ 	SWR(smmu, 0x70, 0);                      /* sTLBGSYNC */
+ 	bool synced = poll(smmu, 0x74, 1u, 0, 10);
+ 	uint32_t smr = rd(smmu, 0x800), s2cr = rd(smmu, 0xc00), cbar = rd(gr1, 0x0);
+ 	uint32_t sctlr = rd(cb, 0x0), tcr = rd(cb, 0x30), ttbr = rd(cb, 0x20);
+-	bool ok = synced && smr == ((1u << 31) | (0x7fffu << 16)) && (s2cr & 0x300ff) == 0 &&
++	bool ok = synced && smr == (1u << 31) && (s2cr & 0x300ff) == 0 &&
+ 	    (cbar & (3u << 16)) == (1u << 16) && (sctlr & 0x27) == 0x27 && tcr == (28u | (1u << 23)) &&
+ 	    ttbr == (uint32_t)pt;
+ 	printf("SWEET GPU: SMMU identity %s: pt %llx SMR0 %08x S2CR0 %08x CBAR0 %08x SCTLR %08x TCR %08x TTBR0 %08x tlbsync %d\n",
