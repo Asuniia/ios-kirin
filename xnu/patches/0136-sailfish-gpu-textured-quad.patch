@@ -1,0 +1,329 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -53,6 +53,12 @@
+  * per configuration: blend.asm at 200 MHz, blend4.asm (4 pixels and 128-bit
+  * accesses per invocation) at 200 MHz and at 300 MHz (GPLL0 / 2, inside the
+  * 745 mV corner).
++ * 0135a: blend4 @300 MHz 1.7-1.9 ms = ~2.5x one CPU core.
++ *
++ * sweetgpu=6 adds the textured-quad kernel (sample.asm: affine transform,
++ * bilinear sample through the texture unit, opacity, source-over), checked
++ * against integer CPU references: an identity placement and a 2x upscale at
++ * opacity 0.5.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -185,6 +191,9 @@
+ #define BYPASS                  1
+ #define SB4_CS_SHADER           0xd
+ #define SB4_CS_SSBO             0xf
++#define SB4_CS_TEX              0x5
++#define R_TPL1_VS_TEX_COUNT     0xe700
++#define R_TPL1_FS_TEX_COUNT     0xe750
+ #define BLIT2D                  5
+ #define BLIT2DSCALE             7
+ #define END2D                   8
+@@ -687,8 +696,42 @@
+ 			return;
+ 		}
+ 	}
++}
++
++/* Optional dispatch state: constants, textures + samplers, 2-D grid. */
++struct cs_extra {
++	const uint32_t *consts;         /* nconst vec4s, uploaded at c0 */
++	uint32_t nconst;
++	const uint32_t *tex;            /* ntex x 12 dwords (A5XX_TEX_CONST) */
++	const uint32_t *samp;           /* ntex x 4 dwords (A5XX_TEX_SAMP) */
++	uint32_t ntex;
++	uint32_t groups_y;              /* 0 = 1 */
++};
++
++/* A5XX_TEX_CONST for a linear RGBA8 2-D image (byte 0 = x). */
++static void
++tex_rgba8(uint32_t *t, uint64_t pa, uint32_t w, uint32_t h, uint32_t pitch)
++{
++	memset(t, 0, 12 * 4);
++	t[0] = (0u << 4) | (1u << 7) | (2u << 10) | (3u << 13) | (0x30u << 22);  /* XYZW, TFMT5_8_8_8_8_UNORM */
++	t[1] = w | (h << 15);
++	t[2] = (pitch << 7) | (1u << 29);                       /* PITCHALIGN 0, 2D */
++	t[3] = ((pitch * h) >> 12) & 0x3fff;                    /* ARRAY_PITCH */
++	t[4] = (uint32_t)pa;                                    /* 32-byte aligned */
++	t[5] = (uint32_t)(pa >> 32) | (1u << 17);               /* DEPTH 1 */
+ }
+ 
++/* A5XX_TEX_SAMP: unnormalized coords, clamp to edge, linear or nearest. */
++static void
++samp_unnorm(uint32_t *s, bool linear)
++{
++	uint32_t f = linear ? 1 : 0;
++	s[0] = (f << 1) | (f << 3) | (1u << 5) | (1u << 8) | (1u << 11);
++	s[1] = (1u << 5) | (32u << 8);                         /* UNNORM, MAX_LOD 0.125 */
++	s[2] = 0;
++	s[3] = 0;
++}
++
+ /*
+  * One compute dispatch of `groups` x k->local[0] invocations (computerator
+  * a5xx_emit_grid: cs_restore_emit, cs_program_emit, cs_ibo_emit; no consts,
+@@ -697,8 +740,10 @@
+  */
+ static bool
+ compute_run(vm_offset_t gpu, const struct sweet_kernel *k, uint64_t shader_pa,
+-    const uint64_t *buf, const uint32_t *buf_bytes, uint32_t groups, uint64_t fence, uint32_t seq)
++    const uint64_t *buf, const uint32_t *buf_bytes, uint32_t groups, uint64_t fence, uint32_t seq,
++    const struct cs_extra *x)
+ {
++	uint32_t gy = x && x->groups_y ? x->groups_y : 1;
+ 	uint32_t thr = k->double_threadsize ? 1 : 0;     /* FOUR_QUADS : TWO_QUADS */
+ 
+ 	/* cs_restore_emit */
+@@ -726,7 +771,7 @@
+ 	emit(pkt4(R_HLSQ_CS_CNTL, 1)); emit((k->instrlen << 1) | (k->num_bufs ? 1u : 0));
+ 	emit(pkt4(R_SP_CS_CONFIG, 1)); emit(1);
+ 	emit(pkt4(R_HLSQ_CS_CONSTLEN, 2)); emit(k->constlen / 4); emit(k->instrlen);
+-	emit(pkt4(R_TPL1_CS_TEX_COUNT, 1)); emit(0);
++	emit(pkt4(R_TPL1_CS_TEX_COUNT, 1)); emit(x ? x->ntex : 0);
+ 	emit(pkt4(R_SP_CS_OBJ_START, 6));
+ 	emit((uint32_t)shader_pa); emit((uint32_t)(shader_pa >> 32));
+ 	emit(0);                                /* PVT_MEM_PARAM */
+@@ -740,6 +785,34 @@
+ 	emit((2u << 16) | (SB4_CS_SHADER << 18) | (k->instrlen << 22));    /* SS4_INDIRECT */
+ 	emit((uint32_t)shader_pa);              /* STATE_TYPE ST4_SHADER (0) in bits 1:0 */
+ 	emit((uint32_t)(shader_pa >> 32));
++	/* constants (computerator emit_const), textures + samplers (fd5 emit_textures) */
++	if (x && x->nconst) {
++		emit(pkt7(CP_LOAD_STATE4, 3 + 4 * x->nconst));
++		emit((SB4_CS_SHADER << 18) | (x->nconst << 22));       /* SS4_DIRECT, DST_OFF 0 */
++		emit(1);                                                /* ST4_CONSTANTS */
++		emit(0);
++		for (uint32_t i = 0; i < 4 * x->nconst; i++) {
++			emit(x->consts[i]);
++		}
++	}
++	if (x && x->ntex) {
++		emit(pkt7(CP_LOAD_STATE4, 3 + 4 * x->ntex));
++		emit((SB4_CS_TEX << 18) | (x->ntex << 22));
++		emit(0);                                                /* ST4_SHADER = samplers */
++		emit(0);
++		for (uint32_t i = 0; i < 4 * x->ntex; i++) {
++			emit(x->samp[i]);
++		}
++		emit(pkt7(CP_LOAD_STATE4, 3 + 12 * x->ntex));
++		emit((SB4_CS_TEX << 18) | (x->ntex << 22));
++		emit(1);                                                /* ST4_CONSTANTS = textures */
++		emit(0);
++		for (uint32_t i = 0; i < 12 * x->ntex; i++) {
++			emit(x->tex[i]);
++		}
++		emit(pkt4(R_TPL1_VS_TEX_COUNT, 4)); emit(0); emit(0); emit(0); emit(0);
++		emit(pkt4(R_TPL1_FS_TEX_COUNT, 1)); emit(0);
++	}
+ 	/* cs_ibo_emit: SSBO sizes (bytes, overflowing from WIDTH into HEIGHT), then addresses */
+ 	if (k->num_bufs) {
+ 		emit(pkt7(CP_LOAD_STATE4, 3 + 2 * k->num_bufs));
+@@ -758,14 +831,14 @@
+ 			emit((uint32_t)buf[i]); emit((uint32_t)(buf[i] >> 32));
+ 		}
+ 	}
+-	/* grid: 1-D, `groups` workgroups */
++	/* grid: groups x gy workgroups */
+ 	emit(pkt4(R_HLSQ_CS_NDRANGE_0, 7));
+ 	emit(3u | ((k->local[0] - 1) << 2) | ((k->local[1] - 1) << 12) | ((k->local[2] - 1) << 22));
+ 	emit(k->local[0] * groups); emit(0);
+-	emit(k->local[1]); emit(0);
++	emit(k->local[1] * gy); emit(0);
+ 	emit(k->local[2]); emit(0);
+ 	emit(pkt4(R_HLSQ_CS_KERNEL_GROUP_X, 3)); emit(1); emit(1); emit(1);
+-	emit(pkt7(CP_EXEC_CS, 4)); emit(0); emit(groups); emit(1); emit(1);
++	emit(pkt7(CP_EXEC_CS, 4)); emit(0); emit(groups); emit(gy); emit(1);
+ 	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
+ 	emit(pkt7(CP_EVENT_WRITE, 4)); emit(CACHE_FLUSH_TS);
+ 	emit((uint32_t)fence); emit((uint32_t)(fence >> 32)); emit(seq);
+@@ -872,7 +945,7 @@
+ 		uint64_t bufs[2] = {src, dst};
+ 		uint32_t sizes[2] = {bytes, bytes};
+ 		bool read = compute_run(gpu, cfg[ci].k, ci == 0 ? kb : kb4, bufs, sizes,
+-		    n / cfg[ci].px_per_inv / 64, scratch + 48, seq);
++		    n / cfg[ci].px_per_inv / 64, scratch + 48, seq, NULL);
+ 		uint64_t t2 = mach_absolute_time();
+ 		bool done = false;
+ 		for (unsigned us = 0; us < 500000 && !(done = (*fv == seq)); us += 10) {
+@@ -902,6 +975,123 @@
+ 		gpu_wait(1);
+ 	}
+ 	(void)gfx_clock(5);
++}
++
++/* RGBA8 test image pixel (premultiplied: every channel <= alpha). */
++static uint32_t
++src_px(uint32_t x, uint32_t y)
++{
++	uint32_t al = (x * 9 + y * 5 + 40) & 0xff, c = al ? (x * 7 + y * 3) % (al + 1) : 0;
++	return (al << 24) | (c << 16) | ((c / 2) << 8) | (c / 3);
++}
++
++/*
++ * sample.asm checks. A: identity placement of a 64x64 image at (16, 16) in a
++ * 128x128 dst, opacity 1 (expect blend_ref, +-1 for float rounding).
++ * B: 2x upscale over the whole dst, opacity 0.5: bilinear weights are
++ * quarters, so out = (sum16 * 255 + d * (8160 - sum16_a)) / 8160 exactly in
++ * integers (sum16 = 16x the bilinear sum; 8160 = 255 * 32); expect +-2.
++ */
++static void
++sample_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
++{
++	const uint32_t W = 128, H = 128, SW = 64, SH = 64;
++	vm_offset_t sva, dva;
++	uint64_t src = gpu_page(&sva), dst = gpu_alloc(&dva, W * H * 4), ks = kernel_page(&k_sample);
++	if (src == 0 || dst == 0 || ks == 0) {
++		printf("SWEET GPU: sample: no pages\n");
++		return;
++	}
++	uint32_t *s = (uint32_t *)sva, *d = (uint32_t *)dva;
++	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 56);
++	for (uint32_t y = 0; y < SH; y++) {
++		for (uint32_t x = 0; x < SW; x++) {
++			s[y * SW + x] = src_px(x, y);
++		}
++	}
++	for (uint32_t t = 0; t < 2; t++) {
++		for (uint32_t i = 0; i < W * H; i++) {
++			d[i] = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++		}
++		uint32_t orig_d0 = d[0];
++		flush_dcache64((addr64_t)src, PAGE_SIZE, TRUE);
++		flush_dcache64((addr64_t)dst, W * H * 4, TRUE);
++		/* floats as bits: 1.0 3f800000, 0.5 3f000000, 255.0 437f0000, -16.0 c1800000 */
++		uint32_t x0 = t == 0 ? 16 : 0, y0 = x0, w = t == 0 ? SW : W, h = t == 0 ? SH : H;
++		uint32_t consts[16] = {
++			t == 0 ? 0x3f800000u : 0x3f000000u, 0, 0, t == 0 ? 0x3f800000u : 0x3f000000u,
++			t == 0 ? 0xc1800000u : 0, t == 0 ? 0xc1800000u : 0, t == 0 ? 0x3f800000u : 0x3f000000u, 0x3f800000u,
++			0x437f0000u, 0x3f000000u, w - 1, W,
++			x0, y0, 0, 0,
++		};
++		uint32_t tex[24], samp[8];
++		tex_rgba8(tex, src, SW, SH, SW * 4);
++		tex_rgba8(tex + 12, dst, W, H, W * 4);
++		samp_unnorm(samp, true);
++		samp_unnorm(samp + 4, false);
++		struct cs_extra x = {consts, 4, tex, samp, 2, h};
++		uint64_t bufs[1] = {dst};
++		uint32_t sizes[1] = {W * H * 4};
++		wr(smmu + 0x8000, 0x58, 0xffffffffu);
++		bool read = compute_run(gpu, &k_sample, ks, bufs, sizes, (w + 63) / 64, scratch + 56, 0x600 + t, &x);
++		delay(5000);
++		flush_dcache64((addr64_t)scratch, 64, TRUE);
++		flush_dcache64((addr64_t)dst, W * H * 4, TRUE);
++		uint32_t bad = 0, first = ~0u, maxdiff = 0, want_first = 0;
++		for (uint32_t py = 0; py < H; py++) {
++			for (uint32_t px = 0; px < W; px++) {
++				uint32_t i = py * W + px;
++				uint32_t dd = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++				uint32_t want;
++				if (t == 0) {
++					bool in = px >= x0 && px < x0 + w && py >= y0 && py < y0 + h;
++					want = in ? blend_ref(src_px(px - x0, py - y0), dd) : dd;
++				} else {
++					/* texel pairs and quarter weights along each axis, clamped */
++					int ax = (px & 1) ? (int)(px / 2) : (int)(px / 2) - 1, ay = (py & 1) ? (int)(py / 2) : (int)(py / 2) - 1;
++					uint32_t wx0 = (px & 1) ? 3 : 1, wy0 = (py & 1) ? 3 : 1;
++					int xs[2] = {ax < 0 ? 0 : ax, ax + 1 > (int)SW - 1 ? (int)SW - 1 : ax + 1};
++					int ys[2] = {ay < 0 ? 0 : ay, ay + 1 > (int)SH - 1 ? (int)SH - 1 : ay + 1};
++					uint32_t wxs[2] = {wx0, 4 - wx0}, wys[2] = {wy0, 4 - wy0}, sum[4] = {0, 0, 0, 0};
++					for (int j = 0; j < 2; j++) {
++						for (int k2 = 0; k2 < 2; k2++) {
++							uint32_t p = src_px((uint32_t)xs[k2], (uint32_t)ys[j]);
++							for (int c = 0; c < 4; c++) {
++								sum[c] += wys[j] * wxs[k2] * ((p >> (8 * c)) & 0xff);
++							}
++						}
++					}
++					want = 0;
++					for (int c = 0; c < 4; c++) {
++						uint32_t dc = (dd >> (8 * c)) & 0xff;
++						uint32_t v = (sum[c] * 255 + dc * (8160 - sum[3]) + 4080) / 8160;
++						want |= (v > 255 ? 255 : v) << (8 * c);
++					}
++				}
++				uint32_t got = d[i], md = 0;
++				for (int c = 0; c < 4; c++) {
++					int df = (int)((got >> (8 * c)) & 0xff) - (int)((want >> (8 * c)) & 0xff);
++					uint32_t a = (uint32_t)(df < 0 ? -df : df);
++					md = a > md ? a : md;
++				}
++				maxdiff = md > maxdiff ? md : maxdiff;
++				if (md > (t == 0 ? 1u : 2u) && bad++ == 0) {
++					first = i;
++					want_first = want;
++				}
++			}
++		}
++		cp_state(gpu, read ? "sample read:" : "sample NOT read (200 ms):");
++		smmu_faults(smmu, "after sample:");
++		printf("SWEET GPU: sample %s: fence %x (want %x), max channel diff %u, %u bad (first [%u] = %08x want %08x, "
++		    "d[0] %08x was %08x) -> %s\n", t == 0 ? "A identity 64x64 at (16,16)" : "B 2x upscale, opacity 0.5",
++		    *fv, 0x600 + t, maxdiff, bad, first, first < W * H ? d[first] : 0, want_first, d[0], orig_d0,
++		    bad == 0 ? "GPU TEXTURED QUAD MATCHES THE CPU" : "wrong");
++		if (!read) {
++			return;
++		}
++		gpu_wait(1);
++	}
+ }
+ 
+ /* Step 4.1: fill.asm and blend.asm, checked by the CPU. */
+@@ -937,7 +1127,7 @@
+ 		uint64_t bufs[2] = {a, b};
+ 		uint32_t sizes[2] = {bytes, bytes};
+ 		bool read = compute_run(gpu, t == 0 ? &k_fill : &k_blend, t == 0 ? kfill : kblend,
+-		    bufs, sizes, groups, scratch + 32, 0x400 + t);
++		    bufs, sizes, groups, scratch + 32, 0x400 + t, NULL);
+ 		delay(5000);
+ 		flush_dcache64((addr64_t)scratch, 64, TRUE);
+ 		flush_dcache64((addr64_t)a, PAGE_SIZE, TRUE);
+@@ -1105,8 +1295,12 @@
+ 			gpu_wait(2);
+ 			compute_test(gpu, smmu, scratch_va, scratch);
+ 		}
+-		if (level >= 5) {
++		if (level >= 6) {
+ 			gpu_wait(2);
++			(void)gfx_clock(3);     /* 300 MHz */
++			sample_test(gpu, smmu, scratch_va, scratch);
++		} else if (level >= 5) {
++			gpu_wait(2);
+ 			bench_test(gpu, smmu, scratch_va, scratch);
+ 		}
+ 	}
+--- a/bsd/dev/sweet_gpu_shaders.h
++++ b/bsd/dev/sweet_gpu_shaders.h
+@@ -61,3 +61,28 @@
+ 	.double_threadsize = 0, .branchstack = 0,
+ 	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 2,
+ };
++/* k_sample: generated by tools/ir3asm from tools/gpu-shaders/sample.asm */
++static const uint32_t k_sample_bin[128] = {
++	0x00000000, 0x202cc028, 0x00000001, 0x202cc029, 0x00000002, 0x202cc02a, 0x00000003, 0x202cc02b,
++	0x00000004, 0x202cc02c, 0x00000005, 0x202cc02d, 0x00000006, 0x202cc02e, 0x00000007, 0x202cc02f,
++	0x00000008, 0x202cc030, 0x00000009, 0x202cc031, 0x0000000a, 0x202cc032, 0x0000000b, 0x202cc033,
++	0x0000000c, 0x202cc034, 0x0000000d, 0x202cc035, 0x00000000, 0x204cc009, 0x200600c0, 0x46d00004,
++	0x00000000, 0x00000200, 0x00000004, 0x42100004, 0x003500c1, 0x42100005, 0x00000000, 0x00000100,
++	0x00320004, 0x42d00004, 0x00000000, 0x00000200, 0x00340004, 0x42100004, 0x00000000, 0x00000200,
++	0x00040005, 0x62198006, 0x00000004, 0x200c400c, 0x00000005, 0x200c400d, 0x00000000, 0x00000100,
++	0x0031000c, 0x4010000c, 0x0031000d, 0x4010000d, 0x20020006, 0x46d00008, 0x00000000, 0x00000100,
++	0x002c0028, 0x63860010, 0x002d0029, 0x63860011, 0x00000000, 0x00000200, 0x0010002a, 0x63868010,
++	0x0011002b, 0x63868011, 0x00000000, 0x00000200, 0x00000021, 0xa0c01f14, 0x02200019, 0xa0c01f18,
++	0x002e0014, 0x50700b14, 0x00000000, 0x00000200, 0x4017002f, 0x4010001c, 0x00000000, 0x00000200,
++	0x20140018, 0x638e0b20, 0x00310020, 0x63980b20, 0x00300020, 0x40300b20, 0x00000020, 0x2004cb24,
++	0x00000000, 0x00000200, 0x20080025, 0x46d00025, 0x20100026, 0x46d00026, 0x20180027, 0x46d00027,
++	0x00000000, 0x00000200, 0x00250024, 0x43b00024, 0x00270026, 0x43b00026, 0x00000000, 0x00000200,
++	0x00260024, 0x43b00024, 0x00000000, 0x00000500, 0x06000649, 0xc7260008, 0x00000000, 0x03000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++static const struct sweet_kernel k_sample = {
++	.bin = k_sample_bin, .size = sizeof(k_sample_bin),
++	.instrlen = 4, .constlen = 4, .max_reg = 13, .max_half_reg = -1,
++	.double_threadsize = 0, .branchstack = 0,
++	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 1,
++};
