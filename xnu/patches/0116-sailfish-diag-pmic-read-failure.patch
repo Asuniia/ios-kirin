@@ -1,0 +1,21 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -132,6 +132,18 @@
+ 	if (i < obs_n) {
+ 		ok = keys_obs_read(obs[i], addr, out);
+ 	}
++	static uint16_t failed[8];
++	static unsigned failed_n;
++	unsigned f;
++	for (f = 0; f < failed_n && failed[f] != ppid; f++) {
++	}
++	if (!ok && f == failed_n && f < 8) {
++		failed[failed_n++] = ppid;
++		uint16_t apid = keys_find_apid(ppid);
++		printf("SWEET PMIC: read ppid 0x%03x addr 0x%02x failed: apid %u owner %u map 0x%08x slot %u/%u status 0x%x\n",
++		    ppid, addr, apid, apid == KEYS_NO_APID ? 0 : keys_rd(keys_cnfg, 0x700u + 4u * apid) & 7u,
++		    apid == KEYS_NO_APID ? 0 : keys_rd(keys_core, 0x800u + 4u * apid), i, obs_n, keys_last_status);
++	}
+ 	lck_mtx_unlock(&sweet_pmic_lock);
+ 	return ok;
+ }
