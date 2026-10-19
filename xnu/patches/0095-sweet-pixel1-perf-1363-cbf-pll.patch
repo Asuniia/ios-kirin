@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_perf.c
 +++ b/bsd/dev/sweet_perf.c
-@@ -8,10 +8,16 @@
+@@ -8,10 +8,17 @@
   * and once at start the cached memcpy bandwidth of each CPU.
   *
   * Also the CPU clocks (MSM8996 Pro, Linux drivers/clk/msm/clock-cpu-8996.c):
@@ -13,15 +13,16 @@
 + * the shared APC rail PM8994 S11 at 905 mV and both kryo regulators in BHS
 + * (clusters fed straight from S11). 905 mV is the CPR ceiling of the
 + * nominal band (DT qcom,cpr-voltage-ceiling), so its top corners are safe
-+ * without touching the PMIC: perf 1363.2 MHz, CBF 1190.4 MHz. Boot-arg
-+ * sweetclk=1 starts the perf PLL at sweetclk_mhz (default 1363) and, if
-+ * sweetcbf_mhz is set, the CBF PLL; with S11 below 905 mV (or unreadable)
++ * without touching the PMIC: perf 1363.2 MHz, CBF 1190.4 MHz. By default
++ * (boot-arg sweetclk=0 turns it off) the perf PLL starts at sweetclk_mhz
++ * (default 1363) and the CBF PLL at sweetcbf_mhz (default 1190, 0 = leave
++ * on GPLL0); both ran a full iOS session (boot 0095a). With S11 below 905 mV (or unreadable)
 + * the perf cluster gets 883 MHz (Linux's early-init rate, set before any
 + * regulator driver runs) and the CBF is left alone.
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
-@@ -69,27 +75,42 @@
+@@ -69,27 +76,42 @@
  	    clk_rd(b, 0x100), clk_rd(b, 0x104), clk_rd(b, 0x110));
  }
  
@@ -79,7 +80,7 @@
  	clk_wr(b, CLK_PLL_MODE, 0x00118000);    /* FSM mode: turns the PLL on */
  	delay(50);
  	unsigned i;
-@@ -97,13 +118,13 @@
+@@ -97,13 +119,13 @@
  		delay(1);
  	}
  	if (!(clk_rd(b, CLK_PLL_MODE) & (1u << 31))) {
@@ -97,12 +98,14 @@
  }
  
  static void
-@@ -134,13 +155,27 @@
+@@ -133,14 +155,28 @@
+ 	}
  	printf("SWEET CLK: S11 %s type=%#x subtype=%#x range=%#x vset=%#x (%u) mode=%#x en=%#x\n",
  	    ok ? "ok" : "READ FAILED", r[0], r[1], r[2], r[3], r[3], r[4], r[5]);
- 	int on = 0;
+-	int on = 0;
 -	uint32_t mhz = 883;
-+	uint32_t mhz = 1363, cbfmhz = 0;
++	int on = 1;
++	uint32_t mhz = 1363, cbfmhz = 1190;
  	(void)PE_parse_boot_argn("sweetclk", &on, sizeof(on));
  	(void)PE_parse_boot_argn("sweetclk_mhz", &mhz, sizeof(mhz));
 -	if (on && mhz >= 300 && mhz <= 2150) {
