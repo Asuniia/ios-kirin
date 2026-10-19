@@ -1,0 +1,45 @@
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1879,6 +1879,22 @@
+ 	uint32_t i = os_atomic_inc_orig(&sweet_prof_n, relaxed);
+ 	if (i < SWEET_PROF_MAX) {
+ 		sweet_prof_pc[i] = pc;
++	}
++	if (PSR64_IS_USER(get_saved_state_cpsr(state))) {
++		return;
++	}
++	/*
++	 * Kernel callers: frame-pointer return addresses, depth 1-3 in the low
++	 * 2 bits (frames inside this thread's kernel stack only).
++	 */
++	vm_offset_t lo = current_thread()->kernel_stack, hi = lo + kernel_stack_size;
++	uint64_t fp = get_saved_state_fp(state);
++	for (uint64_t d = 1; d <= 3 && fp >= lo && fp + 16 <= hi && (fp & 15) == 0; d++) {
++		i = os_atomic_inc_orig(&sweet_prof_n, relaxed);
++		if (i < SWEET_PROF_MAX) {
++			sweet_prof_pc[i] = (VM_KERNEL_UNSLIDE(((uint64_t *)fp)[1]) & ~3ULL) | d;
++		}
++		fp = ((uint64_t *)fp)[0];
+ 	}
+ }
+ #endif
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -117,7 +117,7 @@
+ {
+ 	static int chan;
+ 	static uint64_t pcs[SWEET_PROF_MAX];
+-	enum { TOP = 160 };
++	enum { TOP = 240 };
+ 	static uint64_t top_pc[TOP];
+ 	static uint32_t top_n[TOP];
+ 
+@@ -131,7 +131,7 @@
+ 		sweet_prof_found = 0;
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_prof_find, NULL, NULL, NULL);
+ 		sweet_prof_pid = sweet_prof_found;
+-		(void)tsleep(&chan, PZERO, "sweetprf", 20 * hz);
++		(void)tsleep(&chan, PZERO, "sweetprf", 10 * hz);
+ 		sweet_prof_pid = 0;
+ 		uint32_t n = MIN(sweet_prof_n, SWEET_PROF_MAX), k = sweet_prof_kernel, all = sweet_prof_all;
+ 		memcpy(pcs, sweet_prof_pc, n * sizeof(pcs[0]));
