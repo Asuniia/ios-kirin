@@ -1,0 +1,246 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_perf.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_perf_init(void);
++extern void sweet_gpu_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+@@ -662,6 +663,7 @@
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_perf_init();
++	sweet_gpu_init();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,215 @@
++/*
++ * Adreno 530 power-up probe for the Pixel 1 (MSM8996), boot-arg sweetgpu=1.
++ * Step 1 of GPU acceleration: get the GPU powered and clocked and read its
++ * registers. Sequence after mainline Linux (mmcc-msm8996.c, gdsc.c,
++ * msm8996.dtsi gpu@b00000; sources in research/adreno/):
++ *   GFX rail   PMI8994 S2 (SID 3, ppid 0x317; S3 is its second phase),
++ *              apps-owned qpnp-regulator. Only touched if it is off: set to
++ *              745 mV (CPR ceiling of the 315 MHz corner) and enabled.
++ *   MMSS CC    0x8c0000: GPU_GDSC 0x4034 (CX), gpu_ahb_clk 0x403c, GPU_GX_GDSC
++ *              0x4024 (IO clamp 0x4300), gfx3d RCG 0x4000 = GPLL0/3 = 200 MHz,
++ *              gpu_gx_gfx3d_clk 0x4028, rbbmtimer RCG 0x4090 (XO) +
++ *              branch 0x40b0
++ *   GCC        0x300000: gcc_mmss_bimc_gfx_clk 0x9010, gcc_bimc_gfx_clk 0x46018
++ *   GPU        0xb00000 (dword offsets from a5xx.xml): VBIF_VERSION 0x3000,
++ *              RBBM_STATUS 0x4f5, RBBM_ALWAYSON_COUNTER_LO 0x4d2
++ * Runs 40 s after start with 11 s pauses between stages, so the UFS log
++ * ring (flushed every 10 s) holds the last good step if a stage hangs.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++extern bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
++void sweet_gpu_init(void);
++
++#define MMCC_PA         0x008c0000u
++#define GCC_PA          0x00300000u
++#define GPU_PA          0x00b00000u
++#define MEMACC_PA       0x007af000u     /* gfx_mem_acc corner at +0x004 */
++#define GFX_S2          0x317u
++
++static int gpu_chan;
++
++static void
++gpu_wait(unsigned secs)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(secs, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&gpu_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb sy" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb sy" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* Poll until (reg & mask) == want, up to ms milliseconds. */
++static bool
++poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned ms)
++{
++	for (unsigned i = 0; i < ms * 10; i++) {
++		if ((rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(100);
++	}
++	return false;
++}
++
++/* gcc / gcc46: the GCC pages at 0x309000 and 0x346000. */
++static void
++dump(vm_offset_t mm, vm_offset_t gcc, vm_offset_t gcc46, const char *when)
++{
++	printf("SWEET GPU: %s mmcc gpu_gdsc %08x gx_gdsc %08x clamp %08x ahb %08x gfx3d_br %08x "
++	    "gfx3d_rcg %08x/%08x rbbm_rcg %08x/%08x rbbm_br %08x gcc mmss_bimc_gfx %08x bimc_gfx %08x\n",
++	    when, rd(mm, 0x4034), rd(mm, 0x4024), rd(mm, 0x4300), rd(mm, 0x403c), rd(mm, 0x4028),
++	    rd(mm, 0x4000), rd(mm, 0x4004), rd(mm, 0x4090), rd(mm, 0x4094), rd(mm, 0x40b0),
++	    rd(gcc, 0x10), rd(gcc46, 0x18));
++}
++
++/* Branch enable + wait for CLK_OFF (bit 31) to clear. */
++static bool
++branch_on(vm_offset_t base, uint32_t off)
++{
++	wr(base, off, rd(base, off) | 1u);
++	return poll(base, off, 1u << 31, 0, 10);
++}
++
++/* GDSC on: clear SW_COLLAPSE, wait for PWR_ON (bit 31). */
++static bool
++gdsc_on(vm_offset_t mm, uint32_t gdscr)
++{
++	wr(mm, gdscr, rd(mm, gdscr) & ~1u);
++	return poll(mm, gdscr, 1u << 31, 1u << 31, 10);
++}
++
++static void
++gpu_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	gpu_wait(40);
++	vm_offset_t mm = ml_io_map(MMCC_PA, 0x10000);
++	vm_offset_t gcc = ml_io_map(GCC_PA + 0x9000, 0x1000);
++	vm_offset_t gcc46 = ml_io_map(GCC_PA + 0x46000, 0x1000);
++	vm_offset_t memacc = ml_io_map(MEMACC_PA, 0x1000);
++	if (mm == 0 || gcc == 0 || gcc46 == 0 || memacc == 0) {
++		printf("SWEET GPU: map failed\n");
++		return;
++	}
++
++	/* 1. Read-only state. */
++	uint8_t s2[7] = {0};
++	static const uint8_t s2regs[7] = {0x04, 0x05, 0x08, 0x40, 0x41, 0x45, 0x46};
++	bool s2ok = true;
++	for (int i = 0; i < 7; i++) {
++		s2ok = s2ok && sweet_pmic_read(GFX_S2, s2regs[i], &s2[i]);
++	}
++	printf("SWEET GPU: S2 %s type %02x subtype %02x status %02x range %02x vset %02x (%u) mode %02x en %02x; mem-acc %08x\n",
++	    s2ok ? "ok" : "UNREADABLE", s2[0], s2[1], s2[2], s2[3], s2[4], s2[4], s2[5], s2[6],
++	    rd(memacc, 4));
++	dump(mm, gcc, gcc46, "at boot:");
++	gpu_wait(11);
++
++	/* 2. GFX rail. Range 0 only: FTS2 (subtype 8) 5 mV steps from 0, FTS2.5 (9) from 80 mV. */
++	if (!s2ok || s2[0] != 0x1c || s2[3] != 0 || (s2[1] != 8 && s2[1] != 9)) {
++		printf("SWEET GPU: S2 not a range-0 FTS2/2.5 regulator, stop\n");
++		return;
++	}
++	if (!(s2[6] & 0x80)) {
++		uint8_t vset = (uint8_t)((745 - (s2[1] == 9 ? 80 : 0)) / 5);
++		bool ok = sweet_pmic_write(GFX_S2, 0x41, vset) && sweet_pmic_write(GFX_S2, 0x46, 0x80);
++		delay(1000);
++		uint8_t en = 0, v = 0, st = 0;
++		(void)(sweet_pmic_read(GFX_S2, 0x46, &en) && sweet_pmic_read(GFX_S2, 0x41, &v) &&
++		    sweet_pmic_read(GFX_S2, 0x08, &st));
++		printf("SWEET GPU: S2 enable %s: en %02x vset %u status %02x\n", ok ? "ok" : "FAILED", en, v, st);
++		if (!ok || !(en & 0x80)) {
++			return;
++		}
++	} else {
++		printf("SWEET GPU: S2 already on (vset %u), left as is\n", s2[4]);
++	}
++	gpu_wait(11);
++
++	/* 3. CX side: GPU GDSC + AHB clock. */
++	bool cx = gdsc_on(mm, 0x4034);
++	bool ahb = branch_on(mm, 0x403c);
++	printf("SWEET GPU: gpu_gdsc %s %08x, ahb %s %08x\n", cx ? "on" : "TIMEOUT", rd(mm, 0x4034),
++	    ahb ? "on" : "TIMEOUT", rd(mm, 0x403c));
++	gpu_wait(11);
++
++	/* 4. GX: release IO clamp, GDSC on, retain mem/periph on the core branch. */
++	wr(mm, 0x4300, rd(mm, 0x4300) & ~1u);
++	bool gx = gdsc_on(mm, 0x4024);
++	wr(mm, 0x4028, rd(mm, 0x4028) | (1u << 14) | (1u << 13));
++	printf("SWEET GPU: gx_gdsc %s %08x clamp %08x\n", gx ? "on" : "TIMEOUT", rd(mm, 0x4024), rd(mm, 0x4300));
++	gpu_wait(11);
++
++	/* 5. Clocks: gfx3d = GPLL0 (src 5) / 3 (div field 2*3-1), rbbmtimer = XO. */
++	wr(mm, 0x4004, (5u << 8) | 5u);
++	wr(mm, 0x4000, rd(mm, 0x4000) | 1u);
++	bool r1 = poll(mm, 0x4000, 1u, 0, 10);
++	wr(mm, 0x4094, (0u << 8) | 0u);
++	wr(mm, 0x4090, rd(mm, 0x4090) | 1u);
++	bool r2 = poll(mm, 0x4090, 1u, 0, 10);
++	bool b1 = branch_on(mm, 0x4028), b2 = branch_on(mm, 0x40b0);
++	bool g1 = branch_on(gcc, 0x10), g2 = branch_on(gcc46, 0x18);
++	printf("SWEET GPU: rcg gfx3d %s rbbm %s; branches gfx3d %s rbbm %s mmss_bimc_gfx %s bimc_gfx %s\n",
++	    r1 ? "ok" : "TIMEOUT", r2 ? "ok" : "TIMEOUT", b1 ? "on" : "OFF", b2 ? "on" : "OFF",
++	    g1 ? "on" : "OFF", g2 ? "on" : "OFF");
++	dump(mm, gcc, gcc46, "after power-up:");
++	if (!(cx && ahb && gx && b1 && b2 && g1 && g2)) {
++		printf("SWEET GPU: not all on, no GPU register access\n");
++		return;
++	}
++	gpu_wait(11);
++
++	/* 6. GPU registers. */
++	vm_offset_t gpu = ml_io_map(GPU_PA, 0x40000);
++	if (gpu == 0) {
++		printf("SWEET GPU: GPU map failed\n");
++		return;
++	}
++	printf("SWEET GPU: reading GPU registers\n");
++	uint32_t vbif = rd(gpu, 0x3000 * 4);
++	uint32_t status = rd(gpu, 0x4f5 * 4);
++	uint32_t aon0 = rd(gpu, 0x4d2 * 4);
++	delay(1000);
++	uint32_t aon1 = rd(gpu, 0x4d2 * 4);
++	printf("SWEET GPU: VBIF_VERSION %08x RBBM_STATUS %08x ALWAYSON %08x -> %08x (%s)\n",
++	    vbif, status, aon0, aon1, aon1 != aon0 ? "counting: GPU alive" : "not counting");
++}
++
++void
++sweet_gpu_init(void)
++{
++	int on = 0;
++	thread_t thread;
++	if (!PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
