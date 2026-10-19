@@ -8,15 +8,14 @@
  #include <kern/clock.h>
  #include <kern/kalloc.h>
  #include <kern/thread.h>
-@@ -336,9 +337,95 @@
- 	clock_interval_to_deadline(secs, NSEC_PER_SEC, &deadline);
+@@ -337,8 +338,95 @@
  	(void)assert_wait_deadline(&perf_sleep_chan, THREAD_UNINT, deadline);
  	thread_block(THREAD_CONTINUE_NULL);
-+}
+ }
 +
 +/*
 + * Per-process CPU use over the last interval ("SWEET TOP"), from the
-+ * cpu_time ledger. Percent of one CPU (400% = all four busy).
++ * cpu_time ledger (mach time units). Percent of one CPU (400% = all four busy).
 + */
 +extern uint64_t get_task_cpu_time(task_t task);
 +
@@ -28,7 +27,7 @@
 +	char name[20];
 +} top_tab[TOP_SLOTS];
 +static uint32_t top_gen;
-+
+ 
 +static int
 +top_visit(proc_t p, __unused void *arg)
 +{
@@ -37,7 +36,8 @@
 +	if (task == TASK_NULL) {
 +		return PROC_RETURNED;
 +	}
-+	uint64_t ns = get_task_cpu_time(task);
++	uint64_t ns;
++	absolutetime_to_nanoseconds(get_task_cpu_time(task), &ns);	/* ledger is in mach time */
 +	for (i = 0; i < TOP_SLOTS; i++) {
 +		if (top_tab[i].gen != 0 && top_tab[i].pid == pid) {
 +			break;
@@ -59,8 +59,8 @@
 +	top_tab[i].last = ns;
 +	top_tab[i].gen = top_gen;
 +	return PROC_RETURNED;
- }
- 
++}
++
  static void
 +perf_top(uint64_t interval_ns)
 +{
@@ -104,7 +104,7 @@
  perf_thread(void *arg, wait_result_t result)
  {
  	(void)arg;
-@@ -350,6 +437,8 @@
+@@ -350,6 +438,8 @@
  		perf_bandwidth(c);
  	}
  	thread_bind(NULL);
@@ -113,7 +113,7 @@
  	uint64_t swaps = 0, presents = 0, pabs = 0, t = mach_absolute_time();
  	for (;;) {
  		uint64_t mhz[4] = {0, 0, 0, 0};
-@@ -369,6 +458,7 @@
+@@ -369,6 +459,7 @@
  		    dp ? perf_ns(dabs) / 1000 / dp : 0);
  		printf("SWEET PERF: panel kicks %llu (after done %llu, after 50 ms timeout %llu)\n",
  		    sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout);
