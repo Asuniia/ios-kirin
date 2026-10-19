@@ -1,0 +1,21 @@
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -20,7 +20,8 @@
+  * the perf cluster gets 883 MHz (Linux's early-init rate, set before any
+  * regulator driver runs) and the CBF is left alone.
+  *
+- * Turbo (default on, boot-arg sweetturbo=0 keeps the nominal clocks above):
++ * Turbo (default off since 0107: no visible UI gain, more heat and battery
++ * drain than USB charging covers; boot-arg sweetturbo=1 turns it on):
+  * S11 is raised to 940 mV (Linux's open-loop voltage at the top corners; CPR
+  * settles at ~900 mV) the way Linux's spm-regulator does it, through the
+  * system SAW 0x09a10000 (DT qcom,spm@9A10000 "system-cbf", vctl port 0):
+@@ -250,7 +251,7 @@
+ 	}
+ 	printf("SWEET CLK: S11 %s type=%#x subtype=%#x range=%#x vset=%#x (%u) mode=%#x en=%#x\n",
+ 	    ok ? "ok" : "READ FAILED", r[0], r[1], r[2], r[3], r[3], r[4], r[5]);
+-	int on = 1, turbo = 1;
++	int on = 1, turbo = 0;
+ 	uint32_t mhz = 1363, cbfmhz = 1190;
+ 	(void)PE_parse_boot_argn("sweetclk", &on, sizeof(on));
+ 	(void)PE_parse_boot_argn("sweetturbo", &turbo, sizeof(turbo));
