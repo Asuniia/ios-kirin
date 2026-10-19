@@ -1,0 +1,135 @@
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -19,6 +19,19 @@
+  * on GPLL0); both ran a full iOS session (boot 0095a). With S11 below 905 mV (or unreadable)
+  * the perf cluster gets 883 MHz (Linux's early-init rate, set before any
+  * regulator driver runs) and the CBF is left alone.
++ *
++ * Turbo (default on, boot-arg sweetturbo=0 keeps the nominal clocks above):
++ * S11 is raised to 940 mV (Linux's open-loop voltage at the top corners; CPR
++ * settles at ~900 mV) the way Linux's spm-regulator does it, through the
++ * system SAW 0x09a10000 (DT qcom,spm@9A10000 "system-cbf", vctl port 0):
++ * SAW_RST=1, VCTL[7:0] and PMIC_DATA_3[7:0] = vlevel, PMIC_STS[7:0] echoes it.
++ * Only if the SAW reports 905 mV before and the PMIC reads back 940 mV after,
++ * the mem-acc selects (0x099e00c0: pwrcl [1:0], perfcl [3:2], L3 [4]) go to
++ * their high-voltage value 0 and the clocks go to the Pro maxima: perf
++ * 2150.4, CBF 1593.6 and the pwr cluster 1593.6 MHz. CPU 0/1 run from the
++ * pwr PLL, so first its lf mux [3:2] moves to the GPLL0 aux clock (~300 MHz)
++ * while the PLL is reprogrammed, then the hf mux [1:0] to the PLL.
++ * No CPR and no thermal management: the hardware TSENS reset is the limit.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -51,6 +64,10 @@
+ #define KRYO0_PA        0x099a2000u     /* pm-apc of the kryo regulators: +0x08 LDO vref, +0x18 bit 0 BHS */
+ #define KRYO1_PA        0x099d2000u
+ #define PMIC_S11        0x132u          /* PM8994 SID 1 S11 (APC rail, spm-regulator) */
++#define SAW_PA          0x09a10000u     /* system SAW (SAW2 v3/v4 layouts) */
++#define MEMACC_PA       0x099e0000u     /* acc-sel at +0xc0 */
++#define S11_VSET_NOM    165u            /* 905 mV: 80 mV + 5 mV * vset */
++#define S11_VSET_TURBO  172u            /* 940 mV */
+ 
+ static uint32_t
+ clk_rd(vm_offset_t base, uint32_t off)
+@@ -84,6 +101,7 @@
+ 	uint32_t postdiv;               /* USER_CTL [9:8] value (main output divider) */
+ };
+ static const struct clk_pll clk_perf = {"perf", 0x04, 0x08, 0x10, 0x18, 0x1c, 0x20, 0x24, 0x100};
++static const struct clk_pll clk_pwr = {"pwr", 0x04, 0x08, 0x10, 0x18, 0x1c, 0x20, 0x24, 0x100};
+ static const struct clk_pll clk_cbf = {"CBF", 0x08, 0x10, 0x18, 0x20, 0x24, 0x30, 0x34, 0x300};
+ 
+ /*
+@@ -129,7 +147,75 @@
+ 	    p->name, i + 50, l, l * 192 / 10, l * 192 % 10, mux, clk_rd(muxbase, muxoff));
+ }
+ 
++/*
++ * Linux msm_spm_drv_set_vdd (AVS off). Refuses unless the SAW reports
++ * `expect` (or 0: never used) first; the caller checks the PMIC afterwards.
++ * Boot 0102a: SAW ver 0x10000000 (SAW2 v3.0 layout), id 0x2018086f, PMIC_STS 0.
++ */
++static bool
++saw_set_vset(uint32_t expect, uint32_t vset)
++{
++	vm_offset_t saw = ml_io_map(SAW_PA, 0x1000);
++	if (!saw) {
++		return false;
++	}
++	uint32_t ver = clk_rd(saw, 0xfd0), major = ver >> 28;
++	bool v4 = major == 4;   /* SAW2 v4.x moved the control registers; v3.0 (major 1) and v2.3 share the old ones */
++	uint32_t id = v4 ? 0xc04 : 0x04, sts = v4 ? 0xc18 : 0x14, rst = v4 ? 0xc1c : 0x18;
++	uint32_t vctl = v4 ? 0x900 : 0x1c, avs = v4 ? 0x904 : 0x20, data3 = 0x4c;
++	printf("SWEET CLK: SAW ver=%#x id=%#x pmic_sts=%#x vctl=%#x data3=%#x avs=%#x\n",
++	    ver, clk_rd(saw, id), clk_rd(saw, sts), clk_rd(saw, vctl), clk_rd(saw, data3), clk_rd(saw, avs));
++	/* PMIC_STS is 0 until the SAW sends its first level (ABL set S11 over SPMI). */
++	uint32_t cur = clk_rd(saw, sts) & 0xffu;
++	if ((major != 1 && major != 3 && major != 4) || !(clk_rd(saw, id) & (1u << 2)) ||
++	    (clk_rd(saw, avs) & 1u) || (cur != expect && cur != 0)) {
++		printf("SWEET CLK: SAW not as expected (want PMIC level %u or 0, AVS off), no voltage change\n", expect);
++		return false;
++	}
++	clk_wr(saw, rst, 1);
++	clk_wr(saw, vctl, (clk_rd(saw, vctl) & ~0x700ffu) | vset);
++	clk_wr(saw, data3, (clk_rd(saw, data3) & ~0x700ffu) | vset);
++	unsigned us;
++	for (us = 0; us < 50 && (clk_rd(saw, sts) & 0xffu) != vset; us++) {
++		delay(1);
++	}
++	delay(200);     /* ramp: 35 mV at the FTS2.5 step rate takes well under this */
++	printf("SWEET CLK: SAW pmic_sts=%#x after %u us\n", clk_rd(saw, sts), us);
++	return (clk_rd(saw, sts) & 0xffu) == vset;
++}
++
+ static void
++perf_turbo(vm_offset_t apc0, vm_offset_t apc1, vm_offset_t cbf, vm_offset_t cbfpll)
++{
++	uint8_t vset = 0;
++	if (!saw_set_vset(S11_VSET_NOM, S11_VSET_TURBO) ||
++	    !sweet_pmic_read(PMIC_S11, 0x41, &vset) || vset != S11_VSET_TURBO) {
++		printf("SWEET CLK: turbo skipped (S11 vset=%u)\n", vset);
++		return;
++	}
++	printf("SWEET CLK: S11 vset=%u (940 mV)\n", vset);
++	vm_offset_t macc = ml_io_map(MEMACC_PA, 0x1000);
++	if (macc) {
++		uint32_t a = clk_rd(macc, 0xc0);
++		clk_wr(macc, 0xc0, a & ~0x1fu);
++		printf("SWEET CLK: mem-acc %#x -> %#x\n", a, clk_rd(macc, 0xc0));
++	}
++	clk_pll_start(&clk_perf, apc1, apc1, CLK_MUX, 0, 2150);
++	clk_pll_start(&clk_cbf, cbfpll, cbf, 0x18, 3, 1593);
++	uint32_t mux = clk_rd(apc0, CLK_MUX);
++	if ((mux & 0xfu) != 0x4u) {     /* ABL: hf 0 (lf mux), lf 1 (PLL main) */
++		printf("SWEET CLK: pwr mux=%#x unexpected, pwr cluster left alone\n", mux);
++		return;
++	}
++	clk_wr(apc0, CLK_MUX, (mux & ~0xcu) | (3u << 2));       /* lf: GPLL0 aux */
++	delay(5);
++	clk_pll_start(&clk_pwr, apc0, apc0, CLK_MUX, 0, 1593);
++	clk_dump("pwrcl", apc0);
++	clk_dump("perfcl", apc1);
++	printf("SWEET CLK: cbf mux=%#x pll mode=%#x l=%u\n", clk_rd(cbf, 0x18), clk_rd(cbfpll, 0), clk_rd(cbfpll, 8));
++}
++
++static void
+ perf_clocks(void)
+ {
+ 	vm_offset_t apc0 = ml_io_map(CLK_APC0_PA, 0x1000), apc1 = ml_io_map(CLK_APC1_PA, 0x1000);
+@@ -156,9 +242,16 @@
+ 	}
+ 	printf("SWEET CLK: S11 %s type=%#x subtype=%#x range=%#x vset=%#x (%u) mode=%#x en=%#x\n",
+ 	    ok ? "ok" : "READ FAILED", r[0], r[1], r[2], r[3], r[3], r[4], r[5]);
+-	int on = 1;
++	int on = 1, turbo = 1;
+ 	uint32_t mhz = 1363, cbfmhz = 1190;
+ 	(void)PE_parse_boot_argn("sweetclk", &on, sizeof(on));
++	(void)PE_parse_boot_argn("sweetturbo", &turbo, sizeof(turbo));
++	if (on && turbo && ok && r[1] == 0x09 && r[2] == 0 && r[3] == S11_VSET_NOM) {
++		perf_turbo(apc0, apc1, cbf, cbfpll);
++		if ((clk_rd(apc1, CLK_MUX) & 3u) == 1u) {
++			return;         /* perf PLL running: turbo (or part of it) applied */
++		}
++	}
+ 	(void)PE_parse_boot_argn("sweetclk_mhz", &mhz, sizeof(mhz));
+ 	(void)PE_parse_boot_argn("sweetcbf_mhz", &cbfmhz, sizeof(cbfmhz));
+ 	if (!on) {
