@@ -59,7 +59,7 @@
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
 --- /dev/null
 +++ b/bsd/dev/sweet_perf.c
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,132 @@
 +/*
 + * Performance probe (diagnostic, boot-arg sweetperf=0 turns it off). Every
 + * 10 s it logs:
@@ -67,7 +67,7 @@
 + *                  against the 19.2 MHz timer, interrupts off, CPU-bound
 + *   framebuffer    swaps (backboardd frames), presents (panel copies) and the
 + *                  average present() time from SweetFramebuffer.cpp
-+ * and once at start the cached memcpy bandwidth.
++ * and once at start the cached memcpy bandwidth of each CPU.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -115,7 +115,7 @@
 +}
 +
 +static void
-+perf_bandwidth(void)
++perf_bandwidth(int cpu)
 +{
 +	const size_t sz = 4u << 20;
 +	void *a = kalloc_data(sz, Z_WAITOK | Z_ZERO), *b = kalloc_data(sz, Z_WAITOK | Z_ZERO);
@@ -126,8 +126,8 @@
 +			memcpy((i & 1) ? a : b, (i & 1) ? b : a, sz);
 +		}
 +		uint64_t ns = perf_ns(mach_absolute_time() - t0);
-+		printf("SWEET PERF: memcpy %llu MB/s (8 x 4 MiB, cached kalloc)\n",
-+		    ns ? (8ull * sz * 1000) / ns : 0);
++		printf("SWEET PERF: cpu%d memcpy %llu MB/s (8 x 4 MiB, cached kalloc)\n",
++		    cpu, ns ? (8ull * sz * 1000) / ns : 0);
 +	}
 +	kfree_data(a, sz);
 +	kfree_data(b, sz);
@@ -147,7 +147,12 @@
 +{
 +	(void)arg;
 +	(void)result;
-+	perf_bandwidth();
++	for (int c = 0; c < (int)ml_get_cpu_count(); c++) {
++		thread_bind(cpu_to_processor(c));
++		thread_block(THREAD_CONTINUE_NULL);
++		perf_bandwidth(c);
++	}
++	thread_bind(NULL);
 +	uint64_t swaps = 0, presents = 0, pabs = 0, t = mach_absolute_time();
 +	for (;;) {
 +		uint64_t mhz[4] = {0, 0, 0, 0};
