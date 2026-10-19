@@ -1,0 +1,57 @@
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -188,8 +188,16 @@
+ perf_turbo(vm_offset_t apc0, vm_offset_t apc1, vm_offset_t cbf, vm_offset_t cbfpll)
+ {
+ 	uint8_t vset = 0;
+-	if (!saw_set_vset(S11_VSET_NOM, S11_VSET_TURBO) ||
+-	    !sweet_pmic_read(PMIC_S11, 0x41, &vset) || vset != S11_VSET_TURBO) {
++	bool set = saw_set_vset(S11_VSET_NOM, S11_VSET_TURBO);
++	/* The first read right after the SAW's command can fail (0103a: vset=0). */
++	for (int i = 0; set && i < 10 && vset != S11_VSET_TURBO; i++) {
++		if (i) {
++			delay(100);
++		}
++		vset = 0;
++		(void)sweet_pmic_read(PMIC_S11, 0x41, &vset);
++	}
++	if (!set || vset != S11_VSET_TURBO) {
+ 		printf("SWEET CLK: turbo skipped (S11 vset=%u)\n", vset);
+ 		return;
+ 	}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -123,7 +123,7 @@
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	IOLock       *fPresentLock;     /* swaps and panel copies, in order */
+-	uint64_t      fMinAbs;          /* least time between panel copies */
++	uint64_t      fMinAbs;          /* least time between panel copy starts, minus slack */
+ 	uint64_t      fLastPresent;
+ 	/* Pixel 1: fPhys..fRowBytes describe the 750x1334 RAM surface, these the panel */
+ 	bool          fScaled;
+@@ -220,7 +220,12 @@
+ 	}
+ 	uint32_t hz = 30;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	nanoseconds_to_absolutetime(hz ? NSEC_PER_SEC / hz : 0, &fMinAbs);
++	/*
++	 * Swaps come on the 16.7 ms vsync grid with jitter: a strict 33.3 ms
++	 * (timed from the copy's end, as before) let only every third one
++	 * through, ~20 frames/s. Time from the copy's start, 3/4 period.
++	 */
++	nanoseconds_to_absolutetime(hz ? NSEC_PER_SEC / hz * 3 / 4 : 0, &fMinAbs);
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -407,8 +412,8 @@
+ 	IOLockUnlock(fLock);
+ 	uint64_t t0 = mach_absolute_time();
+ 	present(rec);
+-	fLastPresent = mach_absolute_time();
+-	sweet_fb_stat_present_abs += fLastPresent - t0;
++	fLastPresent = t0;
++	sweet_fb_stat_present_abs += mach_absolute_time() - t0;
+ 	sweet_fb_stat_presents++;
+ }
+ 

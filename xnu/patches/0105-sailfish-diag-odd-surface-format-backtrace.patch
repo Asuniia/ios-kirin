@@ -1,0 +1,76 @@
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1038,6 +1038,44 @@
+ 		printf("%s\n", line);
+ 	}
+ 	task_unlock(task);
++}
++
++/* The current thread's user frame-pointer backtrace, for one-off diagnostics. */
++void sweet_user_backtrace(const char *tag);
++
++void
++sweet_user_backtrace(const char *tag)
++{
++	thread_t thread = current_thread();
++	arm_saved_state_t *ss = find_user_regs(thread);
++	vm_map_t map = get_task_map(current_task());
++	vm_shared_region_t sr = vm_shared_region_get(current_task());
++	uint64_t slide = 0, fp;
++	char line[400];
++	int n;
++
++	if (sr != NULL) {
++		slide = sr->sr_slide;
++		vm_shared_region_deallocate(sr);
++	}
++	if (ss == NULL || !is_saved_state64(ss)) {
++		return;
++	}
++	fp = get_saved_state_fp(ss);
++	n = snprintf(line, sizeof(line), "UBT %s slide 0x%llx pc 0x%llx lr 0x%llx bt", tag, slide,
++	    get_saved_state_pc(ss), get_saved_state_lr(ss));
++	for (int i = 0; i < 24 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++		uint64_t frame[2];
++		if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
++			break;
++		}
++		n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	printf("%s\n", line);
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -26,6 +26,9 @@
+  * ignored (logged once per selector).
+  */
+ #include "SweetSurface.h"
++
++extern "C" void sweet_user_backtrace(const char *tag);   /* osfmk/kern/exception.c */
++#define SWEET_FMT(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -711,6 +714,16 @@
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
++	/* Who asks for formats CoreAnimation's CPU renderer cannot draw into? */
++	static uint32_t odd_logged;
++	if (s->pixelFormat != SWEET_FMT('B', 'G', 'R', 'A') && s->pixelFormat != SWEET_FMT('L', '0', '0', '8') &&
++	    s->pixelFormat != SWEET_FMT('A', '0', '0', '8') && odd_logged < 24) {
++		char tag[64];
++		proc_selfname(tag, sizeof(tag));
++		snprintf(tag + strlen(tag), sizeof(tag) - strlen(tag), " surf %u fmt 0x%x", s->id, s->pixelFormat);
++		odd_logged++;
++		sweet_user_backtrace(tag);
++	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+ 		s->release();

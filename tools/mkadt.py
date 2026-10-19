@@ -272,6 +272,12 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
     ])
 
     product_props = d22ap_product(D20AP_ADT if pixel1 else D22AP_ADT)
+    if pixel1 and product_props:
+        # The Pixel panel is sRGB, and with "P3" iOS picks deep-color snapshot
+        # surfaces (MaterialKit b3a8, CA w30r) that CoreAnimation's CPU renderer
+        # cannot draw into: the dock / App Library backgrounds stayed white.
+        product_props = [(k, cstr('sRGB') if k in ('artwork-display-gamut', 'display-gamut') else v)
+                         for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is

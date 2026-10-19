@@ -1,0 +1,22 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -445,6 +445,19 @@
+ 			continue;
+ 		}
+ 		SweetSurface *s = sweet_surface_copy(id);
++		/* Log swaps outside backboardd's steady two-surface alternation. */
++		static uint32_t seen[2], odd_logged;
++		bool odd = mask != 1 || (id != seen[0] && id != seen[1]);
++		if (layer == 0 && id != seen[0]) {
++			seen[1] = seen[0];
++			seen[0] = id;
++		}
++		if (odd && odd_logged < 300 && sweet_fb_swaps_logged >= 16) {
++			odd_logged++;
++			IOLog("SWEET FB: odd swap %u mask 0x%x layer %u surface %u %ux%u fmt 0x%x a %d,%d %ux%u b %d,%d %dx%d\n",
++			    get32(rec, 0x50), mask, layer, id, s ? s->width : 0, s ? s->height : 0,
++			    s ? s->pixelFormat : 0, sx, sy, get32(a, 8), get32(a, 12), dx, dy, w, h);
++		}
+ 		if (sweet_fb_swaps_logged < 16) {
+ 			sweet_fb_swaps_logged++;
+ 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",

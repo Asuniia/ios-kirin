@@ -80,8 +80,16 @@ def launchd(root):
                if j.get('Label') in ('com.apple.CommCenter', 'com.apple.fairplayd.H2')]
     for k in removed:
         del jobs[k]
+    # CoreAnimation's CPU renderer (no GPU) copies a backdrop 1:1 into the
+    # downscaled capture surface (CA::OGL::SWContext::copy_destination), so
+    # blurs showed only their top part and black below. CA_BACKDROP_SCALE=N
+    # sets the capture scale to 1/N (CA::OGL::capture_backdrop).
+    for j in jobs.values():
+        if j.get('Label') == 'com.apple.backboardd':
+            j.setdefault('EnvironmentVariables', {})['CA_BACKDROP_SCALE'] = '1'
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} jobs removed (CommCenter, fairplayd)')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} jobs removed (CommCenter, fairplayd), '
+          'backboardd CA_BACKDROP_SCALE=1')
 
 
 def containers(root):
