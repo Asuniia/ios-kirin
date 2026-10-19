@@ -1,0 +1,39 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -69,7 +69,6 @@
+ #define R_CP_CHICKEN_DBG        0x0833
+ #define R_CP_PFP_INSTR_BASE     0x0835
+ #define R_CP_ME_INSTR_BASE      0x0838
+-#define R_CP_ADDR_MODE_CNTL     0x0860
+ #define R_CP_INTERRUPT_STATUS   0x0b18
+ #define R_CP_HW_FAULT           0x0b1a
+ #define R_RBBM_AHB_CNTL0        0x0093
+@@ -452,6 +451,7 @@
+ 	static const char *const name[3] = {"copy RGBA8 64x64", "RGBA8 -> RGB888 64x64", "scale RGBA8 32x32 -> RGB888 46x46"};
+ 	for (uint32_t t = 0; t < 3; t++) {
+ 		gpu_wait(2);
++		wr(smmu + 0x8000, 0x58, 0xffffffffu);   /* CB0 FSR: clear the last blit's fault */
+ 		if (t == 0) {
+ 			emit_blit(BLIT_OP_COPY, RB5_R8G8B8A8_UNORM, src, 256, 64, 64,
+ 			    RB5_R8G8B8A8_UNORM, d1, 256, 64, 64, fence, 0x100 + t);
+@@ -578,8 +578,18 @@
+ 	gw(gpu, R_SECVID_TSB_CNTL, 0);
+ 	gw64(gpu, R_SECVID_TSB_BASE, 0);
+ 	gw(gpu, R_SECVID_TSB_SIZE, 0);
+-	gw(gpu, R_CP_ADDR_MODE_CNTL, 1);
+-	gw(gpu, R_SECVID_TSB_ADDR_MODE, 1);
++	/*
++	 * Every block in 64-bit mode (the CP alone was not enough: the 0127a
++	 * blit faulted at the source PA's low 32 bits).
++	 */
++	static const uint16_t addr_mode[] = {
++		0x0860 /* CP */, 0x0bc1 /* VSC */, 0x0c81 /* GRAS */, 0x0cc5 /* RB */, 0x0d01 /* PC */,
++		0x0e05 /* HLSQ */, 0x0e41 /* VFD */, 0x0e61 /* VPC */, 0x0e80 /* UCHE */, 0x0ec1 /* SP */,
++		0x0f01 /* TPL1 */, R_SECVID_TSB_ADDR_MODE,
++	};
++	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
++		gw(gpu, addr_mode[i], 1);
++	}
+ 	gw64(gpu, R_CP_ME_INSTR_BASE, pm4);
+ 	gw64(gpu, R_CP_PFP_INSTR_BASE, pfp);
+ 	gw64(gpu, R_CP_RB_BASE, rb_pa);
