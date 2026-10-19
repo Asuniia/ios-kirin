@@ -1,0 +1,76 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -373,7 +373,63 @@
+ 
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
++
++extern "C" void sweet_user_backtrace(const char *tag);
++
++/*
++ * Diagnostic: find the black frame seen at the end of blur transitions.
++ * Samples a 16x16 grid of each layer-0 frame; when a frame is (almost) all
++ * black after one that was not, logs the last frames' stats (black samples,
++ * distinct colours, time since the previous present) and, on the swap path,
++ * backboardd's user backtrace.
++ */
++struct SweetFrameStat {
++	uint32_t seq, surface, black, uniq, px0;
++	uint64_t abs;
++};
+ 
++static void
++sweet_fb_sample(uint32_t seq, uint32_t surface, uintptr_t base, uint32_t bpr,
++    int32_t sx, int32_t sy, int32_t w, int32_t h)
++{
++	static SweetFrameStat ring[4];
++	static uint32_t n, events;
++	uint32_t px[256], black = 0, uniq = 0;
++	for (int j = 0; j < 16; j++) {
++		for (int i = 0; i < 16; i++) {
++			uint32_t v = *(const volatile uint32_t *)(base + (uint64_t)(sy + h * j / 16) * bpr +
++			    (uint64_t)(sx + w * i / 16) * 4);
++			px[j * 16 + i] = v;
++			black += (v & 0xffffff) == 0;
++		}
++	}
++	for (int k = 0; k < 256; k++) {
++		int m = 0;
++		while (m < k && px[m] != px[k]) {
++			m++;
++		}
++		uniq += m == k;
++	}
++	SweetFrameStat *cur = &ring[n % 4], *prev = &ring[(n + 3) % 4];
++	*cur = (SweetFrameStat){seq, surface, black, uniq, px[136], mach_absolute_time()};
++	n++;
++	if (n < 2 || black < 200 || prev->black >= 200 || events >= 40) {
++		return;
++	}
++	events++;
++	for (uint32_t k = n < 4 ? 0 : n - 4; k < n; k++) {
++		SweetFrameStat *f = &ring[k % 4], *b = &ring[(k + 3) % 4];
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(f->abs - b->abs, &ns);
++		IOLog("SWEET FB: frame %s seq %u surface %u black %u uniq %u px 0x%08x dt %llu us\n",
++		    k == n - 1 ? "BLACK" : "before", f->seq, f->surface, f->black, f->uniq, f->px0, ns / 1000);
++	}
++	IOLog("SWEET FB: black px 0x%08x 0x%08x 0x%08x 0x%08x\n", px[0], px[17], px[136], px[255]);
++	if (current_task() != kernel_task) {
++		sweet_user_backtrace("blackframe");
++	}
++}
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * Copy the frame into the panel inside the swap call, at most sweetfb_hz
+@@ -512,6 +568,9 @@
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++		if (src != 0 && bpe == 4 && layer == 0) {
++			sweet_fb_sample(get32(rec, 0x50), id, src + s->offset, s->bytesPerRow, sx, sy, w, h);
++		}
+ 		if (src != 0 && bpe == 4 && fScaled) {
+ 			blitScaled(src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
+ 		} else if (src != 0 && bpe == 4) {
