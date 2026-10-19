@@ -1,0 +1,60 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -226,14 +226,22 @@
+  * non-cacheable; SMR0 matches every stream ID. Returns false (and the GPU
+  * must not touch memory) unless every write reads back.
+  */
++/* Traced SMMU write: 0121a stalled a CPU on one of them. */
++#define SWR(base, off, val) do { \
++	printf("SWEET GPU: smmu wr %s+0x%x = %08x\n", #base, (unsigned)(off), (unsigned)(val)); \
++	wr(base, off, val); \
++} while (0)
++
+ static bool
+ smmu_identity(vm_offset_t smmu)
+ {
+ 	vm_offset_t pt_va;
+ 	uint64_t pt = gpu_page(&pt_va);
+ 	if (pt == 0) {
++		printf("SWEET GPU: no page-table page\n");
+ 		return false;
+ 	}
++	printf("SWEET GPU: page table at %llx\n", pt);
+ 	uint64_t *l1 = (uint64_t *)pt_va;
+ 	for (uint64_t gb = 2; gb < 8; gb++) {
+ 		/* block | AttrIndx 0 | AP[1] (EL0 too) | SH outer | AF */
+@@ -241,20 +249,20 @@
+ 	}
+ 	flush_dcache64((addr64_t)pt, PAGE_SIZE, TRUE);
+ 	vm_offset_t gr1 = smmu + 0x1000, cb = smmu + 0x8000;
+-	wr(cb, 0x0, 0);                         /* SCTLR off while configuring */
+-	wr(gr1, 0x0, 1u << 16);                 /* CBAR0: S1 translate, S2 bypass */
+-	wr(gr1, 0x800, 1u);                     /* CBA2R0: VA64 */
+-	wr(cb, 0x10, (7u << 15) | 1u);          /* TCR2: SEP upstream, PASIZE 36 bit */
+-	wr(cb, 0x30, 28u | (1u << 23));         /* TCR: T0SZ 28, TG0 4K, walks NC, EPD1 */
+-	wr(cb, 0x38, 0x44u);                    /* MAIR0: attr0 normal non-cacheable */
+-	wr(cb, 0x20, (uint32_t)pt);             /* TTBR0, ASID 0 */
+-	wr(cb, 0x24, (uint32_t)(pt >> 32));
+-	wr(cb, 0x58, 0xffffffffu);              /* FSR: clear */
+-	wr(cb, 0x0, (1u << 5) | (1u << 2) | (1u << 1) | 1u);    /* CFRE AFE TRE M */
+-	wr(smmu, 0x800, (1u << 31) | (0x7fffu << 16));          /* SMR0: any stream */
+-	wr(smmu, 0xc00, 0);                     /* S2CR0: translate, context bank 0 */
+-	wr(smmu, 0x68, 0);                      /* TLBIALLNSNH */
+-	wr(smmu, 0x70, 0);                      /* sTLBGSYNC */
++	SWR(cb, 0x0, 0);                         /* SCTLR off while configuring */
++	SWR(gr1, 0x0, 1u << 16);                 /* CBAR0: S1 translate, S2 bypass */
++	SWR(gr1, 0x800, 1u);                     /* CBA2R0: VA64 */
++	SWR(cb, 0x10, (7u << 15) | 1u);          /* TCR2: SEP upstream, PASIZE 36 bit */
++	SWR(cb, 0x30, 28u | (1u << 23));         /* TCR: T0SZ 28, TG0 4K, walks NC, EPD1 */
++	SWR(cb, 0x38, 0x44u);                    /* MAIR0: attr0 normal non-cacheable */
++	SWR(cb, 0x20, (uint32_t)pt);             /* TTBR0, ASID 0 */
++	SWR(cb, 0x24, (uint32_t)(pt >> 32));
++	SWR(cb, 0x58, 0xffffffffu);              /* FSR: clear */
++	SWR(cb, 0x0, (1u << 5) | (1u << 2) | (1u << 1) | 1u);    /* CFRE AFE TRE M */
++	SWR(smmu, 0x800, (1u << 31) | (0x7fffu << 16));          /* SMR0: any stream */
++	SWR(smmu, 0xc00, 0);                     /* S2CR0: translate, context bank 0 */
++	SWR(smmu, 0x68, 0);                      /* TLBIALLNSNH */
++	SWR(smmu, 0x70, 0);                      /* sTLBGSYNC */
+ 	bool synced = poll(smmu, 0x74, 1u, 0, 10);
+ 	uint32_t smr = rd(smmu, 0x800), s2cr = rd(smmu, 0xc00), cbar = rd(gr1, 0x0);
+ 	uint32_t sctlr = rd(cb, 0x0), tcr = rd(cb, 0x30), ttbr = rd(cb, 0x20);
