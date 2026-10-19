@@ -31,9 +31,24 @@ static void put_px(int x, int y, uint32_t c)
 void con_flush(void)
 {
 #ifdef PIXEL1
-	/* command-mode panel, no autorefresh: MDP CTL0 START sends one frame */
+	/*
+	 * Command-mode panel, no autorefresh: MDP CTL0 START sends one frame
+	 * (TE wait + transfer, up to ~32 ms). Clear PING_PONG_0_DONE (MDP
+	 * INTR_CLEAR 0x901018 bit 8), START, and wait for it (INTR_STATUS
+	 * 0x901014) so the kernel's first START never lands mid-frame: a START
+	 * during a transfer desyncs the panel (rolled picture, stale frames) and
+	 * the bit left set by ABL would let the kernel's check pass too early.
+	 */
+	volatile uint32_t *intr = (volatile uint32_t *)0x901014UL;
+	uint64_t t0, t, f;
+	intr[1] = 1u << 8;
 	__asm__ volatile("dsb sy" ::: "memory");
 	*(volatile uint32_t *)0x90201cUL = 1;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(t0));
+	do {
+		__asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
+	} while (!(intr[0] & (1u << 8)) && t - t0 < f / 10);	/* 100 ms cap */
 #endif
 }
 

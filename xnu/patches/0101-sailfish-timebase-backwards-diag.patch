@@ -1,0 +1,31 @@
+--- a/osfmk/kern/recount.c
++++ b/osfmk/kern/recount.c
+@@ -45,6 +45,9 @@
+ #include <os/atomic_private.h>
+ #include <stdbool.h>
+ #include <stdint.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <arm/cpu_data_internal.h>
++#endif
+ 
+ // Recount's machine-independent implementation and interfaces for the kernel
+ // at-large.
+@@ -411,6 +414,18 @@
+ recount_snap_diff(struct recount_snap *result,
+     const struct recount_snap *lhs, const struct recount_snap *rhs)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * Pixel 1: twice (0086i cpu 0, 0100b cpu 2) the timebase read 0 here and
++	 * the panic printer then hung. Say which counter went where.
++	 */
++	if (__improbable(lhs->rsn_time_mach < rhs->rsn_time_mach)) {
++		kprintf("SWEET TIME: went back on cpu %d: now %#llx last %#llx cntpct %#llx cntvct %#llx base %#llx\n",
++		    cpu_number(), lhs->rsn_time_mach, rhs->rsn_time_mach,
++		    __builtin_arm_rsr64("CNTPCT_EL0"), __builtin_arm_rsr64("CNTVCT_EL0"),
++		    getCpuDatap()->cpu_base_timebase);
++	}
++#endif
+ 	assert3u(lhs->rsn_time_mach, >=, rhs->rsn_time_mach);
+ 	result->rsn_time_mach = lhs->rsn_time_mach - rhs->rsn_time_mach;
+ #if CONFIG_PERVASIVE_CPI
