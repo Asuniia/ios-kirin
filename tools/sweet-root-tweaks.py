@@ -11,11 +11,17 @@ screen (image versions v8-v14 in NOTES.md):
 
   launchd.plist   _PanicOnCrash -> _PanicOnCrasX (a crashing daemon must not
                   panic the system); CommCenter jobs removed (no baseband: it
-                  crash-loops and Setup blocks on its CoreTelephony XPC)
+                  crash-loops and Setup blocks on its CoreTelephony XPC);
+                  fairplayd.H2 removed (no FairPlay kext: it exits at launch,
+                  launchd relaunches it every ~10 s and MIG requests queued on
+                  its port never get a reply; locationd blocks on one and with
+                  it the CoreLocation data migrator)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
-  migration       LastSystemVersion so DataMigration does not run for an hour
-                  on every boot
+  migration       /private/var/datamigrator/migrate sentinel: DataMigration
+                  runs once on first boot (it registers the app extensions;
+                  without it no wallpapers or widgets). Skipping it via
+                  LastSystemVersion left LaunchServices with 1 of 524 appex.
   audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
@@ -64,11 +70,12 @@ def launchd(root):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
+    removed = [k for k, j in jobs.items()
+               if j.get('Label') in ('com.apple.CommCenter', 'com.apple.fairplayd.H2')]
     for k in removed:
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} jobs removed (CommCenter, fairplayd)')
 
 
 def containers(root):
@@ -130,9 +137,10 @@ def main():
     containers(root)
     activation(root)
     audio(root)
-    merge_pref(root, 'com.apple.migration', {
-        'LastSystemVersion': BUILD,
-        'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
+    sentinel = os.path.join(root, 'private/var/datamigrator/migrate')
+    os.makedirs(os.path.dirname(sentinel), exist_ok=True)
+    open(sentinel, 'a').close()
+    os.chown(sentinel, MOBILE, MOBILE)
     merge_pref(root, 'com.apple.springboard', {
         'BKNoWatchdogs': True,
         'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},
