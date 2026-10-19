@@ -1,0 +1,147 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -49,6 +49,10 @@
+  * sweetgpu=5 adds a full-frame benchmark (1024x1024 BGRA = 4 MB per buffer):
+  * CPU cache clean+invalidate of the buffers, GPU blend submit-to-fence, and
+  * the same blend on one CPU core, to size the CPU<->GPU handoff cost.
++ * 0134a: cache maintenance 0.29 ms for 8 MB, GPU 8.3 ms, CPU 4.6 ms. Now
++ * per configuration: blend.asm at 200 MHz, blend4.asm (4 pixels and 128-bit
++ * accesses per invocation) at 200 MHz and at 300 MHz (GPLL0 / 2, inside the
++ * 745 mV corner).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -190,6 +194,7 @@
+ #define PC_CCU_FLUSH_COLOR_TS   0x1d
+ 
+ static int gpu_chan;
++static vm_offset_t mmcc;        /* MMSS clock controller, for the gfx3d clock */
+ 
+ static void
+ gpu_wait(unsigned secs)
+@@ -812,26 +817,49 @@
+ 		ag = ((ag + 0x00800080u + ((ag >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
+ 		dst[i] = s + (rb | (ag << 8));
+ 	}
++}
++
++/* gfx3d RCG = GPLL0 (600 MHz) / div, div in half steps (field 2*div - 1). */
++static bool
++gfx_clock(uint32_t field)
++{
++	wr(mmcc, 0x4004, (5u << 8) | field);
++	wr(mmcc, 0x4000, rd(mmcc, 0x4000) | 1u);
++	return poll(mmcc, 0x4000, 1u, 0, 10);
+ }
+ 
+ /*
+  * Full-frame benchmark: 1024x1024 pixels (4 MB per buffer, about one
+- * 750x1334 iOS frame). Three rounds; GPU at the step-1 clock (200 MHz).
++ * 750x1334 iOS frame), each configuration twice.
+  */
+ static void
+ bench_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
+ {
+-	const uint32_t n = 1024 * 1024, bytes = n * 4, groups = n / 64;
++	const uint32_t n = 1024 * 1024, bytes = n * 4;
+ 	vm_offset_t sva, dva, cva;
+ 	uint64_t src = gpu_alloc(&sva, bytes), dst = gpu_alloc(&dva, bytes), cpu = gpu_alloc(&cva, bytes);
+-	uint64_t kb = kernel_page(&k_blend);
+-	if (src == 0 || dst == 0 || cpu == 0 || kb == 0) {
++	uint64_t kb = kernel_page(&k_blend), kb4 = kernel_page(&k_blend4);
++	if (src == 0 || dst == 0 || cpu == 0 || kb == 0 || kb4 == 0) {
+ 		printf("SWEET GPU: bench: no 4 MB buffers\n");
+ 		return;
+ 	}
++	static const struct {
++		const char *name;
++		const struct sweet_kernel *k;
++		uint32_t px_per_inv, clk_field, mhz;
++	} cfg[3] = {
++		{"blend 1px", &k_blend, 1, 5, 200},
++		{"blend4 4px", &k_blend4, 4, 5, 200},
++		{"blend4 4px", &k_blend4, 4, 3, 300},
++	};
+ 	uint32_t *s = (uint32_t *)sva, *d = (uint32_t *)dva, *c = (uint32_t *)cva;
+ 	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 48);
+-	for (uint32_t r = 0; r < 3; r++) {
++	for (uint32_t r = 0; r < 6; r++) {
++		uint32_t ci = r / 2, seq = 0x500 + r;
++		if (r % 2 == 0 && !gfx_clock(cfg[ci].clk_field)) {
++			printf("SWEET GPU: bench: gfx3d clock switch to %u MHz TIMEOUT\n", cfg[ci].mhz);
++			return;
++		}
+ 		for (uint32_t i = 0; i < n; i++) {
+ 			uint32_t al = (i * 37 + r) & 0xff, ch = al ? (i * 11) % (al + 1) : 0;
+ 			s[i] = (al << 24) | (ch << 16) | ((ch / 2) << 8) | (ch / 3);
+@@ -843,10 +871,11 @@
+ 		uint64_t t1 = mach_absolute_time();
+ 		uint64_t bufs[2] = {src, dst};
+ 		uint32_t sizes[2] = {bytes, bytes};
+-		bool read = compute_run(gpu, &k_blend, kb, bufs, sizes, groups, scratch + 48, 0x500 + r);
++		bool read = compute_run(gpu, cfg[ci].k, ci == 0 ? kb : kb4, bufs, sizes,
++		    n / cfg[ci].px_per_inv / 64, scratch + 48, seq);
+ 		uint64_t t2 = mach_absolute_time();
+ 		bool done = false;
+-		for (unsigned us = 0; us < 500000 && !(done = (*fv == 0x500 + r)); us += 10) {
++		for (unsigned us = 0; us < 500000 && !(done = (*fv == seq)); us += 10) {
+ 			delay(10);
+ 			flush_dcache64((addr64_t)scratch + 48, 4, TRUE);
+ 		}
+@@ -861,10 +890,10 @@
+ 				first = i;
+ 			}
+ 		}
+-		printf("SWEET GPU: bench %u: %u px; cache clean+inval 8 MB %llu us; GPU submit %llu us, "
++		printf("SWEET GPU: bench %u %s @%u MHz: %u px; cache clean+inval 8 MB %llu us; GPU submit %llu us, "
+ 		    "submit->fence %llu us (%s); inval 4 MB %llu us; CPU blend %llu us; GPU vs CPU %u wrong (first %u)\n",
+-		    r, n, usecs(t1 - t0), usecs(t2 - t1), usecs(t3 - t1), done ? "done" : read ? "NO FENCE" : "NOT READ",
+-		    usecs(t4 - t3), usecs(t5 - t4), bad, first);
++		    r, cfg[ci].name, cfg[ci].mhz, n, usecs(t1 - t0), usecs(t2 - t1), usecs(t3 - t1),
++		    done ? "done" : read ? "NO FENCE" : "NOT READ", usecs(t4 - t3), usecs(t5 - t4), bad, first);
+ 		smmu_faults(smmu, "after bench:");
+ 		if (!done) {
+ 			cp_state(gpu, "bench stuck:");
+@@ -872,6 +901,7 @@
+ 		}
+ 		gpu_wait(1);
+ 	}
++	(void)gfx_clock(5);
+ }
+ 
+ /* Step 4.1: fill.asm and blend.asm, checked by the CPU. */
+@@ -1091,6 +1121,7 @@
+ 	vm_offset_t gcc = ml_io_map(GCC_PA + 0x9000, 0x1000);
+ 	vm_offset_t gcc46 = ml_io_map(GCC_PA + 0x46000, 0x1000);
+ 	vm_offset_t memacc = ml_io_map(MEMACC_PA, 0x1000);
++	mmcc = mm;
+ 	if (mm == 0 || gcc == 0 || gcc46 == 0 || memacc == 0) {
+ 		printf("SWEET GPU: map failed\n");
+ 		return;
+--- a/bsd/dev/sweet_gpu_shaders.h
++++ b/bsd/dev/sweet_gpu_shaders.h
+@@ -40,3 +40,24 @@
+ 	.double_threadsize = 1, .branchstack = 0,
+ 	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 2,
+ };
++/* k_blend4: generated by tools/ir3asm from tools/gpu-shaders/blend4.asm */
++static const uint32_t k_blend4_bin[96] = {
++	0x00000000, 0x204cc009, 0x00ff00ff, 0x204cc014, 0x00800080, 0x204cc015, 0x000000ff, 0x204cc016,
++	0x200600c0, 0x46d00004, 0x00000000, 0x00000200, 0x00000004, 0x42100004, 0x00000000, 0x00000200,
++	0x20040004, 0x46d00008, 0x20020004, 0x46d00005, 0x00000000, 0x00000500, 0x05023600, 0xc6e6000c,
++	0x05023600, 0xc6e6021c, 0x2018000c, 0x56f00b20, 0x2008001c, 0x46f00b24, 0x00200016, 0x42580320,
++	0x0014001c, 0x43900b28, 0x00140024, 0x43900b24, 0x00200028, 0x46180b28, 0x00200024, 0x46180b24,
++	0x20080028, 0x46f00b2c, 0x20080024, 0x46f00b30, 0x0014002c, 0x43900b2c, 0x00140030, 0x43900b30,
++	0x002c0028, 0x42180b28, 0x00300024, 0x42180b24, 0x00150028, 0x42100b28, 0x00150024, 0x42100b24,
++	0x20080028, 0x46f00b28, 0x20080024, 0x46f00b24, 0x00140028, 0x43900b28, 0x00140024, 0x43900b24,
++	0x20080024, 0x46d00b24, 0x00240028, 0x43b80b28, 0x0028000c, 0x42180b0c, 0x00000000, 0x00000500,
++	0x05003619, 0xc7260208, 0x00000000, 0x03000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++static const struct sweet_kernel k_blend4 = {
++	.bin = k_blend4_bin, .size = sizeof(k_blend4_bin),
++	.instrlen = 3, .constlen = 0, .max_reg = 12, .max_half_reg = -1,
++	.double_threadsize = 0, .branchstack = 0,
++	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 2,
++};
