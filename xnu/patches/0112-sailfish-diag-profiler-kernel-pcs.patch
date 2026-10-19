@@ -1,0 +1,24 @@
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1870,13 +1870,15 @@
+ 	if (task_pid(current_task()) != pid) {
+ 		return;
+ 	}
+-	if (PSR64_IS_USER(get_saved_state_cpsr(state))) {
+-		uint32_t i = os_atomic_inc_orig(&sweet_prof_n, relaxed);
+-		if (i < SWEET_PROF_MAX) {
+-			sweet_prof_pc[i] = get_saved_state_pc(state);
+-		}
+-	} else {
++	/* Kernel pcs are stored unslid (0xfffffff007...: nm of the built kernel). */
++	uint64_t pc = get_saved_state_pc(state);
++	if (!PSR64_IS_USER(get_saved_state_cpsr(state))) {
+ 		os_atomic_inc(&sweet_prof_kernel, relaxed);
++		pc = VM_KERNEL_UNSLIDE(pc);
++	}
++	uint32_t i = os_atomic_inc_orig(&sweet_prof_n, relaxed);
++	if (i < SWEET_PROF_MAX) {
++		sweet_prof_pc[i] = pc;
+ 	}
+ }
+ #endif
