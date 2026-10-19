@@ -1,0 +1,127 @@
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -6,6 +6,12 @@
+  *   framebuffer    swaps (backboardd frames), presents (panel copies) and the
+  *                  average present() time from SweetFramebuffer.cpp
+  * and once at start the cached memcpy bandwidth of each CPU.
++ *
++ * Also the CPU clocks (MSM8996 Pro, Linux drivers/clk/msm/clock-cpu-8996.c):
++ * ABL leaves the perf cluster (CPU 2/3) on the 19.2 MHz XO. The register
++ * state is logged; boot-arg sweetclk=1 then runs the perf PLL at
++ * sweetclk_mhz (default 883: the rate Linux's early init sets before any
++ * voltage regulator driver runs, i.e. safe at ABL's APC voltage).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -22,8 +28,103 @@
+ extern uint64_t sweet_fb_stat_swaps, sweet_fb_stat_presents, sweet_fb_stat_present_abs;
+ void sweet_perf_init(void);
+ 
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
+ static int perf_sleep_chan;
+ 
++#define CLK_APC0_PA     0x06400000u     /* pwr cluster PLL + mux */
++#define CLK_APC1_PA     0x06480000u     /* perf cluster PLL + mux */
++#define CLK_CBF_PA      0x09a11000u     /* CBF mux at +0x18 */
++#define CLK_CBF_PLL_PA  0x09a20000u
++#define CLK_MUX         0x40u           /* [1:0] hf: 0 lf, 1 PLL, 2 PLL via ACD, 3 alt PLL; [3:2] lf */
++#define CLK_PLL_MODE    0x00u           /* bit 31 locked */
++#define CLK_PLL_L       0x04u
++
++static uint32_t
++clk_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++clk_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++clk_dump(const char *name, vm_offset_t b)
++{
++	printf("SWEET CLK: %s mode=%#x l=%u alpha=%#x user=%#x cfg=%#x/%#x test=%#x/%#x mux=%#x ctl=%#x alt: mode=%#x l=%u user=%#x\n",
++	    name, clk_rd(b, 0), clk_rd(b, 4), clk_rd(b, 8), clk_rd(b, 0x10), clk_rd(b, 0x18),
++	    clk_rd(b, 0x1c), clk_rd(b, 0x20), clk_rd(b, 0x24), clk_rd(b, CLK_MUX), clk_rd(b, 0x44),
++	    clk_rd(b, 0x100), clk_rd(b, 0x104), clk_rd(b, 0x110));
++}
++
++/* Linux cpu_clock_8996_early_init + __variable_rate_pll_init, perf PLL only, no ACD. */
++static void
++clk_perf_pll(vm_offset_t b, uint32_t mhz)
++{
++	uint32_t l = mhz * 10 / 192;    /* 19.2 MHz steps */
++	uint32_t mux = clk_rd(b, CLK_MUX);
++	if ((mux & 3u) != 0) {
++		printf("SWEET CLK: perf cluster not on the low mux (mux=%#x), left alone\n", mux);
++		return;
++	}
++	clk_wr(b, CLK_PLL_MODE, 0);     /* off: the cluster runs from the lf mux */
++	uint32_t user = clk_rd(b, 0x10);
++	user &= ~((3u << 8) | (1u << 12) | (1u << 24));
++	user |= 0x100u | (1u << 0) | (1u << 3); /* post-div 2 on main, main + early outputs */
++	clk_wr(b, 0x10, user);
++	clk_wr(b, 0x08, 0);             /* alpha */
++	clk_wr(b, 0x18, 0x200d4828);    /* config_ctl (v3/Pro) */
++	clk_wr(b, 0x1c, 0x006);
++	clk_wr(b, 0x20, 0x1c000000);    /* test_ctl lo/hi */
++	clk_wr(b, 0x24, 0x00004000);
++	clk_wr(b, CLK_PLL_L, l);
++	clk_wr(b, CLK_PLL_MODE, 0x00118000);    /* FSM mode: turns the PLL on */
++	delay(50);
++	unsigned i;
++	for (i = 0; i < 1000 && !(clk_rd(b, CLK_PLL_MODE) & (1u << 31)); i++) {
++		delay(1);
++	}
++	if (!(clk_rd(b, CLK_PLL_MODE) & (1u << 31))) {
++		printf("SWEET CLK: perf PLL did not lock (mode=%#x), staying on the low mux\n", clk_rd(b, 0));
++		return;
++	}
++	clk_wr(b, CLK_MUX, (mux & ~3u) | 1u);   /* glitch-free switch to the primary PLL */
++	delay(5);
++	printf("SWEET CLK: perf PLL locked after %u us, L=%u (%u.%u MHz), mux %#x -> %#x\n",
++	    i + 50, l, l * 192 / 10, l * 192 % 10, mux, clk_rd(b, CLK_MUX));
++}
++
++static void
++perf_clocks(void)
++{
++	vm_offset_t apc0 = ml_io_map(CLK_APC0_PA, 0x1000), apc1 = ml_io_map(CLK_APC1_PA, 0x1000);
++	vm_offset_t cbf = ml_io_map(CLK_CBF_PA, 0x1000), cbfpll = ml_io_map(CLK_CBF_PLL_PA, 0x1000);
++	if (!apc0 || !apc1 || !cbf || !cbfpll) {
++		printf("SWEET CLK: MMIO mapping failed\n");
++		return;
++	}
++	clk_dump("pwrcl", apc0);
++	clk_dump("perfcl", apc1);
++	printf("SWEET CLK: cbf mux=%#x pll mode=%#x l=%u user=%#x\n",
++	    clk_rd(cbf, 0x18), clk_rd(cbfpll, 0), clk_rd(cbfpll, 8), clk_rd(cbfpll, 0x18));
++	int on = 0;
++	uint32_t mhz = 883;
++	(void)PE_parse_boot_argn("sweetclk", &on, sizeof(on));
++	(void)PE_parse_boot_argn("sweetclk_mhz", &mhz, sizeof(mhz));
++	if (on && mhz >= 300 && mhz <= 2150) {
++		clk_perf_pll(apc1, mhz);
++		clk_dump("perfcl", apc1);
++	}
++}
++
+ static uint64_t
+ perf_ns(uint64_t abs)
+ {
+@@ -85,6 +186,7 @@
+ {
+ 	(void)arg;
+ 	(void)result;
++	perf_clocks();
+ 	for (int c = 0; c < (int)ml_get_cpu_count(); c++) {
+ 		thread_bind(cpu_to_processor(c));
+ 		thread_block(THREAD_CONTINUE_NULL);
