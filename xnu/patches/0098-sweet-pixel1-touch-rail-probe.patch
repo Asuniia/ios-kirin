@@ -1,0 +1,30 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -30,6 +30,7 @@
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_GCC_VOTE_PA 0x00352000u   /* +4: APCS_CLOCK_BRANCH_ENA_VOTE */
+@@ -459,6 +460,19 @@
+ 	    touch_rd(st.gpio[1], 4) & 1u, touch_rd(st.gpio[2], 0), touch_rd(st.gpio[2], 4) & 1u,
+ 	    touch_rd(st.gpio[3], 0), touch_rd(st.gpio[3], 4) & 1u, touch_rd(st.gpio[4], 0),
+ 	    touch_rd(st.gpio[4], 4) & 1u);
++	/*
++	 * Candidate touch rails (RPM-managed, always-on in Linux): PM8994 SID 1
++	 * LDOn at 0x4000 + 0x100 * (n - 1); +0x46 bit 7 enable, +0x40/+0x41 range/vset.
++	 */
++	static const unsigned ldos[] = {6, 17, 18, 19, 22, 23};
++	for (unsigned i = 0; i < sizeof(ldos) / sizeof(ldos[0]); i++) {
++		uint16_t ppid = (uint16_t)(0x100u | (0x40u + ldos[i] - 1u));
++		uint8_t en = 0, rng = 0, vset = 0;
++		bool ok = sweet_pmic_read(ppid, 0x46, &en) && sweet_pmic_read(ppid, 0x40, &rng) &&
++		    sweet_pmic_read(ppid, 0x41, &vset);
++		printf("SWEET TOUCH: PM8994 L%u %s en=%#x range=%#x vset=%#x\n", ldos[i],
++		    ok ? "ok" : "READ FAILED", en, rng, vset);
++	}
+ 	if (!touch_clocks()) {
+ 		goto out;
+ 	}
