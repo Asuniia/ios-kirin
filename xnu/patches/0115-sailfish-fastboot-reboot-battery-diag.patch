@@ -1,0 +1,62 @@
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -468,9 +468,40 @@
+ 	}
+ }
+ 
++/*
++ * Boot-arg sweetfastboot=SECS: SECS after boot, reboot into the bootloader's
++ * fastboot (as the shim's reset(): IMEM restart_reason 0x77665500, PSCI
++ * SYSTEM_RESET), so tests end without the user pressing Power+VolDown. The
++ * extra 11 s let the UFS log ring flush (every 10 s) first.
++ */
++static void
++fastboot_thread(void *arg, wait_result_t result)
++{
++	(void)result;
++	perf_wait((unsigned)(uintptr_t)arg);
++	printf("SWEET FASTBOOT: rebooting to fastboot in 11 s\n");
++	perf_wait(11);
++	vm_offset_t imem = ml_io_map(0x146aa000, 0x1000);
++	if (imem != 0) {
++		*(volatile uint32_t *)(imem + 0x65c) = 0x77665500;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL;	/* SYSTEM_RESET */
++	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	printf("SWEET FASTBOOT: PSCI SYSTEM_RESET returned %lld\n", (long long)x0);
++}
++
+ void
+ sweet_perf_init(void)
+ {
++	int fastboot = 0;
++	if (PE_parse_boot_argn("sweetfastboot", &fastboot, sizeof(fastboot)) && fastboot > 0) {
++		thread_t t;
++		if (kernel_thread_start(fastboot_thread, (void *)(uintptr_t)fastboot, &t) == KERN_SUCCESS) {
++			thread_deallocate(t);
++		}
++	}
++
+ 	int enabled = 1;
+ 	thread_t thread;
+ 	(void)PE_parse_boot_argn("sweetperf", &enabled, sizeof(enabled));
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -187,8 +187,14 @@
+ 		}
+ 		valid = valid && i < 4;
+ 	}
+-	valid = valid && reg(0x1310, &usb) && reg(0x130d, &input) &&
+-	    reg(0x1010, &chgr_rt) && reg(0x100e, &chgr);
++	int step = !valid ? 1 : !reg(0x1310, &usb) ? 2 : !reg(0x130d, &input) ? 3 :
++	    !reg(0x1010, &chgr_rt) ? 4 : !reg(0x100e, &chgr) ? 5 : 0;
++	valid = step == 0;
++	static int logged;
++	if (fReal && !valid && logged < 10) {
++		logged++;
++		IOLog("SWEET BATTERY: PMIC read failed at step %d\n", step);
++	}
+ 	if (!valid) {
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
