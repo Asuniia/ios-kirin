@@ -1,0 +1,141 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -45,6 +45,10 @@
+  * the CPU. Then blend.asm: premultiplied BGRA8 source-over (CA's
+  * vAlpha_Blend_Premultiplied_BGRA_8888) on 1024 pixels, compared with the
+  * same arithmetic on the CPU.
++ *
++ * sweetgpu=5 adds a full-frame benchmark (1024x1024 BGRA = 4 MB per buffer):
++ * CPU cache clean+invalidate of the buffers, GPU blend submit-to-fence, and
++ * the same blend on one CPU core, to size the CPU<->GPU handoff cost.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -304,17 +308,24 @@
+ 	gw(gpu, reg + 1, (uint32_t)(v >> 32));
+ }
+ 
+-/* One 16 KB kernel page, physically contiguous; returns its PA. */
+-static uint64_t
+-gpu_page(vm_offset_t *va)
++/* Physically contiguous, zeroed kernel memory; returns its PA (0 on failure). */
++static uint64_t
++gpu_alloc(vm_offset_t *va, vm_size_t size)
+ {
+-	if (kmem_alloc_contig(kernel_map, va, PAGE_SIZE, PAGE_MASK, 0, 0,
++	if (kmem_alloc_contig(kernel_map, va, size, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		return 0;
+ 	}
+ 	return ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)*va));
+ }
+ 
++/* One 16 KB page. */
++static uint64_t
++gpu_page(vm_offset_t *va)
++{
++	return gpu_alloc(va, PAGE_SIZE);
++}
++
+ static bool
+ blob(const char *name, uint64_t *pa, uint32_t *len)
+ {
+@@ -780,6 +791,87 @@
+ 		out |= (((t + 128 + (t >> 8)) >> 8) & 0xff) << sh;
+ 	}
+ 	return src + out;
++}
++
++static uint64_t
++usecs(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++/* CPU blend as fast as plain C gets: blend.asm's two-channels-per-op form. */
++static void
++blend_cpu(const uint32_t *src, uint32_t *dst, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t s = src[i], d = dst[i], ia = 255 - (s >> 24);
++		uint32_t rb = (d & 0x00ff00ffu) * ia, ag = ((d >> 8) & 0x00ff00ffu) * ia;
++		rb = ((rb + 0x00800080u + ((rb >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
++		ag = ((ag + 0x00800080u + ((ag >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
++		dst[i] = s + (rb | (ag << 8));
++	}
++}
++
++/*
++ * Full-frame benchmark: 1024x1024 pixels (4 MB per buffer, about one
++ * 750x1334 iOS frame). Three rounds; GPU at the step-1 clock (200 MHz).
++ */
++static void
++bench_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
++{
++	const uint32_t n = 1024 * 1024, bytes = n * 4, groups = n / 64;
++	vm_offset_t sva, dva, cva;
++	uint64_t src = gpu_alloc(&sva, bytes), dst = gpu_alloc(&dva, bytes), cpu = gpu_alloc(&cva, bytes);
++	uint64_t kb = kernel_page(&k_blend);
++	if (src == 0 || dst == 0 || cpu == 0 || kb == 0) {
++		printf("SWEET GPU: bench: no 4 MB buffers\n");
++		return;
++	}
++	uint32_t *s = (uint32_t *)sva, *d = (uint32_t *)dva, *c = (uint32_t *)cva;
++	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 48);
++	for (uint32_t r = 0; r < 3; r++) {
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t al = (i * 37 + r) & 0xff, ch = al ? (i * 11) % (al + 1) : 0;
++			s[i] = (al << 24) | (ch << 16) | ((ch / 2) << 8) | (ch / 3);
++			d[i] = c[i] = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++		}
++		uint64_t t0 = mach_absolute_time();
++		flush_dcache64((addr64_t)src, bytes, TRUE);
++		flush_dcache64((addr64_t)dst, bytes, TRUE);
++		uint64_t t1 = mach_absolute_time();
++		uint64_t bufs[2] = {src, dst};
++		uint32_t sizes[2] = {bytes, bytes};
++		bool read = compute_run(gpu, &k_blend, kb, bufs, sizes, groups, scratch + 48, 0x500 + r);
++		uint64_t t2 = mach_absolute_time();
++		bool done = false;
++		for (unsigned us = 0; us < 500000 && !(done = (*fv == 0x500 + r)); us += 10) {
++			delay(10);
++			flush_dcache64((addr64_t)scratch + 48, 4, TRUE);
++		}
++		uint64_t t3 = mach_absolute_time();
++		flush_dcache64((addr64_t)dst, bytes, TRUE);
++		uint64_t t4 = mach_absolute_time();
++		blend_cpu(s, c, n);
++		uint64_t t5 = mach_absolute_time();
++		uint32_t bad = 0, first = ~0u;
++		for (uint32_t i = 0; i < n; i++) {
++			if (d[i] != c[i] && bad++ == 0) {
++				first = i;
++			}
++		}
++		printf("SWEET GPU: bench %u: %u px; cache clean+inval 8 MB %llu us; GPU submit %llu us, "
++		    "submit->fence %llu us (%s); inval 4 MB %llu us; CPU blend %llu us; GPU vs CPU %u wrong (first %u)\n",
++		    r, n, usecs(t1 - t0), usecs(t2 - t1), usecs(t3 - t1), done ? "done" : read ? "NO FENCE" : "NOT READ",
++		    usecs(t4 - t3), usecs(t5 - t4), bad, first);
++		smmu_faults(smmu, "after bench:");
++		if (!done) {
++			cp_state(gpu, "bench stuck:");
++			return;
++		}
++		gpu_wait(1);
++	}
+ }
+ 
+ /* Step 4.1: fill.asm and blend.asm, checked by the CPU. */
+@@ -983,6 +1075,10 @@
+ 			gpu_wait(2);
+ 			compute_test(gpu, smmu, scratch_va, scratch);
+ 		}
++		if (level >= 5) {
++			gpu_wait(2);
++			bench_test(gpu, smmu, scratch_va, scratch);
++		}
+ 	}
+ }
+ 
