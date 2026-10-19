@@ -1,0 +1,211 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -37,6 +37,12 @@
+  * (mkpayload --blob GPU-ZAP-MDT = a530_zap.mdt, GPU-ZAP-SEG = a530_zap.b02;
+  * not in git) into the gpu_mem carveout 0x90f00000 (1 MB, outside iOS
+  * DRAM), then the ring leaves secure mode.
++ *
++ * sweetgpu=4 adds step 4.1, the first shader: a compute kernel (ir3 assembly
++ * in tools/gpu-shaders/, assembled by tools/ir3asm into sweet_gpu_shaders.h)
++ * dispatched like Mesa's computerator a5xx backend (a5xx_emit_grid): 16
++ * workgroups of 64 write out[i] = i ^ 0x5a5a0000 into an SSBO, checked by
++ * the CPU.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -49,6 +55,7 @@
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#include "sweet_gpu_shaders.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+@@ -121,6 +128,25 @@
+ #define R_GPMU_RBCCU_POWER_CNTL 0xa887
+ #define R_GPMU_SP_PWR_CLK_STATUS 0xa88b
+ #define R_GPMU_RBCCU_PWR_CLK_STATUS 0xa88d
++/* compute (computerator a5xx.cc) */
++#define R_RB_DBG_ECO_CNTL       0x0cc4
++#define R_PC_MODE_CNTL          0x0d02
++#define R_HLSQ_TIMEOUT_THRESHOLD_0 0x0e00
++#define R_VPC_MODE_CNTL         0x0e62
++#define R_SP_DBG_ECO_CNTL       0x0ec0
++#define R_SP_SP_CNTL            0xe580
++#define R_SP_CS_CONFIG          0xe589
++#define R_SP_CS_CTRL_REG0       0xe5f0
++#define R_SP_CS_OBJ_START       0xe5f3
++#define R_TPL1_CS_TEX_COUNT     0xe751
++#define R_HLSQ_CONTROL_0_REG    0xe784
++#define R_HLSQ_UPDATE_CNTL      0xe78a
++#define R_HLSQ_CS_CONFIG        0xe790
++#define R_HLSQ_CS_CNTL          0xe796
++#define R_HLSQ_CS_NDRANGE_0     0xe7b0
++#define R_HLSQ_CS_CNTL_0        0xe7b7
++#define R_HLSQ_CS_KERNEL_GROUP_X 0xe7b9
++#define R_HLSQ_CS_CONSTLEN      0xe7dc
+ /* a5xx_color_fmt */
+ #define RB5_R8G8B8A8_UNORM      0x30
+ #define RB5_R8G8B8_UNORM        0x31
+@@ -133,6 +159,11 @@
+ #define CP_BLIT                 0x2c
+ #define CP_EVENT_WRITE          0x46
+ #define CP_SET_RENDER_MODE      0x6c
++#define CP_LOAD_STATE4          0x30
++#define CP_EXEC_CS              0x33
++#define BYPASS                  1
++#define SB4_CS_SHADER           0xd
++#define SB4_CS_SSBO             0xf
+ #define BLIT2D                  5
+ #define BLIT2DSCALE             7
+ #define END2D                   8
+@@ -629,6 +660,114 @@
+ 	}
+ }
+ 
++/*
++ * Step 4.1: one compute dispatch (computerator a5xx_emit_grid with
++ * cs_restore_emit / cs_program_emit / cs_ibo_emit; no consts, no private
++ * memory), then the CPU checks the SSBO.
++ */
++static void
++compute_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
++{
++	static const uint32_t local[3] = {k_fill_LOCAL_SIZE}, groups = 16;
++	uint32_t n = local[0] * groups, bytes = n * 4;
++	vm_offset_t shva, outva;
++	uint64_t sh = gpu_page(&shva), out = gpu_page(&outva);
++	if (sh == 0 || out == 0 || bytes > PAGE_SIZE) {
++		printf("SWEET GPU: no compute pages\n");
++		return;
++	}
++	memcpy((void *)shva, k_fill, sizeof(k_fill));
++	memset((void *)outva, 0xee, bytes);
++	flush_dcache64((addr64_t)sh, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)out, PAGE_SIZE, TRUE);
++	uint64_t fence = scratch + 32;
++	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 32);
++	uint32_t thr = k_fill_DOUBLE_THREADSIZE ? 1 : 0;   /* FOUR_QUADS : TWO_QUADS */
++	wr(smmu + 0x8000, 0x58, 0xffffffffu);
++
++	/* cs_restore_emit */
++	emit(pkt7(CP_SET_RENDER_MODE, 5)); emit(BYPASS); emit(0); emit(0); emit(0); emit(0);
++	emit(pkt4(R_UCHE_CACHE_INVALIDATE_MIN, 5)); emit(0); emit(0); emit(0); emit(0); emit(0x12);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(pkt4(R_HLSQ_UPDATE_CNTL, 1)); emit(0x000fffff);
++	emit(pkt4(R_RB_MODE_CNTL, 1)); emit(0x44);
++	emit(pkt4(R_RB_DBG_ECO_CNTL, 1)); emit(0x00100000);
++	emit(pkt4(R_PC_MODE_CNTL, 1)); emit(0x1f);
++	emit(pkt4(R_SP_MODE_CNTL, 1)); emit(0x1e);
++	emit(pkt4(R_SP_DBG_ECO_CNTL, 1)); emit(0x40000800);     /* not A540 */
++	emit(pkt4(R_TPL1_MODE_CNTL, 1)); emit(0x544);
++	emit(pkt4(R_HLSQ_TIMEOUT_THRESHOLD_0, 2)); emit(0x80); emit(0);
++	emit(pkt4(R_VPC_DBG_ECO_CNTL, 1)); emit(0x400);
++	emit(pkt4(R_HLSQ_MODE_CNTL, 1)); emit(1);
++	emit(pkt4(R_VPC_MODE_CNTL, 1)); emit(0);
++	/* cs_program_emit */
++	emit(pkt4(R_SP_SP_CNTL, 1)); emit(0);
++	emit(pkt4(R_HLSQ_CONTROL_0_REG, 1)); emit((thr << 2) | 0x880);
++	emit(pkt4(R_SP_CS_CTRL_REG0, 1));
++	emit((thr << 3) | ((uint32_t)(k_fill_MAX_HALF_REG + 1) << 4) | ((uint32_t)(k_fill_MAX_REG + 1) << 10) |
++	    ((uint32_t)k_fill_BRANCHSTACK << 24) | (1u << 2) /* BUFFER */ | 0x2);
++	emit(pkt4(R_HLSQ_CS_CONFIG, 1)); emit(1);
++	emit(pkt4(R_HLSQ_CS_CNTL, 1)); emit((k_fill_INSTRLEN << 1) | (k_fill_NUM_BUFS ? 1u : 0));
++	emit(pkt4(R_SP_CS_CONFIG, 1)); emit(1);
++	emit(pkt4(R_HLSQ_CS_CONSTLEN, 2)); emit(k_fill_CONSTLEN / 4); emit(k_fill_INSTRLEN);
++	emit(pkt4(R_TPL1_CS_TEX_COUNT, 1)); emit(0);
++	emit(pkt4(R_SP_CS_OBJ_START, 6));
++	emit((uint32_t)sh); emit((uint32_t)(sh >> 32));
++	emit(0);                                /* PVT_MEM_PARAM */
++	emit(0); emit(0);                       /* PVT_MEM_ADDR */
++	emit(0);                                /* PVT_MEM_SIZE */
++	emit(pkt4(R_HLSQ_UPDATE_CNTL, 1)); emit(0x01f00000);
++	emit(pkt4(R_HLSQ_CS_CNTL_0, 2));
++	emit(k_fill_WGID_REGID | (0xfcu << 8) | (0xfcu << 16) | ((uint32_t)k_fill_LOCALID_REGID << 24));
++	emit(1);                                /* HLSQ_CS_CNTL_1 */
++	emit(pkt7(CP_LOAD_STATE4, 3));
++	emit((2u << 16) | (SB4_CS_SHADER << 18) | ((uint32_t)k_fill_INSTRLEN << 22));     /* SS4_INDIRECT */
++	emit((uint32_t)sh);                     /* STATE_TYPE ST4_SHADER (0) in bits 1:0 */
++	emit((uint32_t)(sh >> 32));
++	/* cs_ibo_emit: SSBO 0 size (bytes, overflowing from WIDTH into HEIGHT), then address */
++	emit(pkt7(CP_LOAD_STATE4, 5));
++	emit((SB4_CS_SSBO << 18) | (1u << 22));
++	emit(1);                                /* ST4_CONSTANTS */
++	emit(0);
++	emit((bytes & 0xffffu) << 16);
++	emit(bytes >> 16);
++	emit(pkt7(CP_LOAD_STATE4, 5));
++	emit((SB4_CS_SSBO << 18) | (1u << 22));
++	emit(2);                                /* ST4_UBO */
++	emit(0);
++	emit((uint32_t)out); emit((uint32_t)(out >> 32));
++	/* grid */
++	emit(pkt4(R_HLSQ_CS_NDRANGE_0, 7));
++	emit(3u | ((local[0] - 1) << 2) | ((local[1] - 1) << 12) | ((local[2] - 1) << 22));
++	emit(local[0] * groups); emit(0);
++	emit(local[1]); emit(0);
++	emit(local[2]); emit(0);
++	emit(pkt4(R_HLSQ_CS_KERNEL_GROUP_X, 3)); emit(1); emit(1); emit(1);
++	emit(pkt7(CP_EXEC_CS, 4)); emit(0); emit(groups); emit(1); emit(1);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(pkt7(CP_EVENT_WRITE, 4)); emit(CACHE_FLUSH_TS);
++	emit((uint32_t)fence); emit((uint32_t)(fence >> 32)); emit(0x400);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++
++	bool read = kick(gpu);
++	delay(5000);
++	flush_dcache64((addr64_t)scratch, 64, TRUE);
++	flush_dcache64((addr64_t)out, PAGE_SIZE, TRUE);
++	const uint32_t *o = (const uint32_t *)outva;
++	uint32_t bad = 0, first = ~0u, untouched = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		untouched += o[i] == 0xeeeeeeeeu;
++		if (o[i] != (i ^ 0x5a5a0000u) && bad++ == 0) {
++			first = i;
++		}
++	}
++	cp_state(gpu, read ? "compute read:" : "compute NOT read (200 ms):");
++	smmu_faults(smmu, "after compute:");
++	printf("SWEET GPU: compute %u invocations: fence %x (want 400), %u wrong (first [%u] = %08x), %u untouched; "
++	    "out[0..3] %08x %08x %08x %08x -> %s\n", n, *fv, bad, first, first < n ? o[first] : 0, untouched,
++	    o[0], o[1], o[2], o[3], bad == 0 ? "GPU SHADER WORKS" : "wrong");
++}
++
+ /* Step 2: command processor. */
+ static void
+ cp_test(vm_offset_t gpu, int level)
+@@ -766,6 +905,10 @@
+ 		    *(volatile uint32_t *)(scratch_va + 8));
+ 		gpu_wait(2);
+ 		blit_test(gpu, smmu, scratch_va, scratch);
++		if (level >= 4) {
++			gpu_wait(2);
++			compute_test(gpu, smmu, scratch_va, scratch);
++		}
+ 	}
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_shaders.h
+@@ -0,0 +1,21 @@
++/*
++ * Adreno 530 compute kernels for sweet_gpu.c, generated by tools/ir3asm
++ * (tools/build-ir3asm.sh) from tools/gpu-shaders/*.asm. Do not edit.
++ */
++/* k_fill: generated by tools/ir3asm from tools/gpu-shaders/fill.asm */
++#define k_fill_INSTRLEN 1    /* units of 16 instructions */
++#define k_fill_CONSTLEN 0    /* vec4 */
++#define k_fill_MAX_REG 3
++#define k_fill_MAX_HALF_REG -1
++#define k_fill_DOUBLE_THREADSIZE 1
++#define k_fill_BRANCHSTACK 0
++#define k_fill_LOCAL_SIZE 64, 1, 1
++#define k_fill_LOCALID_REGID 0x0
++#define k_fill_WGID_REGID 0xc0
++#define k_fill_NUM_BUFS 1
++static const uint32_t k_fill[32] = {
++	0x5a5a0000, 0x204cc00d, 0x200600c0, 0x46d00004, 0x00000000, 0x00000200, 0x00000004, 0x42100004,
++	0x00000000, 0x00000200, 0x20020004, 0x46d00008, 0x000d0004, 0x43f0000c, 0x00000000, 0x00000500,
++	0x04000619, 0xc7260008, 0x00000000, 0x03000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
