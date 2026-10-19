@@ -1,0 +1,37 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -117,6 +117,7 @@
+ #define CP_NOP                  0x10
+ #define CP_MEM_WRITE            0x3d
+ #define CP_ME_INIT              0x48
++#define CP_SET_SECURE_MODE      0x66
+ #define CP_WAIT_FOR_IDLE        0x26
+ #define CP_BLIT                 0x2c
+ #define CP_EVENT_WRITE          0x46
+@@ -624,7 +625,26 @@
+ 	printf("SWEET GPU: scratch %08x -> %s\n", got,
+ 	    got == 0xc0ffee01 ? "CP_MEM_WRITE landed: COMMAND PROCESSOR WORKS" : "no write");
+ 	if (level >= 3 && read && got == 0xc0ffee01) {
++		/*
++		 * 0128a: blits complete (fences land, no faults) but write nothing:
++		 * in secure mode the RB may only write secure memory. Try the CP
++		 * leaving it without a zap shader (mainline/KGSL load one first).
++		 */
+ 		gpu_wait(11);
++		emit(pkt7(CP_SET_SECURE_MODE, 1));
++		emit(0);
++		emit(pkt7(CP_MEM_WRITE, 3));
++		emit((uint32_t)scratch + 8);
++		emit((uint32_t)(scratch >> 32));
++		emit(0x5ec0de00);
++		read = kick(gpu);
++		delay(1000);
++		flush_dcache64((addr64_t)scratch, 64, TRUE);
++		cp_state(gpu, read ? "after CP_SET_SECURE_MODE 0:" : "CP_SET_SECURE_MODE 0 NOT read:");
++		smmu_faults(smmu, "after CP_SET_SECURE_MODE 0:");
++		printf("SWEET GPU: marker after secure-mode packet %08x (want 5ec0de00)\n",
++		    *(volatile uint32_t *)(scratch_va + 8));
++		gpu_wait(2);
+ 		blit_test(gpu, smmu, scratch_va, scratch);
+ 	}
+ }
