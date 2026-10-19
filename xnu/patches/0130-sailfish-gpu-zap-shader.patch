@@ -1,0 +1,168 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -30,6 +30,13 @@
+  * by the CPU: RGBA8 64x64 copy, RGBA8 -> RGB888 (the panel format, alpha
+  * dropped) and a BLIT_OP_SCALE 32x32 -> 46x46 (1.44x, the AppleCLCD
+  * present() scale) into RGB888.
++ * The GPU starts in secure mode, where the RB writes nothing to normal
++ * memory (0128a: blits complete, destinations stay zero) and
++ * CP_SET_SECURE_MODE 0 hangs the CP without a zap shader (0129a). So, as
++ * mainline adreno_zap_shader_load: TZ PAS id 13 loads the vendor a530_zap
++ * (mkpayload --blob GPU-ZAP-MDT = a530_zap.mdt, GPU-ZAP-SEG = a530_zap.b02;
++ * not in git) into the gpu_mem carveout 0x90f00000 (1 MB, outside iOS
++ * DRAM), then the ring leaves secure mode.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -47,6 +54,7 @@
+ extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+ extern bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
+ extern ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
++extern vm_map_address_t phystokv(uint64_t pa);
+ void sweet_gpu_init(void);
+ 
+ #define MMCC_PA         0x008c0000u
+@@ -54,6 +62,9 @@
+ #define GPU_PA          0x00b00000u
+ #define MEMACC_PA       0x007af000u     /* gfx_mem_acc corner at +0x004 */
+ #define GFX_S2          0x317u
++#define ZAP_PA          0x90f00000u     /* msm8996.dtsi gpu_mem, 1 MB */
++#define ZAP_SIZE        0x00100000u
++#define GPU_PAS_ID      13
+ #define SMMU_PA         0x00b40000u
+ 
+ /* a5xx.xml dword offsets */
+@@ -414,6 +425,114 @@
+ 	emit(pkt7(CP_EVENT_WRITE, 4)); emit(CACHE_FLUSH_TS);
+ 	emit((uint32_t)fence); emit((uint32_t)(fence >> 32)); emit(seq);
+ 	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++}
++
++/*
++ * Qualcomm SCM call, ARM SMCCC (qcom_scm-smc.c): standard call, SMC64, SIP
++ * owner, fn (svc << 8) | cmd, x1 = arginfo, x2-x5 = args. TZ may return
++ * INTERRUPTED (1: call again with x0 = 1, x6 as returned) or
++ * EBUSY (-12: retry later). Returns x0 (0 = ok); *r1 = x1.
++ */
++static int64_t
++scm_call(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
++{
++	uint64_t fn = (1ull << 30) | (2ull << 24) | ((uint64_t)svc << 8) | cmd;
++	for (int busy = 0;; busy++) {
++		uint64_t a0 = fn, a6 = 0;
++		register uint64_t x0 __asm__("x0"), x1 __asm__("x1"), x2 __asm__("x2"), x3 __asm__("x3");
++		register uint64_t x4 __asm__("x4"), x5 __asm__("x5"), x6 __asm__("x6"), x7 __asm__("x7");
++		do {
++			x0 = a0; x1 = arginfo; x2 = a; x3 = b; x4 = c; x5 = 0; x6 = a6; x7 = 0;
++			__asm__ volatile("smc #0"
++			    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++			    :
++			    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++			a0 = 1;
++			a6 = x6;
++		} while (x0 == 1);
++		if ((int64_t)x0 != -12 || busy >= 20) {
++			if (r1) {
++				*r1 = x1;
++			}
++			return (int64_t)x0;
++		}
++		delay(30000);
++	}
++}
++
++/* ELF32 program header */
++struct zap_phdr {
++	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++
++/*
++ * mainline qcom_mdt_load + qcom_scm_pas_auth_and_reset for the split
++ * a530_zap: metadata = the .mdt (ELF header + phdrs + hash segment), one
++ * relocatable loadable segment (the .b02) placed at the carveout start.
++ */
++static bool
++zap_load(void)
++{
++	uint64_t mdt, seg;
++	uint32_t mdt_len, seg_len;
++	if (!blob("GPU-ZAP-MDT", &mdt, &mdt_len) || !blob("GPU-ZAP-SEG", &seg, &seg_len)) {
++		printf("SWEET GPU: no GPU-ZAP-MDT/GPU-ZAP-SEG in the payload\n");
++		return false;
++	}
++	vm_offset_t meta_va;
++	uint64_t meta = gpu_page(&meta_va);
++	if (meta == 0 || mdt_len > PAGE_SIZE || mdt_len < 0x34) {
++		printf("SWEET GPU: zap metadata %u bytes, no page\n", mdt_len);
++		return false;
++	}
++	memcpy((void *)meta_va, (const void *)phystokv(mdt), mdt_len);
++	const uint8_t *m = (const uint8_t *)meta_va;
++	uint32_t phoff = *(const uint32_t *)(m + 0x1c);
++	uint16_t phnum = *(const uint16_t *)(m + 0x2c);
++	uint32_t lo = ~0u, hi = 0, filesz = 0, memsz = 0, nload = 0;
++	for (uint32_t i = 0; i < phnum && phoff + (i + 1) * 32 <= mdt_len; i++) {
++		const struct zap_phdr *ph = (const struct zap_phdr *)(m + phoff + i * 32);
++		/* PT_LOAD, not the hash segment (type field 2 in flags 26:24), not empty */
++		if (ph->type != 1 || ((ph->flags >> 24) & 7) == 2 || ph->memsz == 0) {
++			continue;
++		}
++		nload++;
++		lo = ph->paddr;
++		hi = (ph->paddr + ph->memsz + 0xfff) & ~0xfffu;
++		filesz = ph->filesz;
++		memsz = ph->memsz;
++	}
++	if (nload != 1 || filesz != seg_len || memsz > ZAP_SIZE) {
++		printf("SWEET GPU: zap layout unexpected: %u loadable, filesz %u seg %u memsz %u\n",
++		    nload, filesz, seg_len, memsz);
++		return false;
++	}
++	flush_dcache64((addr64_t)meta, PAGE_SIZE, TRUE);
++	uint64_t r1 = 0;
++	/* PAS_INIT_IMAGE (svc 2 cmd 1): args (pas id VAL, metadata RW) */
++	int64_t r = scm_call(2, 1, 2u | (2u << 6), GPU_PAS_ID, meta, 0, &r1);
++	printf("SWEET GPU: zap init_image (meta %llx, %u bytes) -> %lld/%llx\n", meta, mdt_len, r, r1);
++	if (r != 0 || r1 != 0) {
++		return false;
++	}
++	/* PAS_MEM_SETUP (svc 2 cmd 2): pas id, base, size */
++	r = scm_call(2, 2, 3, GPU_PAS_ID, ZAP_PA, hi - lo, &r1);
++	printf("SWEET GPU: zap mem_setup %x + %x -> %lld/%llx\n", ZAP_PA, hi - lo, r, r1);
++	if (r != 0 || r1 != 0) {
++		return false;
++	}
++	vm_offset_t zap = ml_io_map(ZAP_PA, ZAP_SIZE);
++	if (zap == 0) {
++		return false;
++	}
++	const uint32_t *src = (const uint32_t *)phystokv(seg);
++	for (uint32_t off = 0; off < ((memsz + 3) & ~3u); off += 4) {
++		wr(zap, off, off < seg_len ? src[off / 4] : 0);
++	}
++	/* PAS_AUTH_AND_RESET (svc 2 cmd 5): pas id */
++	r = scm_call(2, 5, 1, GPU_PAS_ID, 0, 0, &r1);
++	printf("SWEET GPU: zap auth_and_reset -> %lld/%llx\n", r, r1);
++	return r == 0 && r1 == 0;
+ }
+ 
+ /* Source pixel (x, y) of the RGBA8 test pattern, byte c. */
+@@ -625,12 +744,13 @@
+ 	printf("SWEET GPU: scratch %08x -> %s\n", got,
+ 	    got == 0xc0ffee01 ? "CP_MEM_WRITE landed: COMMAND PROCESSOR WORKS" : "no write");
+ 	if (level >= 3 && read && got == 0xc0ffee01) {
+-		/*
+-		 * 0128a: blits complete (fences land, no faults) but write nothing:
+-		 * in secure mode the RB may only write secure memory. Try the CP
+-		 * leaving it without a zap shader (mainline/KGSL load one first).
+-		 */
++		/* Leave secure mode (see the header). */
+ 		gpu_wait(11);
++		if (!zap_load()) {
++			printf("SWEET GPU: no zap shader, the GPU stays secure: no blit test\n");
++			return;
++		}
++		gpu_wait(2);
+ 		emit(pkt7(CP_SET_SECURE_MODE, 1));
+ 		emit(0);
+ 		emit(pkt7(CP_MEM_WRITE, 3));
