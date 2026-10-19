@@ -1,0 +1,270 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -15,6 +15,14 @@
+  *              RBBM_STATUS 0x4f5, RBBM_ALWAYSON_COUNTER_LO 0x4d2
+  * Runs 40 s after start with 11 s pauses between stages, so the UFS log
+  * ring (flushed every 10 s) holds the last good step if a stage hangs.
++ *
++ * sweetgpu=2 adds step 2, the command processor (mainline a5xx_hw_init /
++ * a5xx_me_init): GPU SMMU 0xb40000 state (bypass if it translates), CP
++ * microcode from the payload (mkpayload --blob GPU-PM4 / GPU-PFP = the
++ * vendor a530_pm4.fw / a530_pfp.fw without their 4-byte header; not in git),
++ * a 16 KB ring, CP_ME_INIT + CP_MEM_WRITE of 0xc0ffee01 to a scratch page,
++ * then (separately, last) RBBM_SECVID_TRUST_CNTL = 0 to leave secure mode
++ * as mainline does without a zap shader.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -23,10 +31,15 @@
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+ extern bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
++extern ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
+ void sweet_gpu_init(void);
+ 
+ #define MMCC_PA         0x008c0000u
+@@ -34,7 +47,40 @@
+ #define GPU_PA          0x00b00000u
+ #define MEMACC_PA       0x007af000u     /* gfx_mem_acc corner at +0x004 */
+ #define GFX_S2          0x317u
++#define SMMU_PA         0x00b40000u
+ 
++/* a5xx.xml dword offsets */
++#define R_CP_RB_BASE            0x0800
++#define R_CP_RB_CNTL            0x0802
++#define R_CP_RB_RPTR            0x0806
++#define R_CP_RB_WPTR            0x0807
++#define R_CP_ROQ_THRESHOLDS_1   0x081f
++#define R_CP_ROQ_THRESHOLDS_2   0x0820
++#define R_CP_MEQ_THRESHOLDS     0x0825
++#define R_CP_MERCIU_SIZE        0x0826
++#define R_CP_PFP_ME_CNTL        0x0832
++#define R_CP_CHICKEN_DBG        0x0833
++#define R_CP_PFP_INSTR_BASE     0x0835
++#define R_CP_ME_INSTR_BASE      0x0838
++#define R_CP_ADDR_MODE_CNTL     0x0860
++#define R_CP_INTERRUPT_STATUS   0x0b18
++#define R_CP_HW_FAULT           0x0b1a
++#define R_RBBM_AHB_CNTL0        0x0093
++#define R_RBBM_AHB_CNTL1        0x0094
++#define R_RBBM_AHB_CNTL2        0x0095
++#define R_RBBM_INT_0_STATUS     0x04e1
++#define R_RBBM_STATUS           0x04f5
++#define R_VBIF_RR_QOS_ARB       0x3049
++#define R_SECVID_TRUST_CNTL     0xf400
++#define R_SECVID_TSB_BASE       0xf800
++#define R_SECVID_TSB_SIZE       0xf802
++#define R_SECVID_TSB_CNTL       0xf803
++#define R_SECVID_TSB_ADDR_MODE  0xf810
++/* adreno_pm4.xml opcodes */
++#define CP_NOP                  0x10
++#define CP_MEM_WRITE            0x3d
++#define CP_ME_INIT              0x48
++
+ static int gpu_chan;
+ 
+ static void
+@@ -100,12 +146,174 @@
+ {
+ 	wr(mm, gdscr, rd(mm, gdscr) & ~1u);
+ 	return poll(mm, gdscr, 1u << 31, 1u << 31, 10);
++}
++
++static uint32_t
++parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^
++	       (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++/* msm_ringbuffer OUT_PKT7 header */
++static uint32_t
++pkt7(uint32_t op, uint32_t cnt)
++{
++	return (7u << 28) | cnt | (parity(cnt) << 15) | ((op & 0x7fu) << 16) | (parity(op) << 23);
++}
++
++static void
++gw(vm_offset_t gpu, uint32_t reg, uint32_t v)
++{
++	wr(gpu, reg * 4, v);
++}
++
++static uint32_t
++gr(vm_offset_t gpu, uint32_t reg)
++{
++	return rd(gpu, reg * 4);
++}
++
++static void
++gw64(vm_offset_t gpu, uint32_t reg, uint64_t v)
++{
++	gw(gpu, reg, (uint32_t)v);
++	gw(gpu, reg + 1, (uint32_t)(v >> 32));
++}
++
++/* One 16 KB kernel page, physically contiguous; returns its PA. */
++static uint64_t
++gpu_page(vm_offset_t *va)
++{
++	if (kmem_alloc_contig(kernel_map, va, PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	return ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)*va));
++}
++
++static bool
++blob(const char *name, uint64_t *pa, uint32_t *len)
++{
++	DTEntry node;
++	uint64_t const *v;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) != kSuccess ||
++	    SecureDTGetProperty(node, name, (void const **)&v, &size) != kSuccess || size != 16) {
++		return false;
++	}
++	*pa = v[0];
++	*len = (uint32_t)v[1];
++	return true;
++}
++
++static void
++cp_state(vm_offset_t gpu, const char *when)
++{
++	printf("SWEET GPU: %s RBBM_STATUS %08x RPTR %u WPTR %u CP_HW_FAULT %08x CP_INT %08x RBBM_INT %08x TRUST %08x\n",
++	    when, gr(gpu, R_RBBM_STATUS), gr(gpu, R_CP_RB_RPTR), gr(gpu, R_CP_RB_WPTR),
++	    gr(gpu, R_CP_HW_FAULT), gr(gpu, R_CP_INTERRUPT_STATUS), gr(gpu, R_RBBM_INT_0_STATUS),
++	    gr(gpu, R_SECVID_TRUST_CNTL));
+ }
+ 
++/* Step 2: command processor. */
+ static void
++cp_test(vm_offset_t gpu)
++{
++	uint64_t pm4, pfp;
++	uint32_t pm4_len, pfp_len;
++	if (!blob("GPU-PM4", &pm4, &pm4_len) || !blob("GPU-PFP", &pfp, &pfp_len)) {
++		printf("SWEET GPU: no GPU-PM4/GPU-PFP in the payload, no CP test\n");
++		return;
++	}
++	vm_offset_t smmu = ml_io_map(SMMU_PA, 0x10000);
++	if (smmu == 0) {
++		return;
++	}
++	uint32_t cr0 = rd(smmu, 0);
++	printf("SWEET GPU: SMMU sCR0 %08x IDR0 %08x IDR1 %08x SMR0 %08x S2CR0 %08x CB0 SCTLR %08x\n",
++	    cr0, rd(smmu, 0x20), rd(smmu, 0x24), rd(smmu, 0x800), rd(smmu, 0xc00), rd(smmu, 0x8000));
++	if (!(cr0 & 1u)) {
++		/* Not in bypass: CLIENTPD = 1 so the GPU uses physical addresses. */
++		wr(smmu, 0, cr0 | 1u);
++		printf("SWEET GPU: SMMU sCR0 -> %08x\n", rd(smmu, 0));
++	}
++	vm_offset_t ring_va, scratch_va;
++	uint64_t ring = gpu_page(&ring_va), scratch = gpu_page(&scratch_va);
++	if (ring == 0 || scratch == 0) {
++		printf("SWEET GPU: no ring/scratch page\n");
++		return;
++	}
++	printf("SWEET GPU: pm4 %llx (%u) pfp %llx (%u) ring %llx scratch %llx\n",
++	    pm4, pm4_len, pfp, pfp_len, ring, scratch);
++	flush_dcache64((addr64_t)pm4, pm4_len, TRUE);
++	flush_dcache64((addr64_t)pfp, pfp_len, TRUE);
++	gpu_wait(11);
++
++	/* Subset of a5xx_hw_init (A530 values). */
++	gw(gpu, R_VBIF_RR_QOS_ARB, 3);
++	gw(gpu, R_RBBM_AHB_CNTL0, 1);
++	gw(gpu, R_CP_MEQ_THRESHOLDS, 0x40);
++	gw(gpu, R_CP_MERCIU_SIZE, 0x40);
++	gw(gpu, R_CP_ROQ_THRESHOLDS_2, 0x80000060);
++	gw(gpu, R_CP_ROQ_THRESHOLDS_1, 0x40201b16);
++	gw(gpu, R_CP_CHICKEN_DBG, 0x02000000);
++	gw(gpu, R_RBBM_AHB_CNTL1, 0xa6ffffff);
++	gw(gpu, R_RBBM_AHB_CNTL2, 0x3f);
++	gw(gpu, R_SECVID_TSB_CNTL, 0);
++	gw64(gpu, R_SECVID_TSB_BASE, 0);
++	gw(gpu, R_SECVID_TSB_SIZE, 0);
++	gw(gpu, R_CP_ADDR_MODE_CNTL, 1);
++	gw(gpu, R_SECVID_TSB_ADDR_MODE, 1);
++	gw64(gpu, R_CP_ME_INSTR_BASE, pm4);
++	gw64(gpu, R_CP_PFP_INSTR_BASE, pfp);
++	gw64(gpu, R_CP_RB_BASE, ring);
++	/* BUFSZ log2(16 KB / 8) = 11, BLKSZ log2(32 / 8) = 2 (mainline), NO_UPDATE */
++	gw(gpu, R_CP_RB_CNTL, 11u | (2u << 8) | (1u << 27));
++	cp_state(gpu, "before ME start:");
++
++	uint32_t *rb = (uint32_t *)ring_va, n = 0;
++	rb[n++] = pkt7(CP_ME_INIT, 8);
++	rb[n++] = 0x2f;
++	rb[n++] = 0x3;
++	rb[n++] = 0x20000000;
++	rb[n++] = 0;
++	rb[n++] = 0;
++	rb[n++] = 0xb;          /* A530 token-end-sync workaround */
++	rb[n++] = 0;
++	rb[n++] = 0;
++	rb[n++] = pkt7(CP_MEM_WRITE, 3);
++	rb[n++] = (uint32_t)scratch;
++	rb[n++] = (uint32_t)(scratch >> 32);
++	rb[n++] = 0xc0ffee01;
++	rb[n++] = pkt7(CP_NOP, 0);
++	flush_dcache64((addr64_t)ring, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)scratch, PAGE_SIZE, TRUE);
++
++	gw(gpu, R_CP_PFP_ME_CNTL, 0);   /* clear ME_HALT */
++	gw(gpu, R_CP_RB_WPTR, n);
++	unsigned ms;
++	for (ms = 0; ms < 200 && gr(gpu, R_CP_RB_RPTR) != n; ms++) {
++		delay(1000);
++	}
++	delay(1000);
++	flush_dcache64((addr64_t)scratch, 64, TRUE);
++	uint32_t got = *(volatile uint32_t *)scratch_va;
++	cp_state(gpu, ms < 200 ? "ring consumed:" : "ring NOT consumed (200 ms):");
++	printf("SWEET GPU: scratch %08x -> %s\n", got,
++	    got == 0xc0ffee01 ? "CP_MEM_WRITE landed: COMMAND PROCESSOR WORKS" : "no write");
++	gpu_wait(11);
++
++	/* Leave secure mode (mainline's no-zap-shader path); TZ may refuse. */
++	printf("SWEET GPU: writing RBBM_SECVID_TRUST_CNTL = 0\n");
++	gpu_wait(11);
++	gw(gpu, R_SECVID_TRUST_CNTL, 0);
++	cp_state(gpu, "after TRUST_CNTL write:");
++}
++
++static void
+ gpu_thread(void *arg, wait_result_t result)
+ {
+-	(void)arg;
+ 	(void)result;
+ 	gpu_wait(40);
+ 	vm_offset_t mm = ml_io_map(MMCC_PA, 0x10000);
+@@ -198,6 +406,10 @@
+ 	uint32_t aon1 = rd(gpu, 0x4d2 * 4);
+ 	printf("SWEET GPU: VBIF_VERSION %08x RBBM_STATUS %08x ALWAYSON %08x -> %08x (%s)\n",
+ 	    vbif, status, aon0, aon1, aon1 != aon0 ? "counting: GPU alive" : "not counting");
++	if ((int)(uintptr_t)arg >= 2 && aon1 != aon0) {
++		gpu_wait(11);
++		cp_test(gpu);
++	}
+ }
+ 
+ void
+@@ -208,7 +420,7 @@
+ 	if (!PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
+-	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
++	if (kernel_thread_start(gpu_thread, (void *)(uintptr_t)on, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }

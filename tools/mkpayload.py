@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pack an xnu kernel Mach-O + ADT into the payload the sweet shim boots.
 
-  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE]
+  mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE] [--blob NAME=FILE ...]
 
 The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
 (no kmutil, no iBoot) resolves those for us, and xnu only rebases static
@@ -25,6 +25,10 @@ kernel_end past it, so the shim needs no changes: the image lands below the
 ADT and boot_args, inside topOfKernelData (never handed to the VM), and the
 ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
 turn into md0 (boot with rd=md0).
+
+--blob NAME=FILE does the same for any file under /chosen/memory-map NAME
+(e.g. the Adreno microcode, which must not live in git: sweet_gpu.c reads
+GPU-PM4 / GPU-PFP).
 """
 import argparse, os, struct, sys
 
@@ -122,13 +126,13 @@ def decode(raw, fmt, image_base):
     raise ValueError(f'unsupported chained pointer format {fmt}')
 
 
-def add_ramdisk_to_adt(adt_blob, phys, size):
-    """Return the ADT with /chosen/memory-map RAMDisk = <phys, size> (two uintptr_t)."""
+def add_memory_map_entry(adt_blob, name, phys, size):
+    """Return the ADT with /chosen/memory-map NAME = <phys, size> (two uintptr_t)."""
     root, _ = adt.parse(adt_blob)
     chosen = next(c for c in root.children if c.name == 'chosen')
     mmap = next(c for c in chosen.children if c.name == 'memory-map')
-    assert mmap.prop('RAMDisk') is None, 'ADT already has a RAMDisk'
-    mmap.props.append(('RAMDisk', 0, struct.pack('<2Q', phys, size)))
+    assert mmap.prop(name) is None, f'ADT already has {name}'
+    mmap.props.append((name, 0, struct.pack('<2Q', phys, size)))
     return adt.serialize(root)
 
 
@@ -140,7 +144,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -158,15 +162,18 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
     ramdisk = None
-    if ramdisk_path:
-        image = open(ramdisk_path, 'rb').read()
-        rd_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
-        rd_va = kernel_end
-        kernel_end = rd_va + rd_size
-        rd_pa = rd_va - virt_base + PHYS_BASE
-        pieces.append((rd_va, rd_size, image))
-        adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
-        ramdisk = (hex(rd_pa), hex(rd_size))
+    extra = ([('RAMDisk', ramdisk_path)] if ramdisk_path else []) + list(blobs)
+    for name, path in extra:
+        image = open(path, 'rb').read()
+        size = (len(image) + PAGE - 1) & ~(PAGE - 1)
+        va = kernel_end
+        kernel_end = va + size
+        pa = va - virt_base + PHYS_BASE
+        pieces.append((va, size, image))
+        # The exact length (not page-rounded) for blobs; md0 wants whole pages.
+        adt_blob = add_memory_map_entry(adt_blob, name, pa, size if name == 'RAMDisk' else len(image))
+        if name == 'RAMDisk':
+            ramdisk = (hex(pa), hex(size))
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -198,8 +205,10 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--blob', action='append', default=[], metavar='NAME=FILE',
+                    help='file for /chosen/memory-map NAME')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, [b.split('=', 1) for b in a.blob])
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
