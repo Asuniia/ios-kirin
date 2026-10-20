@@ -440,7 +440,7 @@ trace_empty_samplers(GLint prog)
 }
 
 /* SWEETGL_TRACE: each distinct draw state once (program, blend, stencil, depth, target) */
-static void
+static bool
 trace_draw_state(GLint prog, GLenum mode, GLsizei count)
 {
 	static uint32_t seen[8192];
@@ -469,24 +469,35 @@ trace_draw_state(GLint prog, GLenum mode, GLsizei count)
 	    16777619u;
 	key = (key ^ (uint32_t)vp[2] ^ (uint32_t)vp[3] << 16) * 16777619u;
 	if (seen[key % 8192] == key) {
-		return;
+		return false;
 	}
 	seen[key % 8192] = key;
-	TRACE("draw prog %d mode %#x n %d fb %d vp %dx%d blend %d %#x/%#x %#x/%#x eq %#x stencil %d func %#x pass %#x "
-	    "depth %d scissor %d mask %d%d%d%d", prog, mode, count, v[11], vp[2], vp[3], v[0], v[1], v[2], v[3], v[4],
+	TRACE("draw prog %d tex %u %u %u mode %#x n %d fb %d vp %dx%d blend %d %#x/%#x %#x/%#x eq %#x stencil %d func %#x pass %#x "
+	    "depth %d scissor %d mask %d%d%d%d", prog, unit_held[0], unit_held[1], unit_held[2], mode, count, v[11], vp[2], vp[3], v[0], v[1], v[2], v[3], v[4],
 	    v[5], v[6], v[7], v[8], v[9], v[10], m[0], m[1], m[2], m[3]);
+	return true;
+}
+
+/* after a new draw state (trace): the pixel now at the viewport center */
+static void
+trace_draw_result(GLint prog)
+{
+	GLint vp[4] = {0}, fb = 0;
+	uint8_t px[4] = {0};
+	glGetIntegerv(GL_VIEWPORT, vp);
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+	glReadPixels(vp[0] + vp[2] / 2, vp[1] + vp[3] / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	GLenum e = glGetError();
+	TRACE("  -> prog %d fb %d center rgba %02x%02x%02x%02x (err %#x)", prog, fb, px[0], px[1], px[2], px[3], e);
 }
 
 /* before a draw: each unit holds what the program samples there, rect scale set */
-static void
+static bool
 draw_prep(GLenum mode, GLsizei count)
 {
 	GLint prog = 0, unit = -1, w = 0, h = 0, scale = -1;
+	bool fresh = false;
 	glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
-	if (trace_left > 0 && prog != 0) {
-		trace_empty_samplers(prog);
-		trace_draw_state(prog, mode, count);
-	}
 	for (int i = 0; i < n_rect_programs; i++) {
 		if (rect_programs[i].program == (GLuint)prog) {
 			scale = rect_programs[i].scale;
@@ -531,6 +542,11 @@ draw_prep(GLenum mode, GLsizei count)
 	if (active >= 0) {
 		glActiveTexture(GL_TEXTURE0 + active);
 	}
+	if (trace_left > 0 && prog != 0) {
+		trace_empty_samplers(prog);
+		fresh = trace_draw_state(prog, mode, count);
+	}
+	return fresh;
 }
 
 void
@@ -584,8 +600,13 @@ void
 sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count)
 {
 	SGL_CUR(rctx);
-	draw_prep(mode, count);
+	bool fresh = draw_prep(mode, count);
 	glDrawArrays(mode, first, count);
+	if (fresh) {
+		GLint prog = 0;
+		glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+		trace_draw_result(prog);
+	}
 	SGL_POST(65);
 }
 
@@ -593,8 +614,13 @@ void
 sgl_DrawElements(void *rctx, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
 	SGL_CUR(rctx);
-	draw_prep(mode, count);
+	bool fresh = draw_prep(mode, count);
 	glDrawElements(mode, count, type, indices);
+	if (fresh) {
+		GLint prog = 0;
+		glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+		trace_draw_result(prog);
+	}
 	SGL_POST(67);
 }
 
