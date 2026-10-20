@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/vm_page_size.h>
 
@@ -59,6 +60,17 @@ static int trace_left;          /* SWEETGL_TRACE=1: this many trace lines */
 static bool dump_shaders;       /* SWEETGL_TRACE=1: every shader source, no limit */
 
 #define TRACE(...) do { if (trace_left > 0) { trace_left--; sweet_drm_log("sweetgl: trace " __VA_ARGS__); } } while (0)
+
+/*
+ * SWEETGL_TRACE: draws are traced in windows, every draw of one (state,
+ * result and thumbnail), WIN_DRAWS draws every WIN_SECS from WIN_START.
+ */
+#define WIN_START 40
+#define WIN_SECS 15
+#define WIN_DRAWS 250
+static int win_left;
+static time_t win_next;
+#define WTRACE(...) do { if (win_left > 0) TRACE(__VA_ARGS__); } while (0)
 
 /* ponytail: linear table of contexts; backboardd makes one or two */
 #define MAX_CTX 32
@@ -190,7 +202,7 @@ sgl_DiscardFramebufferEXT(void *rctx, GLenum target, GLsizei n, const GLenum *at
 	SGL_CUR(rctx);
 	GLint fb = 0;
 	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
-	TRACE("DiscardFramebuffer fb %d n %d first %#x", fb, n, n > 0 ? attachments[0] : 0);
+	WTRACE("DiscardFramebuffer fb %d n %d first %#x", fb, n, n > 0 ? attachments[0] : 0);
 	glInvalidateFramebuffer(target, n, attachments);
 }
 
@@ -490,18 +502,41 @@ feedback_barrier(GLint prog)
 	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &att);
 	for (int u = 0; u < 15; u++) {
 		if ((prog_units[prog] & 1u << u) && unit_held[u] == (GLuint)att) {
-			TRACE("feedback: prog %d samples fb %d's texture %d on unit %d: barrier", prog, fb, att, u);
+			WTRACE("feedback: prog %d samples fb %d's texture %d on unit %d: barrier", prog, fb, att, u);
 			_mesa_TextureBarrierNV();
 			return;
 		}
 	}
 }
 
-/* SWEETGL_TRACE: each distinct draw state once (program, blend, stencil, depth, target) */
+/* SWEETGL_TRACE: whether this draw is in a window (opens one when due) */
 static bool
+window_draw(void)
+{
+	struct timespec t;
+	if (trace_left <= 0) {
+		return false;
+	}
+	if (win_left > 0 && --win_left > 0) {
+		return true;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	if (win_next == 0) {
+		win_next = t.tv_sec + WIN_START;
+	}
+	if (t.tv_sec < win_next) {
+		return false;
+	}
+	win_next = t.tv_sec + WIN_SECS;
+	win_left = WIN_DRAWS;
+	TRACE("window at %lds: next %d draws", (long)t.tv_sec, WIN_DRAWS);
+	return true;
+}
+
+/* SWEETGL_TRACE: the draw's state and the program's non-sampler uniforms */
+static void
 trace_draw_state(GLint prog, GLenum mode, GLsizei count)
 {
-	static uint32_t seen[8192];
 	GLint v[16] = {0};
 	GLboolean m[4] = {0};
 	v[0] = glIsEnabled(GL_BLEND);
@@ -509,31 +544,47 @@ trace_draw_state(GLint prog, GLenum mode, GLsizei count)
 	glGetIntegerv(GL_BLEND_DST_RGB, &v[2]);
 	glGetIntegerv(GL_BLEND_SRC_ALPHA, &v[3]);
 	glGetIntegerv(GL_BLEND_DST_ALPHA, &v[4]);
-	glGetIntegerv(GL_BLEND_EQUATION_RGB, &v[5]);
-	v[6] = glIsEnabled(GL_STENCIL_TEST);
-	glGetIntegerv(GL_STENCIL_FUNC, &v[7]);
-	glGetIntegerv(GL_STENCIL_PASS_DEPTH_PASS, &v[8]);
-	v[9] = glIsEnabled(GL_DEPTH_TEST);
 	v[10] = glIsEnabled(GL_SCISSOR_TEST);
 	glGetBooleanv(GL_COLOR_WRITEMASK, m);
 	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &v[11]);
-	GLint vp[4] = {0};
+	GLint vp[4] = {0}, sc[4] = {0};
 	glGetIntegerv(GL_VIEWPORT, vp);
-	uint32_t key = 2166136261u;
-	for (int i = 0; i < 12; i++) {
-		key = (key ^ (uint32_t)v[i]) * 16777619u;
+	glGetIntegerv(GL_SCISSOR_BOX, sc);
+	TRACE("draw prog %d tex %u %u %u mode %#x n %d fb %d vp %d,%d %dx%d blend %d %#x/%#x %#x/%#x scissor %d %d,%d %dx%d "
+	    "mask %d%d%d%d", prog, unit_held[0], unit_held[1], unit_held[2], mode, count, v[11], vp[0], vp[1], vp[2], vp[3],
+	    v[0], v[1], v[2], v[3], v[4], v[10], sc[0], sc[1], sc[2], sc[3], m[0], m[1], m[2], m[3]);
+	char line[400];
+	size_t len = 0;
+	GLint n = 0;
+	glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &n);
+	for (GLint i = 0; i < n && len < sizeof(line) - 80; i++) {
+		char name[64];
+		GLint size = 0;
+		GLenum type = 0;
+		glGetActiveUniform(prog, i, sizeof(name), NULL, &size, &type, name);
+		int k = type == GL_FLOAT ? 1 : type == GL_FLOAT_VEC2 ? 2 : type == GL_FLOAT_VEC3 ? 3 :
+		    type == GL_FLOAT_VEC4 ? 4 : type == GL_FLOAT_MAT4 ? 16 : 0;
+		if (k == 0 || strncmp(name, "texmat", 6) == 0 || strcmp(name, "mvp") == 0) {
+			continue;
+		}
+		char *br = strchr(name, '[');
+		if (br != NULL) {
+			*br = 0;
+		}
+		len += (size_t)snprintf(line + len, sizeof(line) - len, " %s=", name);
+		for (GLint e = 0; e < size && e < 8; e++) {
+			char el[80];
+			GLfloat f[16] = {0};
+			snprintf(el, sizeof(el), size > 1 ? "%s[%d]" : "%s", name, e);
+			glGetUniformfv(prog, glGetUniformLocation(prog, el), f);
+			for (int j = 0; j < k && len < sizeof(line) - 12; j++) {
+				len += (size_t)snprintf(line + len, sizeof(line) - len, "%s%.3g", j ? "," : e ? ";" : "", f[j]);
+			}
+		}
 	}
-	key = (key ^ (uint32_t)prog ^ (uint32_t)mode << 8 ^ (uint32_t)(m[0] | m[1] << 1 | m[2] << 2 | m[3] << 3) << 16) *
-	    16777619u;
-	key = (key ^ (uint32_t)vp[2] ^ (uint32_t)vp[3] << 16) * 16777619u;
-	if (seen[key % 8192] == key) {
-		return false;
+	if (len > 0) {
+		TRACE("  uniforms%s", line);
 	}
-	seen[key % 8192] = key;
-	TRACE("draw prog %d tex %u %u %u mode %#x n %d fb %d vp %dx%d blend %d %#x/%#x %#x/%#x eq %#x stencil %d func %#x pass %#x "
-	    "depth %d scissor %d mask %d%d%d%d", prog, unit_held[0], unit_held[1], unit_held[2], mode, count, v[11], vp[2], vp[3], v[0], v[1], v[2], v[3], v[4],
-	    v[5], v[6], v[7], v[8], v[9], v[10], m[0], m[1], m[2], m[3]);
-	return true;
 }
 
 /* after a new draw state (trace): what the viewport now holds */
@@ -561,7 +612,28 @@ trace_draw_result(GLint prog)
 			mx[c] = px[i * 4 + c] > mx[c] ? px[i * 4 + c] : mx[c];
 		}
 	}
+	/* 32x8 cells, bottom row last: ' ' no alpha, else the cell's mean luma 0-9 */
+	char thumb[8 * 33 + 1];
+	for (int cy = 0; cy < 8; cy++) {
+		for (int cx = 0; cx < 32; cx++) {
+			size_t x0 = (size_t)vp[2] * cx / 32, x1 = (size_t)vp[2] * (cx + 1) / 32;
+			size_t y0 = (size_t)vp[3] * (7 - cy) / 8, y1 = (size_t)vp[3] * (8 - cy) / 8;
+			uint64_t a = 0, l = 0, cnt = 0;
+			for (size_t y = y0; y < y1; y++) {
+				for (size_t x = x0; x < x1; x++) {
+					const uint8_t *q = px + (y * (size_t)vp[2] + x) * 4;
+					a += q[3];
+					l += (q[0] * 54u + q[1] * 183u + q[2] * 19u) >> 8;
+					cnt++;
+				}
+			}
+			thumb[cy * 33 + cx] = cnt == 0 || a == 0 ? ' ' : (char)('0' + l * 9 / (cnt * 255));
+		}
+		thumb[cy * 33 + 32] = '/';
+	}
+	thumb[8 * 33 - 1] = 0;
 	const uint8_t *f = first < n ? px + first * 4 : mx;
+	TRACE("  |%s|", thumb);
 	TRACE("  -> prog %d fb %d: %zu of %zu pixels with alpha, max %02x%02x%02x%02x, first lit %02x%02x%02x%02x at %zu,%zu "
 	    "(err %#x)", prog, fb, lit, n, mx[0], mx[1], mx[2], mx[3], f[0], f[1], f[2], f[3],
 	    first < n ? first % (size_t)vp[2] : 0, first < n ? first / (size_t)vp[2] : 0, e);
@@ -620,9 +692,10 @@ draw_prep(GLenum mode, GLsizei count)
 		glActiveTexture(GL_TEXTURE0 + active);
 	}
 	feedback_barrier(prog);
-	if (trace_left > 0 && prog != 0) {
+	if (prog != 0 && window_draw()) {
 		trace_empty_samplers(prog);
-		fresh = trace_draw_state(prog, mode, count);
+		trace_draw_state(prog, mode, count);
+		fresh = true;
 	}
 	return fresh;
 }
@@ -773,7 +846,7 @@ sgl_Clear(void *rctx, GLbitfield mask)
 	SGL_CUR(rctx);
 	GLint fb = 0;
 	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
-	TRACE("Clear fb %d mask %#x", fb, mask);
+	WTRACE("Clear fb %d mask %#x", fb, mask);
 	glClear(mask);
 	SGL_POST(10);
 }
@@ -782,7 +855,7 @@ void
 sgl_BindFramebufferEXT(void *rctx, GLenum target, GLuint framebuffer)
 {
 	SGL_CUR(rctx);
-	TRACE("BindFramebuffer %u", framebuffer);
+	WTRACE("BindFramebuffer %u", framebuffer);
 	glBindFramebuffer(target, framebuffer);
 	SGL_POST(672);
 }
@@ -1013,7 +1086,7 @@ surf_res_put(const struct surf_res *key, struct pipe_resource *res)
 	pipe_resource_reference(&surf_res[victim].res, res);
 }
 
-/* texture swizzle of the bound texture: identity, or A,R,G,B bytes read as RGBA */
+/* texture swizzle of the bound texture: identity, or A,B,G,R bytes read as RGBA */
 static uint8_t tex_argb[TEXSZ_MAX];
 
 static void
@@ -1024,9 +1097,9 @@ set_swizzle(GLenum target, bool argb)
 		return;
 	}
 	tex_argb[tex] = argb;
-	glTexParameteri(target, GL_TEXTURE_SWIZZLE_R, argb ? GL_GREEN : GL_RED);
+	glTexParameteri(target, GL_TEXTURE_SWIZZLE_R, argb ? GL_ALPHA : GL_RED);
 	glTexParameteri(target, GL_TEXTURE_SWIZZLE_G, argb ? GL_BLUE : GL_GREEN);
-	glTexParameteri(target, GL_TEXTURE_SWIZZLE_B, argb ? GL_ALPHA : GL_BLUE);
+	glTexParameteri(target, GL_TEXTURE_SWIZZLE_B, argb ? GL_GREEN : GL_BLUE);
 	glTexParameteri(target, GL_TEXTURE_SWIZZLE_A, argb ? GL_RED : GL_ALPHA);
 }
 
@@ -1132,7 +1205,8 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	}
 	/*
 	 * CA's own 32-bit images without an IOSurface format (attached, no GL
-	 * format) are A,R,G,B in memory and sampled as RGBA by its shaders.
+	 * format) are A,B,G,R in memory (the Settings "+" circle, systemBlue:
+	 * fc fc 79 00) and sampled as RGBA by its shaders.
 	 */
 	bool argb = format == 0 && fourcc == 0 && !multi && IOSurfaceGetBytesPerElement(s) == 4;
 	if (argb) {
