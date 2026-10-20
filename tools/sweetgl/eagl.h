@@ -8,7 +8,12 @@
 #include <stdint.h>
 
 #define SGL_SLOTS 1036
-#define SGL_TGT(t) ((t) == 0x84F5 /* GL_TEXTURE_RECTANGLE */ ? GL_TEXTURE_2D : (t))
+/*
+ * GL_TEXTURE_RECTANGLE (0x84F5) textures are 2D ones; each unit keeps its own
+ * 2D and rect binding like Apple's GL, and the one for target is bound first.
+ */
+GLenum sgl_tgt(GLenum target);
+#define SGL_TGT(t) ((t) == GL_TEXTURE_2D || (t) == 0x84F5 ? sgl_tgt(t) : (t))
 
 /* rctx of the GLI calls: the shim's context; made current on the calling thread if it is not */
 extern __thread void *sgl_current;
@@ -48,6 +53,7 @@ void sgl_LinkProgramARB(void *rctx, GLhandleARB program);
 void sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GLcharARB **string,
     const GLint *length);
 void sgl_BindTexture(void *rctx, GLenum target, GLuint texture);
+void sgl_DeleteTextures(void *rctx, GLsizei n, const GLuint *textures);
 void sgl_PixelStorei(void *rctx, GLenum pname, GLint param);
 void sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count);
 void sgl_DrawElements(void *rctx, GLenum mode, GLsizei count, GLenum type, const void *indices);

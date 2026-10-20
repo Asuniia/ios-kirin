@@ -245,7 +245,7 @@ static void
 tex_size_bound(GLenum target, GLint level, GLsizei w, GLsizei h)
 {
 	GLint tex = 0;
-	if (level != 0 || SGL_TGT(target) != GL_TEXTURE_2D) {
+	if (level != 0 || (target != GL_TEXTURE_2D && target != 0x84F5)) {
 		return;
 	}
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
@@ -335,37 +335,77 @@ rect_link(GLuint program)
 	}
 }
 
-static void
-rect_fixup(void)
+/* per unit: the 2D and rect bindings CA made, and the one GL holds */
+#define UNITS 16
+static GLuint unit_2d[UNITS], unit_rect[UNITS], unit_held[UNITS];
+
+static int
+active_unit(void)
 {
-	if (n_rect_programs == 0) {
-		return;
+	GLint active = GL_TEXTURE0;
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+	return (active - GL_TEXTURE0) & (UNITS - 1);
+}
+
+GLenum
+sgl_tgt(GLenum target)
+{
+	int u = active_unit();
+	GLuint want = target == GL_TEXTURE_2D ? unit_2d[u] : unit_rect[u];
+	if (unit_held[u] != want) {
+		glBindTexture(GL_TEXTURE_2D, want);
+		unit_held[u] = want;
 	}
-	GLint prog = 0;
+	return GL_TEXTURE_2D;
+}
+
+/* before a draw: each unit holds what the program samples there, rect scale set */
+static void
+draw_prep(void)
+{
+	GLint prog = 0, unit = -1, w = 0, h = 0, scale = -1;
 	glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
 	for (int i = 0; i < n_rect_programs; i++) {
-		if (rect_programs[i].program != (GLuint)prog || rect_programs[i].scale < 0) {
-			continue;
+		if (rect_programs[i].program == (GLuint)prog) {
+			scale = rect_programs[i].scale;
+			unit = 0;
+			if (rect_programs[i].sampler >= 0) {
+				glGetUniformiv(prog, rect_programs[i].sampler, &unit);
+			}
+			break;
 		}
-		GLint unit = 0, active = GL_TEXTURE0, w = 0, h = 0;
-		if (rect_programs[i].sampler >= 0) {
-			glGetUniformiv(prog, rect_programs[i].sampler, &unit);
+	}
+	int active = -1;
+	for (int u = 0; u < UNITS; u++) {
+		GLuint want = u == unit ? unit_rect[u] : unit_2d[u];
+		if (unit_held[u] != want) {
+			if (active < 0) {
+				active = active_unit();
+			}
+			glActiveTexture(GL_TEXTURE0 + u);
+			glBindTexture(GL_TEXTURE_2D, want);
+			unit_held[u] = want;
 		}
-		GLint tex = 0;
-		glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
-		glActiveTexture(GL_TEXTURE0 + unit);
-		glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
-		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
-		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
-		GLenum qe = glGetError();
-		glActiveTexture(active);
-		if ((w <= 0 || h <= 0) && tex > 0 && tex < TEXSZ_MAX) {
+	}
+	if (unit >= 0 && unit < UNITS && scale >= 0) {
+		GLuint tex = unit_rect[unit];
+		if (tex < TEXSZ_MAX) {
 			w = tex_w[tex];
 			h = tex_h[tex];
 		}
-		glUniform2f(rect_programs[i].scale, w > 0 ? 1.0f / w : 1.0f, h > 0 ? 1.0f / h : 1.0f);
-		TRACE("rect program %d unit %d tex %d %dx%d (query error %#x)", prog, unit, tex, w, h, qe);
-		return;
+		if (w <= 0 || h <= 0) {
+			if (active < 0) {
+				active = active_unit();
+			}
+			glActiveTexture(GL_TEXTURE0 + unit);
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+		}
+		glUniform2f(scale, w > 0 ? 1.0f / w : 1.0f, h > 0 ? 1.0f / h : 1.0f);
+		TRACE("rect program %d unit %d tex %u %dx%d", prog, unit, tex, w, h);
+	}
+	if (active >= 0) {
+		glActiveTexture(GL_TEXTURE0 + active);
 	}
 }
 
@@ -373,15 +413,37 @@ void
 sgl_BindTexture(void *rctx, GLenum target, GLuint texture)
 {
 	SGL_CUR(rctx);
-	if (trace_left > 0) {
-		GLint active = 0;
-		glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
-		if (target != GL_TEXTURE_2D || active != GL_TEXTURE0) {
-			(void)active;
+	if (target == GL_TEXTURE_2D || target == 0x84F5) {
+		int u = active_unit();
+		*(target == GL_TEXTURE_2D ? &unit_2d[u] : &unit_rect[u]) = texture;
+		unit_held[u] = texture;
+		glBindTexture(GL_TEXTURE_2D, texture);
+	} else {
+		glBindTexture(target, texture);
+	}
+	SGL_POST(5);
+}
+
+/* GL unbinds deleted textures everywhere: so do the shadows */
+void
+sgl_DeleteTextures(void *rctx, GLsizei n, const GLuint *textures)
+{
+	SGL_CUR(rctx);
+	for (GLsizei i = 0; i < n; i++) {
+		for (int u = 0; u < UNITS; u++) {
+			if (unit_2d[u] == textures[i]) {
+				unit_2d[u] = 0;
+			}
+			if (unit_rect[u] == textures[i]) {
+				unit_rect[u] = 0;
+			}
+			if (unit_held[u] == textures[i]) {
+				unit_held[u] = 0;
+			}
 		}
 	}
-	glBindTexture(SGL_TGT(target), texture);
-	SGL_POST(5);
+	glDeleteTextures(n, textures);
+	SGL_POST(59);
 }
 
 void
@@ -397,7 +459,7 @@ void
 sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count)
 {
 	SGL_CUR(rctx);
-	rect_fixup();
+	draw_prep();
 	glDrawArrays(mode, first, count);
 	SGL_POST(65);
 }
@@ -406,7 +468,7 @@ void
 sgl_DrawElements(void *rctx, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
 	SGL_CUR(rctx);
-	rect_fixup();
+	draw_prep();
 	glDrawElements(mode, count, type, indices);
 	SGL_POST(67);
 }
