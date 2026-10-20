@@ -217,6 +217,39 @@ sgl_GetString(void *rctx, GLenum name)
 	return s;
 }
 
+/* failures logged with the info log and source: CA does not ask for them */
+void
+sgl_CompileShaderARB(void *rctx, GLhandleARB shader)
+{
+	SGL_CUR(rctx);
+	glCompileShader(H(shader));
+	GLint ok = 0;
+	glGetShaderiv(H(shader), GL_COMPILE_STATUS, &ok);
+	if (!ok) {
+		static char log[1024], src[4096];
+		glGetShaderInfoLog(H(shader), sizeof(log), NULL, log);
+		glGetShaderSource(H(shader), sizeof(src), NULL, src);
+		sweet_drm_log("sweetgl: shader %u compile failed: %.400s", H(shader), log);
+		for (size_t i = 0, n = strlen(src); i < n; i += 400) {
+			sweet_drm_log("sweetgl:   src %.400s", src + i);
+		}
+	}
+}
+
+void
+sgl_LinkProgramARB(void *rctx, GLhandleARB program)
+{
+	SGL_CUR(rctx);
+	glLinkProgram(H(program));
+	GLint ok = 0;
+	glGetProgramiv(H(program), GL_LINK_STATUS, &ok);
+	if (!ok) {
+		static char log[1024];
+		glGetProgramInfoLog(H(program), sizeof(log), NULL, log);
+		sweet_drm_log("sweetgl: program %u link failed: %.400s", H(program), log);
+	}
+}
+
 /* Apple's ES takes internalformat GL_RGBA with format GL_BGRA; Mesa wants GL_BGRA for both */
 void
 sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLsizei width,
@@ -291,9 +324,48 @@ sweetgl_image_hooks(struct pipe_frontend_screen *fscreen)
 }
 
 static enum pipe_format
-surface_format(uint32_t fourcc, unsigned *internalformat)
+gl_format(GLenum format, GLenum type, unsigned *internalformat)
+{
+	bool half = type == GL_HALF_FLOAT || type == 0x8D61 /* GL_HALF_FLOAT_OES */;
+	switch (format) {
+	case GL_BGRA_EXT:
+		*internalformat = GL_RGBA8;
+		return PIPE_FORMAT_B8G8R8A8_UNORM;
+	case GL_RGBA:
+		*internalformat = half ? GL_RGBA16F : GL_RGBA8;
+		return half ? PIPE_FORMAT_R16G16B16A16_FLOAT : PIPE_FORMAT_R8G8B8A8_UNORM;
+	case GL_LUMINANCE_ALPHA:
+		*internalformat = GL_LUMINANCE_ALPHA;
+		return PIPE_FORMAT_L8A8_UNORM;
+	case GL_LUMINANCE:
+		*internalformat = GL_LUMINANCE;
+		return PIPE_FORMAT_L8_UNORM;
+	case GL_ALPHA:
+		*internalformat = GL_ALPHA;
+		return PIPE_FORMAT_A8_UNORM;
+	case GL_RED:
+		*internalformat = half ? GL_R16F : GL_R8;
+		return half ? PIPE_FORMAT_R16_FLOAT : PIPE_FORMAT_R8_UNORM;
+	case GL_RG:
+		*internalformat = half ? GL_RG16F : GL_RG8;
+		return half ? PIPE_FORMAT_R16G16_FLOAT : PIPE_FORMAT_R8G8_UNORM;
+	default:
+		return PIPE_FORMAT_NONE;
+	}
+}
+
+static enum pipe_format
+surface_format(uint32_t fourcc, size_t bpe, unsigned *internalformat)
 {
 	switch (fourcc) {
+	case 0:                 /* CA's own render surfaces carry no format */
+		return bpe == 4 ? gl_format(GL_BGRA_EXT, GL_UNSIGNED_BYTE, internalformat) :
+		       bpe == 8 ? gl_format(GL_RGBA, GL_HALF_FLOAT, internalformat) :
+		       bpe == 1 ? gl_format(GL_RED, GL_UNSIGNED_BYTE, internalformat) : PIPE_FORMAT_NONE;
+	case 'LA08':
+		return gl_format(GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, internalformat);
+	case 'A008':
+		return gl_format(GL_ALPHA, GL_UNSIGNED_BYTE, internalformat);
 	case 'BGRA':
 		*internalformat = GL_RGBA8;
 		return PIPE_FORMAT_B8G8R8A8_UNORM;
@@ -316,17 +388,18 @@ surface_format(uint32_t fourcc, unsigned *internalformat)
 
 /* The surface's pages as the storage of the texture bound to target. */
 static bool
-bind_surface(IOSurfaceRef s, GLenum target, uint32_t plane, const char *why)
+bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t plane, const char *why)
 {
 	static int logged;
 	uint32_t fourcc = IOSurfaceGetPixelFormat(s);
 	size_t w = IOSurfaceGetWidthOfPlane(s, plane), h = IOSurfaceGetHeightOfPlane(s, plane);
 	size_t pitch = IOSurfaceGetBytesPerRowOfPlane(s, plane);
-	if (IOSurfaceGetPlaneCount(s) > 1 || plane != 0) {
-		fourcc = 0;             /* ponytail: multi-planar (YUV) surfaces not yet */
-	}
 	struct sgl_image img = {0};
-	img.format = surface_format(fourcc, &img.internalformat);
+	bool multi = IOSurfaceGetPlaneCount(s) > 1 || plane != 0;   /* ponytail: YUV surfaces not yet */
+	img.format = format && !multi ? gl_format(format, type, &img.internalformat) : PIPE_FORMAT_NONE;
+	if (img.format == PIPE_FORMAT_NONE && !multi) {
+		img.format = surface_format(fourcc, IOSurfaceGetBytesPerElementOfPlane(s, plane), &img.internalformat);
+	}
 	uint32_t handle = 0;
 	uint64_t size = 0;
 	if (img.format != PIPE_FORMAT_NONE &&
@@ -463,7 +536,7 @@ m_tex_iosurface(id self, SEL cmd, IOSurfaceRef s, NSUInteger target, NSUInteger 
 		    height, format, type, plane, invert);
 	}
 	SGL_CUR(c);
-	return bind_surface(s, (GLenum)target, plane, "texImageIOSurface");
+	return bind_surface(s, (GLenum)target, (GLenum)format, (GLenum)type, plane, "texImageIOSurface");
 }
 
 static BOOL
@@ -474,7 +547,7 @@ m_attach(id self, SEL cmd, NSUInteger target, IOSurfaceRef s, BOOL inverted)
 		return ((BOOL(*)(id, SEL, NSUInteger, IOSurfaceRef, BOOL))orig_attach)(self, cmd, target, s, inverted);
 	}
 	SGL_CUR(c);
-	return bind_surface(s, (GLenum)target, 0, "attachImage");
+	return bind_surface(s, (GLenum)target, 0, 0, 0, "attachImage");
 }
 
 static __thread id current_eagl;

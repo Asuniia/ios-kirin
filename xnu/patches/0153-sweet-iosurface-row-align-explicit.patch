@@ -1,0 +1,49 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -274,12 +274,17 @@
+ }
+ 
+ static uint32_t
+-sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
++sweet_row_align(uint64_t row)
+ {
+-	uint64_t row = (uint64_t)sweet_div_up(width, ew) * bpe;
+ 	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+ }
+ 
++static uint32_t
++sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
++{
++	return sweet_row_align((uint64_t)sweet_div_up(width, ew) * bpe);
++}
++
+ /* Geometry from the creation properties (IOSurface.h keys). */
+ static IOReturn
+ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -298,8 +303,13 @@
+ 	    s->bytesPerElement > 64 || s->elementWidth == 0 || s->elementHeight == 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
+-	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
++	/*
++	 * Explicit rows are rounded up to the alignment too: the GPU (Adreno 5xx
++	 * texture and render target pitch) needs 64-byte rows, and clients take
++	 * the real value from the lock result (CA asked for 833 px in 3360 bytes).
++	 */
++	s->bytesPerRow = sweet_row_align(sweet_dict_u32(props, "IOSurfaceBytesPerRow",
++	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement)));
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
+@@ -327,8 +337,8 @@
+ 			    p->bytesPerElement > 64 || p->elementWidth == 0 || p->elementHeight == 0) {
+ 				return kIOReturnBadArgument;
+ 			}
+-			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
+-			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
++			p->bytesPerRow = sweet_row_align(sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
++			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement)));
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+ 			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+ 			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));

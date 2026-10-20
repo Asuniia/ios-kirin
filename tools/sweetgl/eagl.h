@@ -42,5 +42,7 @@ void sgl_FinishObjectAPPLE(void *rctx, GLenum object, GLint name);
 GLboolean sgl_TestObjectAPPLE(void *rctx, GLenum object, GLuint name);
 void sgl_Flush(void *rctx);
 const GLubyte *sgl_GetString(void *rctx, GLenum name);
+void sgl_CompileShaderARB(void *rctx, GLhandleARB shader);
+void sgl_LinkProgramARB(void *rctx, GLhandleARB program);
 
 #endif

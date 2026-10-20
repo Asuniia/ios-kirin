@@ -29,3 +29,24 @@ index e8f01b8..a6c37f9 100644
    subdir('drm')
  endif
  
+diff --git a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gallium/drivers/freedreno/freedreno_resource.c
+index 29134ba..e6423e3 100644
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -1601,6 +1601,16 @@ fd_resource_from_handle(struct pipe_screen *pscreen,
+       goto fail;
+    }
+ 
++#ifdef __APPLE__
++   if (rsc->layout.pitch0 != handle->stride && !rsc->layout.tile_mode &&
++       !rsc->layout.ubwc && tmpl->last_level == 0 && handle->stride % 64 == 0 &&
++       handle->stride >= tmpl->width0 * rsc->layout.cpp) {
++      rsc->layout.pitchalign = 6;
++      rsc->layout.pitch0 = handle->stride;
++      rsc->layout.slices[0].size0 = handle->stride * tmpl->height0;
++      rsc->layout.layer_size = rsc->layout.slices[0].size0;
++   }
++#endif
+    if (rsc->layout.pitch0 != handle->stride) {
+       if (FD_DBG(LAYOUT))
+          mesa_loge("invalid pitch (%u vs %u) for: %" PRSC_FMT, rsc->layout.pitch0,
