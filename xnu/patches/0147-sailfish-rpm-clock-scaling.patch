@@ -1,0 +1,155 @@
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -25,6 +25,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
+ bool sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz);
++bool sweet_rpm_clk_scaling(void);
+ 
+ static LCK_GRP_DECLARE(sweet_rpm_grp, "sweet_rpm");
+ static LCK_MTX_DECLARE(sweet_rpm_lock, &sweet_rpm_grp);
+@@ -291,11 +292,12 @@
+ }
+ 
+ /*
+- * One active-set request: type, id and nkvp {key, 4, value} records. Lock
+- * held. True if the RPM acked it ("msg#" = our id) without "err".
++ * One request in set `set` (0 active, 1 sleep): type, id and nkvp {key, 4,
++ * value} records. Lock held. True if the RPM acked it ("msg#" = our id)
++ * without "err".
+  */
+ static bool
+-rpm_request(const char *what, uint32_t type, uint32_t id, const uint32_t *kv, unsigned nkvp)
++rpm_request(const char *what, uint32_t set, uint32_t type, uint32_t id, const uint32_t *kv, unsigned nkvp)
+ {
+ 	if (!rpm_open()) {
+ 		return false;
+@@ -304,7 +306,7 @@
+ 	uint32_t w[11 + 3 * 4] = {
+ 		CMD_TX_DATA | (RPM_LCID << 16), 0, 0, 0,        /* chunk set below */
+ 		0x00716572u, 20u + 12u * nkvp,                  /* "req", length */
+-		msg, 0u, type, id, 12u * nkvp,                  /* active set */
++		msg, set, type, id, 12u * nkvp,
+ 	};
+ 	if (nkvp > 4) {
+ 		return false;
+@@ -350,25 +352,85 @@
+ 	char what[8];
+ 	snprintf(what, sizeof(what), "L%u", ldo);
+ 	lck_mtx_lock(&sweet_rpm_lock);
+-	bool ok = rpm_request(what, 0x616f646cu, ldo, kv, 2);  /* "ldoa" */
++	bool ok = rpm_request(what, 0, 0x616f646cu, ldo, kv, 2);       /* "ldoa" */
+ 	lck_mtx_unlock(&sweet_rpm_lock);
+ 	printf("SWEET RPM: L%u %u uV: %s\n", ldo, uv, ok ? "ok" : "FAILED");
+ 	return ok;
+ }
+ 
+ /*
+- * Clock vote in the active set (clk-smd-rpm.c): type e.g. "clk2" (memory
+- * clocks: id 0 bimc = DDR), key "KHz ", rate in kHz; the RPM rounds to a
+- * supported rate.
++ * Clock vote in the sleep and the active set, like a Linux clk-smd-rpm
++ * clock without an _a twin: type e.g. "clk2" (memory clocks: id 0 bimc =
++ * DDR), key "KHz ", rate in kHz; the RPM rounds to a supported rate. Takes
++ * effect only once scaling is on (sweet_rpm_clk_scaling).
+  */
+ bool
+ sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz)
+ {
+ 	uint32_t kv[2] = {0x007a484bu, khz};                    /* "KHz " */
+ 	lck_mtx_lock(&sweet_rpm_lock);
+-	bool ok = rpm_request("clk", type, id, kv, 1);
++	bool ok = rpm_request("clk sleep", 1, type, id, kv, 1) && rpm_request("clk active", 0, type, id, kv, 1);
+ 	lck_mtx_unlock(&sweet_rpm_lock);
+ 	printf("SWEET RPM: clock %08x id %u %u kHz: %s\n", type, id, khz, ok ? "ok" : "FAILED");
++	return ok;
++}
++
++/*
++ * RPM clock scaling on (clk-smd-rpm.c clk_smd_rpm_enable_scaling, downstream
++ * enable_rpm_scaling): "clk0" id 2, "Enab" = 1, sleep then active set.
++ * Until then the RPM acks rate votes and ignores them (0146a: DDR stayed at
++ * 1016 MHz after an acked 1804 MHz vote). Once it is on the RPM goes by the
++ * AP's votes, so first, like Linux's clk_smd_rpm_handoff, every msm8996 RPM
++ * clock (downstream clock-gcc-8996.c / msm-clocks-hwio-8996.h) is voted on
++ * at its maximum in both sets: rate clocks "KHz " INT_MAX, branches "Enab"
++ * 1, XO buffers "swen" 1, their pin-controlled twins "pccb" 1.
++ */
++static const struct {
++	uint32_t type, id, key, value;
++} rpm_handoff[] = {
++	{0x316b6c63u, 0, 0x007a484bu, 0x7fffffffu},     /* clk1 pnoc */
++	{0x316b6c63u, 1, 0x007a484bu, 0x7fffffffu},     /* clk1 snoc */
++	{0x316b6c63u, 2, 0x007a484bu, 0x7fffffffu},     /* clk1 cnoc */
++	{0x326b6c63u, 0, 0x007a484bu, 0x7fffffffu},     /* clk2 bimc (DDR) */
++	{0x69786d6du, 0, 0x007a484bu, 0x7fffffffu},     /* mmxi mmssnoc_axi */
++	{0x00617069u, 0, 0x007a484bu, 0x7fffffffu},     /* ipa */
++	{0x00006563u, 0, 0x007a484bu, 0x7fffffffu},     /* ce1 */
++	{0x72676761u, 1, 0x62616e45u, 1},               /* aggr aggre1_noc */
++	{0x72676761u, 2, 0x62616e45u, 1},               /* aggr aggre2_noc */
++	{0x306b6c63u, 1, 0x62616e45u, 1},               /* clk0 qdss */
++	{0x616b6c63u, 1, 0x6e657773u, 1},               /* clka bb_clk1 */
++	{0x616b6c63u, 2, 0x6e657773u, 1},               /* clka bb_clk2 */
++	{0x616b6c63u, 4, 0x6e657773u, 1},               /* clka rf_clk1 */
++	{0x616b6c63u, 5, 0x6e657773u, 1},               /* clka rf_clk2 */
++	{0x616b6c63u, 8, 0x6e657773u, 1},               /* clka ln_bb_clk */
++	{0x616b6c63u, 0xb, 0x6e657773u, 1},             /* clka div_clk1 */
++	{0x616b6c63u, 0xc, 0x6e657773u, 1},             /* clka div_clk2 */
++	{0x616b6c63u, 0xd, 0x6e657773u, 1},             /* clka div_clk3 */
++	{0x616b6c63u, 1, 0x62636370u, 1},               /* clka bb_clk1_pin */
++	{0x616b6c63u, 2, 0x62636370u, 1},               /* clka bb_clk2_pin */
++	{0x616b6c63u, 4, 0x62636370u, 1},               /* clka rf_clk1_pin */
++	{0x616b6c63u, 5, 0x62636370u, 1},               /* clka rf_clk2_pin */
++};
++
++bool
++sweet_rpm_clk_scaling(void)
++{
++	uint32_t kv[2] = {0x62616e45u, 1u};                     /* "Enab" */
++	unsigned failed = 0;
++	lck_mtx_lock(&sweet_rpm_lock);
++	for (unsigned i = 0; i < sizeof(rpm_handoff) / sizeof(rpm_handoff[0]); i++) {
++		uint32_t h[2] = {rpm_handoff[i].key, rpm_handoff[i].value};
++		char what[24];
++		snprintf(what, sizeof(what), "handoff %08x %u", rpm_handoff[i].type, rpm_handoff[i].id);
++		for (uint32_t set = 0; set < 2; set++) {
++			failed += !rpm_request(what, 1 - set, rpm_handoff[i].type, rpm_handoff[i].id, h, 1);
++		}
++	}
++	bool ok = failed == 0 && rpm_request("scaling sleep", 1, 0x306b6c63u, 2, kv, 1) &&
++	    rpm_request("scaling active", 0, 0x306b6c63u, 2, kv, 1);
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: clock handoff (%u votes failed)\n", failed);
++	printf("SWEET RPM: clock scaling on: %s\n", ok ? "ok" : "FAILED");
+ 	return ok;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -475,6 +475,7 @@
+ }
+ 
+ extern bool sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz);
++extern bool sweet_rpm_clk_scaling(void);
+ 
+ static void
+ perf_thread(void *arg, wait_result_t result)
+@@ -484,13 +485,15 @@
+ 	perf_clocks();
+ 	/*
+ 	 * sweetddr=MHZ: ask the RPM for that DDR rate (bimc_clk, "clk2" id 0,
+-	 * active set) like Linux's bus votes; without one it stays where the
+-	 * bootloader left it (1016 MHz, 0145a; Linux runs at 1804).
++	 * sleep + active set) like Linux's bus votes, after turning RPM clock
++	 * scaling on; without them DDR stays where the bootloader left it
++	 * (1016 MHz, 0145a; Linux runs at 1804).
+ 	 */
+ 	int ddr = 0;
+ 	if (PE_parse_boot_argn("sweetddr", &ddr, sizeof(ddr)) && ddr > 0) {
+ 		uint64_t before = clk_measure_mhz(0xad) * 2;
+-		bool ok = sweet_rpm_clk(0x326b6c63u, 0, (uint32_t)ddr * 1000u);
++		bool ok = sweet_rpm_clk_scaling() && sweet_rpm_clk(0x326b6c63u, 0, (uint32_t)ddr * 1000u);
++		delay(10000);
+ 		printf("SWEET PERF: DDR vote %d MHz %s: %llu -> %llu MHz\n", ddr, ok ? "acked" : "FAILED",
+ 		    before, clk_measure_mhz(0xad) * 2);
+ 	}
