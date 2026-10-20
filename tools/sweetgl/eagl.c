@@ -303,6 +303,13 @@ sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GLcharA
 		memmove(src + at + sizeof(rect_prelude) - 1, src + at, n - at + 1);
 		memcpy(src + at, rect_prelude, sizeof(rect_prelude) - 1);
 	}
+	if (trace_left > 0) {
+		/* whole source, in 400-byte pieces (log lines are 512 bytes) */
+		sweet_drm_log("sweetgl: shader %u source (%zu bytes):", H(shader), strlen(src));
+		for (size_t i = 0, l = strlen(src); i < l; i += 400) {
+			sweet_drm_log("sweetgl:   | %.400s", src + i);
+		}
+	}
 	const GLchar *one = src;
 	glShaderSource(H(shader), 1, &one, NULL);
 	free(src);
@@ -369,7 +376,7 @@ sgl_BindTexture(void *rctx, GLenum target, GLuint texture)
 		GLint active = 0;
 		glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
 		if (target != GL_TEXTURE_2D || active != GL_TEXTURE0) {
-			TRACE("BindTexture %#x %u on unit %d", target, texture, active - GL_TEXTURE0);
+			(void)active;
 		}
 	}
 	glBindTexture(SGL_TGT(target), texture);
