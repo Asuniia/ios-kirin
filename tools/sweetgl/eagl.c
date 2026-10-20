@@ -104,6 +104,11 @@ void
 sgl_post(int slot)
 {
 	static unsigned char logged[SGL_SLOTS][8];     /* per slot and error, the first 3 */
+	static bool used[SGL_SLOTS];
+	if (!used[slot]) {
+		used[slot] = true;
+		sweet_drm_log("sweetgl: first call of slot %d %s", slot, sgl_slot_names[slot]);
+	}
 	GLenum e = glGetError();
 	unsigned k = e - GL_INVALID_ENUM;
 	if (e != GL_NO_ERROR && (k >= 8 || logged[slot][k] < 3)) {
