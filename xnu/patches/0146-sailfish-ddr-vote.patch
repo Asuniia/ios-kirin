@@ -1,0 +1,160 @@
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -12,17 +12,23 @@
+  *   requests   smd-rpm.c / qcom_smd-regulator.c: "req" header, {msg_id,
+  *              flags 0 = active set, type "ldoa", id n, len} + KVPs swen/uv;
+  *              the answer carries "msg#" and, on failure, "err" + text.
+- * One caller at a time (the touch thread); message RAM only 32-bit accesses.
++ * Callers are serialized by sweet_rpm_lock (touch thread, perf thread);
++ * message RAM only 32-bit accesses.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <kern/locks.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
++bool sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz);
+ 
++static LCK_GRP_DECLARE(sweet_rpm_grp, "sweet_rpm");
++static LCK_MTX_DECLARE(sweet_rpm_lock, &sweet_rpm_grp);
++
+ #define RPM_MSGRAM_PA   0x00068000u
+ #define RPM_MSGRAM_SIZE 0x6000u
+ #define RPM_IPC_PA      0x09820000u     /* APCS GLB, +0x10 IPC */
+@@ -284,46 +290,85 @@
+ 	return ok;
+ }
+ 
+-/* Vote PM8994 LDOn on at uv in the active set. */
+-bool
+-sweet_rpm_ldoa(unsigned ldo, uint32_t uv)
++/*
++ * One active-set request: type, id and nkvp {key, 4, value} records. Lock
++ * held. True if the RPM acked it ("msg#" = our id) without "err".
++ */
++static bool
++rpm_request(const char *what, uint32_t type, uint32_t id, const uint32_t *kv, unsigned nkvp)
+ {
+ 	if (!rpm_open()) {
+ 		return false;
+ 	}
+-	uint32_t id = ++rpm.msg_id;
+-	uint32_t w[] = {
++	uint32_t msg = ++rpm.msg_id;
++	uint32_t w[11 + 3 * 4] = {
+ 		CMD_TX_DATA | (RPM_LCID << 16), 0, 0, 0,        /* chunk set below */
+-		0x00716572u, 20u + 24u,                         /* "req", length */
+-		id, 0u, 0x616f646cu, ldo, 24u,                  /* active set, "ldoa" n */
+-		0x6e657773u, 4u, 1u,                            /* swen = 1 */
+-		0x00007675u, 4u, uv,                            /* uv */
++		0x00716572u, 20u + 12u * nkvp,                  /* "req", length */
++		msg, 0u, type, id, 12u * nkvp,                  /* active set */
+ 	};
+-	w[2] = sizeof(w) - 16u;
++	if (nkvp > 4) {
++		return false;
++	}
++	for (unsigned k = 0; k < nkvp; k++) {
++		w[11 + 3 * k] = kv[2 * k];
++		w[12 + 3 * k] = 4u;
++		w[13 + 3 * k] = kv[2 * k + 1];
++	}
++	uint32_t bytes = (11u + 3u * nkvp) * 4u;
++	w[2] = bytes - 16u;
+ 	rpm.resp_ready = false;
+-	if (!rpm_send(w, sizeof(w))) {
++	if (!rpm_send(w, bytes)) {
+ 		return false;
+ 	}
+ 	if (!RPM_POLL(1000u, rpm.resp_ready)) {
+-		printf("SWEET RPM: L%u: no answer\n", ldo);
++		printf("SWEET RPM: %s: no answer\n", what);
+ 		return false;
+ 	}
+ 	/* "req", length, then {type, length, data} records */
+ 	bool acked = false, err = false;
+ 	uint32_t words = MIN(rpm.resp_len / 4, 2u + rpm.resp[1] / 4), i = 2;
+ 	while (i + 2 <= words) {
+-		uint32_t type = rpm.resp[i], len = rpm.resp[i + 1];
+-		if (type == 0x2367736du && rpm.resp[i + 2] == id) {
++		uint32_t rtype = rpm.resp[i], len = rpm.resp[i + 1];
++		if (rtype == 0x2367736du && rpm.resp[i + 2] == msg) {
+ 			acked = true;
+-		} else if (type == 0x00727265u) {
++		} else if (rtype == 0x00727265u) {
+ 			char text[32] = {0};
+ 			memcpy(text, &rpm.resp[i + 2], MIN(len, sizeof(text) - 1));
+-			printf("SWEET RPM: L%u: error '%s'\n", ldo, text);
++			printf("SWEET RPM: %s: error '%s'\n", what, text);
+ 			err = true;
+ 		}
+ 		i += 2 + (len + 3) / 4;
+ 	}
+-	printf("SWEET RPM: L%u %u uV: %s\n", ldo, uv, acked && !err ? "ok" : "FAILED");
+ 	return acked && !err;
+ }
++
++/* Vote PM8994 LDOn on at uv in the active set. */
++bool
++sweet_rpm_ldoa(unsigned ldo, uint32_t uv)
++{
++	uint32_t kv[4] = {0x6e657773u, 1u, 0x00007675u, uv};      /* swen = 1, uv */
++	char what[8];
++	snprintf(what, sizeof(what), "L%u", ldo);
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request(what, 0x616f646cu, ldo, kv, 2);  /* "ldoa" */
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: L%u %u uV: %s\n", ldo, uv, ok ? "ok" : "FAILED");
++	return ok;
++}
++
++/*
++ * Clock vote in the active set (clk-smd-rpm.c): type e.g. "clk2" (memory
++ * clocks: id 0 bimc = DDR), key "KHz ", rate in kHz; the RPM rounds to a
++ * supported rate.
++ */
++bool
++sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz)
++{
++	uint32_t kv[2] = {0x007a484bu, khz};                    /* "KHz " */
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request("clk", type, id, kv, 1);
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: clock %08x id %u %u kHz: %s\n", type, id, khz, ok ? "ok" : "FAILED");
++	return ok;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -473,6 +473,8 @@
+ 	}
+ 	return (((uint64_t)f * 10 + 15) * 4800000 / (0x10000 * 10 + 35)) / 1000000;
+ }
++
++extern bool sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz);
+ 
+ static void
+ perf_thread(void *arg, wait_result_t result)
+@@ -480,6 +482,18 @@
+ 	(void)arg;
+ 	(void)result;
+ 	perf_clocks();
++	/*
++	 * sweetddr=MHZ: ask the RPM for that DDR rate (bimc_clk, "clk2" id 0,
++	 * active set) like Linux's bus votes; without one it stays where the
++	 * bootloader left it (1016 MHz, 0145a; Linux runs at 1804).
++	 */
++	int ddr = 0;
++	if (PE_parse_boot_argn("sweetddr", &ddr, sizeof(ddr)) && ddr > 0) {
++		uint64_t before = clk_measure_mhz(0xad) * 2;
++		bool ok = sweet_rpm_clk(0x326b6c63u, 0, (uint32_t)ddr * 1000u);
++		printf("SWEET PERF: DDR vote %d MHz %s: %llu -> %llu MHz\n", ddr, ok ? "acked" : "FAILED",
++		    before, clk_measure_mhz(0xad) * 2);
++	}
+ 	for (int c = 0; c < (int)ml_get_cpu_count(); c++) {
+ 		thread_bind(cpu_to_processor(c));
+ 		thread_block(THREAD_CONTINUE_NULL);
