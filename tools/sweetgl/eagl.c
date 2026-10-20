@@ -24,6 +24,7 @@
 #include <time.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/vm_page_size.h>
+#include <libkern/OSCacheControl.h>
 
 #include "eagl.h"
 
@@ -1702,6 +1703,98 @@ swap(Class cls, const char *sel, void *imp)
 	return method_setImplementation(m, (IMP)imp);
 }
 
+/*
+ * Research hook (SWEETGL_TRACE): which image formats CA's GL renderer asks
+ * its format table for (QuartzCore 0x18840433c in dsc-8: (ctx, format,
+ * flag, &internalformat, &format, &type, &flags, &x)), with the caller.
+ * The first 4 instructions become a jump here; they are replayed before
+ * continuing. Needs cs_enforcement_disable (text page written).
+ */
+#include <mach/mach.h>
+extern const void *_dyld_get_shared_cache_range(size_t *length);
+void sgl_fmt_log(uint32_t fmt, uint32_t flag, uint64_t caller);
+uint64_t sgl_fmt_cont;
+static uint64_t sgl_cache_slide;
+
+void
+sgl_fmt_log(uint32_t fmt, uint32_t flag, uint64_t caller)
+{
+	static uint64_t seen[256];
+	static int n;
+	uint64_t key = (uint64_t)fmt << 48 ^ (uint64_t)flag << 40 ^ (caller - sgl_cache_slide);
+	for (int i = 0; i < n; i++) {
+		if (seen[i] == key) {
+			return;
+		}
+	}
+	if (n < 256) {
+		seen[n++] = key;
+		sweet_drm_log("sweetgl: CA format %u flag %u from %#llx", fmt, flag,
+		    (unsigned long long)(caller - sgl_cache_slide));
+	}
+}
+
+__attribute__((naked)) static void
+sgl_fmt_hook(void)
+{
+	__asm__ volatile(
+	    "stp x29, x30, [sp, #-96]!\n"
+	    "mov x29, sp\n"
+	    "stp x0, x1, [sp, #16]\n"
+	    "stp x2, x3, [sp, #32]\n"
+	    "stp x4, x5, [sp, #48]\n"
+	    "stp x6, x7, [sp, #64]\n"
+	    "mov x0, x1\n"
+	    "mov x1, x2\n"
+	    "mov x2, x30\n"
+	    "bl _sgl_fmt_log\n"
+	    "ldp x0, x1, [sp, #16]\n"
+	    "ldp x2, x3, [sp, #32]\n"
+	    "ldp x4, x5, [sp, #48]\n"
+	    "ldp x6, x7, [sp, #64]\n"
+	    "ldp x29, x30, [sp], #96\n"
+	    "str wzr, [x5]\n"
+	    "str wzr, [x4]\n"
+	    "str wzr, [x3]\n"
+	    "strb wzr, [x6]\n"
+	    "adrp x16, _sgl_fmt_cont@PAGE\n"
+	    "ldr x16, [x16, _sgl_fmt_cont@PAGEOFF]\n"
+	    "br x16\n");
+}
+
+static void
+sgl_install_fmt_hook(void)
+{
+	size_t len = 0;
+	const uint8_t *cache = _dyld_get_shared_cache_range(&len);
+	if (cache == NULL) {
+		return;
+	}
+	sgl_cache_slide = (uint64_t)(uintptr_t)cache - 0x180000000ull;
+	uint32_t *t = (uint32_t *)(uintptr_t)(0x18840433cull + sgl_cache_slide);
+	static const uint32_t want[4] = {0xb90000bf, 0xb900009f, 0xb900007f, 0x390000df};
+	if (memcmp(t, want, sizeof(want)) != 0) {
+		sweet_drm_log("sweetgl: format hook: unexpected code at %p (%08x), not hooked", (void *)t, t[0]);
+		return;
+	}
+	sgl_fmt_cont = (uint64_t)(uintptr_t)t + 16;
+	vm_address_t page = (vm_address_t)t & ~(vm_address_t)vm_page_mask;
+	kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	if (kr != KERN_SUCCESS) {
+		sweet_drm_log("sweetgl: format hook: vm_protect rw %d", kr);
+		return;
+	}
+	uint32_t patch[4] = {0x58000050, 0xd61f0200, 0, 0};    /* ldr x16, #8; br x16; .quad hook */
+	uint64_t target = (uint64_t)(uintptr_t)sgl_fmt_hook;
+	memcpy(&patch[2], &target, 8);
+	memcpy(t, patch, sizeof(patch));
+	kr = vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	sys_icache_invalidate(t, sizeof(patch));
+	sweet_drm_log("sweetgl: format hook installed at %p (slide %#llx), protect back %d", (void *)t,
+	    (unsigned long long)sgl_cache_slide, kr);
+}
+
 /* Called at load. CA picks its GLES renderer by itself once initWithAPI:3 succeeds. */
 void
 sweetgl_eagl_install(void)
@@ -1711,6 +1804,9 @@ sweetgl_eagl_install(void)
 	const char *t = getenv("SWEETGL_TRACE");
 	trace_left = t && t[0] == '1' ? 20000 : 0;
 	dump_shaders = trace_left > 0;
+	if (trace_left > 0) {
+		sgl_install_fmt_hook();
+	}
 	Class cls = objc_getClass("EAGLContext");
 	if (cls == Nil) {
 		sweet_drm_log("sweetgl: no EAGLContext class");

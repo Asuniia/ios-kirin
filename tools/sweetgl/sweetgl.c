@@ -291,9 +291,15 @@ selftest_thread(void *arg)
 	return NULL;
 }
 
+void sweetgl_layerdump_start(void);
+
 __attribute__((constructor)) static void
 sweetgl_load(void)
 {
+	if (strcmp(getprogname(), "SpringBoard") == 0) {
+		sweetgl_layerdump_start();
+		return;
+	}
 	sweetgl_eagl_install();
 	const char *t = getenv("SWEETGL_TEST");
 	if (t && t[0] == '1') {

@@ -1,0 +1,56 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -450,12 +450,13 @@
+  * Boot-arg sweetenv=NAME:VAR=VAL[,VAR=VAL...] appends VAR=VAL to the
+  * environment of every executable whose file name is NAME, e.g.
+  * sweetenv=backboardd:CA_DISABLE_BACKDROP_CACHE=1 (CoreAnimation knobs
+- * without editing launchd.plist on the phone). One NAME per boot.
++ * without editing launchd.plist on the phone). Several NAME:... entries
++ * are separated by ';'.
+  */
+ static int
+ sweet_exec_env(struct image_params *imgp, int ptr_size)
+ {
+-	static char spec[256];
++	static char spec[512];
+ 	static int state;       /* 0 not parsed, 1 none, 2 set */
+ 	if (state == 0) {
+ 		state = PE_parse_boot_argn("sweetenv", spec, sizeof(spec)) && spec[0] ? 2 : 1;
+@@ -469,18 +470,28 @@
+ 			base = c + 1;
+ 		}
+ 	}
+-	size_t n = 0;
+-	while (spec[n] && spec[n] != ':') {
+-		n++;
+-	}
+-	if (spec[n] != ':' || strlen(base) != n || strncmp(base, spec, n) != 0) {
+-		return 0;
++	const char *entry = spec;
++	for (;;) {
++		size_t n = 0;
++		while (entry[n] && entry[n] != ':' && entry[n] != ';') {
++			n++;
++		}
++		if (entry[n] == ':' && strlen(base) == n && strncmp(base, entry, n) == 0) {
++			break;
++		}
++		while (*entry && *entry != ';') {
++			entry++;
++		}
++		if (*entry == '\0') {
++			return 0;
++		}
++		entry++;
+ 	}
+-	const char *p = spec + n + 1;
+-	while (*p) {
++	const char *p = strchr(entry, ':') + 1;
++	while (*p && *p != ';') {
+ 		char var[128];
+ 		size_t len = 0;
+-		while (p[len] && p[len] != ',') {
++		while (p[len] && p[len] != ',' && p[len] != ';') {
+ 			len++;
+ 		}
+ 		if (len > 0 && len < sizeof(var)) {
