@@ -657,6 +657,48 @@ surface_format(uint32_t fourcc, size_t bpe, unsigned *internalformat)
 #define FCC_C(c) ((c) >= 0x20 && (c) < 0x7f ? (c) : '.')
 #define FCC(f) FCC_C((f) >> 24), FCC_C(((f) >> 16) & 0xff), FCC_C(((f) >> 8) & 0xff), FCC_C((f) & 0xff)
 
+/*
+ * Rows the GPU cannot sample in place (A5xx pitch is 64-byte aligned; CA's
+ * own bitmaps are not): copied into the texture instead.
+ * ponytail: a snapshot, later CPU writes to the surface are not seen (CA's
+ * images are immutable).
+ */
+static bool
+copy_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, size_t w, size_t h, size_t pitch,
+    const char *why)
+{
+	size_t bpe = IOSurfaceGetBytesPerElement(s);
+	const void *base = IOSurfaceGetBaseAddress(s);
+	if (base == NULL || bpe == 0 || pitch % bpe != 0) {
+		sweet_drm_log("sweetgl: %s: surface %u %zux%zu pitch %zu: cannot copy", why, IOSurfaceGetID(s), w, h, pitch);
+		return false;
+	}
+	GLint row = 0, align = 4, skip_rows = 0, skip_pixels = 0;
+	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row);
+	glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
+	glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+	glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(pitch / bpe));
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+	glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+	glTexImage2D(target, 0, format == GL_BGRA_EXT ? GL_BGRA_EXT : (GLint)format, (GLsizei)w, (GLsizei)h, 0,
+	    format, type, base);
+	GLenum e = glGetError();
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, row);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, align);
+	glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
+	glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
+	tex_size_bound(target, 0, (GLsizei)w, (GLsizei)h);
+	TRACE("%s surf %u %zux%zu pitch %zu fmt %#x/%#x copied, err %#x", why, IOSurfaceGetID(s), w, h, pitch,
+	    format, type, e);
+	if (e != GL_NO_ERROR) {
+		sweet_drm_log("sweetgl: %s: surface %u %zux%zu pitch %zu fmt %#x/%#x: copy error %#x", why,
+		    IOSurfaceGetID(s), w, h, pitch, format, type, e);
+	}
+	return e == GL_NO_ERROR;
+}
+
 /* The surface's pages as the storage of the texture bound to target. */
 static bool
 bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t plane, const char *why)
@@ -670,6 +712,9 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	img.format = format && !multi ? gl_format(format, type, &img.internalformat) : PIPE_FORMAT_NONE;
 	if (img.format == PIPE_FORMAT_NONE && !multi) {
 		img.format = surface_format(fourcc, IOSurfaceGetBytesPerElementOfPlane(s, plane), &img.internalformat);
+	}
+	if (format && !multi && pitch % 64 != 0) {
+		return copy_surface(s, target, format, type, w, h, pitch, why);
 	}
 	uint32_t handle = 0;
 	uint64_t size = 0;

@@ -1,0 +1,14 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -710,6 +710,11 @@
+ 	if (ret == kIOReturnSuccess && address != NULL) {
+ 		/* the creator's memory: whole pages from the one holding the address */
+ 		uint64_t addr = address->unsigned64BitValue(), start = trunc_page_64(addr);
++		/* its rows as they are: no GPU alignment (sweetgl copies unaligned ones) */
++		uint32_t bpr = sweet_dict_u32(props, "IOSurfaceBytesPerRow", 0);
++		if (bpr >= (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
++			s->bytesPerRow = bpr;
++		}
+ 		uint64_t len = round_page_64((addr - start) + (uint64_t)s->bytesPerRow *
+ 		    sweet_div_up(s->height, s->elementHeight));
+ 		bool ok = s->planeCount == 0 && addr != 0 && len <= SWEET_SURFACE_MAX_ALLOC;
