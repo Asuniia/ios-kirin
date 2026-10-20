@@ -830,6 +830,65 @@ surface_format(uint32_t fourcc, size_t bpe, unsigned *internalformat)
 #define FCC_C(c) ((c) >= 0x20 && (c) < 0x7f ? (c) : '.')
 #define FCC(f) FCC_C((f) >> 24), FCC_C(((f) >> 16) & 0xff), FCC_C(((f) >> 8) & 0xff), FCC_C((f) & 0xff)
 
+/*
+ * One Mesa resource per surface (and format): CA renders into a surface
+ * through one texture (attachImage) and samples it through another
+ * (texImageIOSurface); as separate resources Mesa could run the reading
+ * batch before the writing one (App Library pods, CC tiles, vibrant glyphs).
+ * ponytail: 32 entries, least recently used dropped; a dropped entry keeps
+ * nothing alive, a freed surface's pages stay imported until then.
+ */
+struct surf_res {
+	uint32_t id, w, h, pitch;
+	enum pipe_format format;
+	uintptr_t base;
+	struct pipe_resource *res;
+	uint64_t used;
+};
+#define SURF_RES_MAX 32
+static struct surf_res surf_res[SURF_RES_MAX];
+static uint64_t surf_res_clock;
+
+static bool
+surf_res_same(const struct surf_res *a, const struct surf_res *b)
+{
+	return a->id == b->id && a->format == b->format && a->w == b->w && a->h == b->h && a->pitch == b->pitch &&
+	       a->base == b->base;
+}
+
+/* a new reference to the cached resource, or NULL */
+static struct pipe_resource *
+surf_res_get(const struct surf_res *key)
+{
+	for (int i = 0; i < SURF_RES_MAX; i++) {
+		if (surf_res[i].res != NULL && surf_res_same(&surf_res[i], key)) {
+			struct pipe_resource *res = NULL;
+			surf_res[i].used = ++surf_res_clock;
+			pipe_resource_reference(&res, surf_res[i].res);
+			return res;
+		}
+	}
+	return NULL;
+}
+
+static void
+surf_res_put(const struct surf_res *key, struct pipe_resource *res)
+{
+	if (res == NULL) {
+		return;
+	}
+	int victim = 0;
+	for (int i = 1; i < SURF_RES_MAX; i++) {
+		if (surf_res[i].used < surf_res[victim].used) {
+			victim = i;
+		}
+	}
+	pipe_resource_reference(&surf_res[victim].res, NULL);
+	surf_res[victim] = *key;
+	surf_res[victim].used = ++surf_res_clock;
+	pipe_resource_reference(&surf_res[victim].res, res);
+}
+
 /* texture swizzle of the bound texture: identity, or A,R,G,B bytes read as RGBA */
 static uint8_t tex_argb[TEXSZ_MAX];
 
@@ -969,7 +1028,16 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	uint32_t handle = 0;
 	uint64_t size = 0;
 	const char *step = img.format == PIPE_FORMAT_NONE ? "format" : "kernel import";
-	if (img.format != PIPE_FORMAT_NONE &&
+	struct surf_res key = {
+		.id = IOSurfaceGetID(s),
+		.format = img.format,
+		.w = (uint32_t)w,
+		.h = (uint32_t)h,
+		.pitch = (uint32_t)pitch,
+		.base = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(s, plane),
+	};
+	img.res = img.format != PIPE_FORMAT_NONE ? surf_res_get(&key) : NULL;
+	if (img.res == NULL && img.format != PIPE_FORMAT_NONE &&
 	    sweet_drm_import_iosurface(IOSurfaceGetID(s), (uint64_t)(uintptr_t)IOSurfaceGetBaseAddress(s),
 	    &handle, &size) == 0) {
 		struct pipe_screen *screen = sweetgl_screen();
@@ -994,6 +1062,7 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 		/* takes over the handle: closed with the resource, or now on failure */
 		step = "mesa layout";
 		img.res = screen->resource_from_handle(screen, &templ, &wh, PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+		surf_res_put(&key, img.res);
 	}
 	if (img.res == NULL) {
 		if (logged++ < 50) {
