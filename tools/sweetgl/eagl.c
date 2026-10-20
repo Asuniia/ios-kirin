@@ -600,6 +600,18 @@ sgl_FramebufferTexture2DEXT(void *rctx, GLenum target, GLenum attachment, GLenum
 	SGL_POST(677);
 }
 
+void
+sgl_TexParameteri(void *rctx, GLenum target, GLenum pname, GLint param)
+{
+	SGL_CUR(rctx);
+	target = SGL_TGT(target);
+	if (pname >= 0x8E42 && pname <= 0x8E46) {
+		TRACE("TexParameteri tex %u swizzle %#x = %#x", unit_held[active_unit()], pname, param);
+	}
+	glTexParameteri(target, pname, param);
+	SGL_POST(304);
+}
+
 static GLint
 unpack_row(void)
 {

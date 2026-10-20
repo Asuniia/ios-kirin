@@ -57,6 +57,7 @@ void sgl_TexSubImage2D(void *rctx, GLenum target, GLint level, GLint x, GLint y,
     GLsizei height, GLenum format, GLenum type, const void *pixels);
 void sgl_FramebufferTexture2DEXT(void *rctx, GLenum target, GLenum attachment, GLenum textarget, GLuint texture,
     GLint level);
+void sgl_TexParameteri(void *rctx, GLenum target, GLenum pname, GLint param);
 void sgl_DeleteTextures(void *rctx, GLsizei n, const GLuint *textures);
 void sgl_PixelStorei(void *rctx, GLenum pname, GLint param);
 void sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count);
