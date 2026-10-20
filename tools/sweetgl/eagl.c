@@ -256,6 +256,20 @@ sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GLcharA
 		p += l;
 	}
 	*p = 0;
+	/*
+	 * CA's inverted-mask shader uses coord_arg (clamp bounds) without
+	 * declaring it; Apple's compiler takes that, Mesa's does not.
+	 */
+	const char *extra = strstr(src, "coord_arg") && !strstr(src, "vec4 coord_arg") ?
+	    "uniform highp vec4 coord_arg;\n" : "";
+	size_t extra_len = strlen(extra);
+	if (extra_len) {
+		src = realloc(src, n + sizeof(rect_prelude) + extra_len + 1);
+		size_t at = strncmp(src, "#version", 8) == 0 && strchr(src, '\n') ? (size_t)(strchr(src, '\n') - src + 1) : 0;
+		memmove(src + at + extra_len, src + at, n - at + 1);
+		memcpy(src + at, extra, extra_len);
+		n += extra_len;
+	}
 	const char *rect = strstr(src, "sampler2DRect");
 	if (rect != NULL && n_rect_shaders < RECT_MAX) {
 		const char *name = rect + strlen("sampler2DRect");
@@ -320,6 +334,15 @@ rect_fixup(void)
 		TRACE("rect program %d unit %d texture %dx%d", prog, unit, w, h);
 		return;
 	}
+}
+
+void
+sgl_PixelStorei(void *rctx, GLenum pname, GLint param)
+{
+	SGL_CUR(rctx);
+	TRACE("PixelStorei %#x %d", pname, param);
+	glPixelStorei(pname, param);
+	SGL_POST(195);
 }
 
 void
