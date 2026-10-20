@@ -135,7 +135,7 @@ sweetgl_create(int api, struct sweetgl_ctx *share)
 	struct st_context_attribs attribs = {
 		.profile = API_OPENGLES2,
 		.major = api >= 3 ? 3 : 2,
-		.minor = 0,
+		.minor = api >= 3 ? 1 : 0,      /* 3.1: glGetTexLevelParameteriv (eagl.c rect textures) */
 	};
 	enum st_context_error err = ST_CONTEXT_SUCCESS;
 	struct st_context *st = st_api_create_context(fscreen, &attribs, &err, share ? share->st : NULL);
