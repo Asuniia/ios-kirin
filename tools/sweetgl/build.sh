@@ -1,0 +1,53 @@
+#!/bin/sh
+# Build sweetgl.dylib (Mesa freedreno + GLES + our frontend) for iOS 16
+# arm64: Mesa static libs from research/mesa-ios (tools/sweetgl/mesa-setup.sh,
+# after `git apply tools/sweetgl/mesa.patch` in research/mesa), ad-hoc signed,
+# zero-padded to 64 MiB so the file on the phone keeps one size and can be
+# rewritten in place (like tools/sweetgpu-ca).
+set -e
+H=$(cd "$(dirname "$0")" && pwd)
+R=$H/../..
+M=$R/research/mesa
+B=$R/research/mesa-ios
+export DEVELOPER_DIR=$R/research/xcode15/Xcode.app/Contents/Developer
+export PATH=$R/research/tools/venv/bin:$R/research/tools/bin:$PATH
+LIBS="src/mesa/libmesa.a src/gallium/auxiliary/libgallium.a
+	src/gallium/drivers/freedreno/libfreedreno.a src/gallium/winsys/freedreno/drm/libfreedrenowinsys.a
+	src/freedreno/drm/libfreedreno_drm.a src/freedreno/ir3/libfreedreno_ir3.a
+	src/freedreno/ir2/libfreedreno_ir2.a src/freedreno/fdl/libfreedreno_layout.a
+	src/freedreno/common/libfreedreno_common.a src/freedreno/isa/libir3encode.a
+	src/freedreno/isa/libir3decode.a src/compiler/isaspec/libisaspec.a
+	src/freedreno/perfcntrs/libfreedreno_perfcntrs.a
+	src/compiler/glsl/libglsl.a src/compiler/glsl/glcpp/libglcpp.a src/compiler/nir/libnir.a
+	src/compiler/spirv/libvtn.a src/compiler/libcompiler.a
+	src/mesa/glapi/glapi/libglapi_bridge.a src/mesa/glapi/shared-glapi/libglapi.a
+	src/util/libxmlconfig.a src/util/libmesa_util.a src/util/libmesa_util_simd.a src/util/blake3/libblake3.a
+	src/c11/impl/libmesa_util_c11.a"
+(cd "$B" && ninja $LIBS)
+CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0"
+INC="-I$H/include -I$M/include -I$M/src -I$M/src/mesa -I$M/src/mapi -I$M/src/gallium/include
+	-I$M/src/gallium/auxiliary -I$M/src/gallium/drivers -I$M/src/gallium/winsys
+	-I$B/src -I$B/src/mesa -I$B/src/mapi"
+O=$H/out
+mkdir -p "$O"
+# Mesa's configure-time defines (HAVE_PTHREAD, ...) as the state tracker gets them
+python3 -I -c '
+import json, shlex, sys
+cc = json.load(open(sys.argv[1]))
+e = [x for x in cc if x["file"].endswith("state_tracker/st_manager.c")][0]
+print("\n".join(shlex.quote(a) for a in shlex.split(e["command"]) if a.startswith("-D")))
+' "$B/compile_commands.json" > "$O/mesa-defines.rsp"
+for f in sweetgl sweet_drm; do
+	$CC -O2 -Wall -fvisibility=hidden @"$O/mesa-defines.rsp" $INC -c "$H/$f.c" -o "$O/$f.o"
+done
+printf '_sweetgl_init\n_sweetgl_create\n_sweetgl_make_current\n_sweetgl_destroy\n_sweetgl_selftest\n' > "$O/exports.txt"
+xcrun -sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=16.0 -dynamiclib -dead_strip \
+	-install_name /usr/lib/sweetgl.dylib -exported_symbols_list "$O/exports.txt" \
+	-o "$O/sweetgl.dylib" "$O/sweetgl.o" "$O/sweet_drm.o" $(for l in $LIBS; do echo "$B/$l"; done) \
+	-framework IOKit -framework CoreFoundation -lc++ -lz
+codesign -f -s - "$O/sweetgl.dylib"
+SIZE=$(stat -f %z "$O/sweetgl.dylib")
+[ "$SIZE" -le 67108864 ] || { echo "sweetgl.dylib is $SIZE bytes, over 64 MiB"; exit 1; }
+cp "$O/sweetgl.dylib" "$O/sweetgl-unpadded.dylib"
+truncate -s 67108864 "$O/sweetgl.dylib"
+echo "built $O/sweetgl.dylib ($SIZE bytes, padded to 64 MiB)"

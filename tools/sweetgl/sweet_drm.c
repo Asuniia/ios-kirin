@@ -42,7 +42,6 @@ struct sbo {
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_once_t once = PTHREAD_ONCE_INIT;
 static io_connect_t conn;
 static int dev_fd = -1;
 static struct sbo *bos;
@@ -52,12 +51,12 @@ static uint64_t gmem_base, max_freq;
 static volatile const uint32_t *fence_page;
 static uint32_t queues;
 
+/* Lock held. The GPU comes up a while after boot: callers may retry. */
 static void
-connect_once(void)
+connect_dev(void)
 {
 	io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("SweetGPU"));
 	if (svc == 0 || IOServiceOpen(svc, mach_task_self(), 0, &conn) != KERN_SUCCESS) {
-		sweet_drm_log("sweetgl: no SweetGPU service");
 		conn = 0;
 		return;
 	}
@@ -66,7 +65,6 @@ connect_once(void)
 	uint32_t n = 5;
 	kern_return_t kr = IOConnectCallScalarMethod(conn, 15, NULL, 0, out, &n);
 	if (kr != KERN_SUCCESS || n != 5) {
-		sweet_drm_log("sweetgl: SweetGPU info failed: %x (GPU not up: boot-arg sweetgpu=8?)", kr);
 		IOServiceClose(conn);
 		conn = 0;
 		return;
@@ -82,8 +80,13 @@ connect_once(void)
 int
 sweet_drm_open(void)
 {
-	pthread_once(&once, connect_once);
-	return conn && dev_fd >= 0 ? dup(dev_fd) : -1;
+	pthread_mutex_lock(&lock);
+	if (!conn) {
+		connect_dev();
+	}
+	int fd = conn && dev_fd >= 0 ? dup(dev_fd) : -1;
+	pthread_mutex_unlock(&lock);
+	return fd;
 }
 
 int

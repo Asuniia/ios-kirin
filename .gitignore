@@ -11,3 +11,5 @@ __pycache__/
 logs/
 tools/sweetgpu-test/out/
 tools/sweetgpu-ca/out/
+tools/sweetgl/out/
+tools/sweetgl/out-build.log
