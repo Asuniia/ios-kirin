@@ -64,12 +64,12 @@ static bool dump_shaders;       /* SWEETGL_TRACE=1: every shader source, no limi
 /*
  * SWEETGL_TRACE: draws are traced in windows, every draw of one (state,
  * uniforms, the scissor box before and after): WIN_DRAWS draws from a draw
- * into a WIN_TRIGGER-sized viewport (CC toggle circles, App Library pods),
+ * into a WIN_TRIGGER-sized viewport (CC slider modules, App Library pods),
  * then none for WIN_SECS.
  */
 #define WIN_SECS 30
 #define WIN_DRAWS 500
-#define WIN_TRIGGER(w, h) (((w) == 108 && (h) == 109) || ((w) == 296 && (h) == 296))
+#define WIN_TRIGGER(w, h) (((w) == 138 && (h) == 306) || ((w) == 296 && (h) == 296) || ((w) == 297 && (h) == 296))
 static int win_left;
 static time_t win_next;
 #define WTRACE(...) do { if (win_left > 0) TRACE(__VA_ARGS__); } while (0)
