@@ -359,12 +359,49 @@ sgl_tgt(GLenum target)
 	return GL_TEXTURE_2D;
 }
 
+/*
+ * SWEETGL_TRACE: samplers of the current program whose texture has no level
+ * 0 (unbound or never filled), once per program/unit/texture.
+ */
+static void
+trace_empty_samplers(GLint prog)
+{
+	static uint32_t seen[4096];
+	GLint n = 0;
+	glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &n);
+	for (GLint i = 0; i < n; i++) {
+		char name[64];
+		GLint size = 0;
+		GLenum type = 0;
+		glGetActiveUniform(prog, i, sizeof(name), NULL, &size, &type, name);
+		if (type != GL_SAMPLER_2D) {
+			continue;
+		}
+		GLint unit = 0, tex = 0, w = 0, active = GL_TEXTURE0;
+		glGetUniformiv(prog, glGetUniformLocation(prog, name), &unit);
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+		glActiveTexture(GL_TEXTURE0 + unit);
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+		glActiveTexture(active);
+		uint32_t key = (uint32_t)prog << 20 ^ (uint32_t)unit << 16 ^ (uint32_t)tex;
+		if (w > 0 || seen[key % 4096] == key + 1) {
+			continue;
+		}
+		seen[key % 4096] = key + 1;
+		TRACE("empty sampler: program %d %s unit %d tex %d", prog, name, unit, tex);
+	}
+}
+
 /* before a draw: each unit holds what the program samples there, rect scale set */
 static void
 draw_prep(void)
 {
 	GLint prog = 0, unit = -1, w = 0, h = 0, scale = -1;
 	glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+	if (trace_left > 0 && prog != 0) {
+		trace_empty_samplers(prog);
+	}
 	for (int i = 0; i < n_rect_programs; i++) {
 		if (rect_programs[i].program == (GLuint)prog) {
 			scale = rect_programs[i].scale;
@@ -657,6 +694,27 @@ surface_format(uint32_t fourcc, size_t bpe, unsigned *internalformat)
 #define FCC_C(c) ((c) >= 0x20 && (c) < 0x7f ? (c) : '.')
 #define FCC(f) FCC_C((f) >> 24), FCC_C(((f) >> 16) & 0xff), FCC_C(((f) >> 8) & 0xff), FCC_C((f) & 0xff)
 
+/* GL upload format/type of a surface CA gave none for (as surface_format) */
+static void
+upload_format(uint32_t fourcc, size_t bpe, GLenum *format, GLenum *type)
+{
+	*type = GL_UNSIGNED_BYTE;
+	switch (fourcc) {
+	case 0:
+		*format = bpe == 4 ? GL_BGRA_EXT : bpe == 8 ? GL_RGBA : bpe == 1 ? GL_RED : 0;
+		*type = bpe == 8 ? GL_HALF_FLOAT : GL_UNSIGNED_BYTE;
+		break;
+	case 'LA08': *format = GL_LUMINANCE_ALPHA; break;
+	case 'A008': *format = GL_ALPHA; break;
+	case 'BGRA': *format = GL_BGRA_EXT; break;
+	case 'RGBA': *format = GL_RGBA; break;
+	case 'RGhA': *format = GL_RGBA; *type = GL_HALF_FLOAT; break;
+	case 'L008': *format = GL_RED; break;
+	case 'L016': *format = GL_RG; break;
+	default: *format = 0;
+	}
+}
+
 /*
  * Rows the GPU cannot sample in place (A5xx pitch is 64-byte aligned; CA's
  * own bitmaps are not): copied into the texture instead.
@@ -682,8 +740,9 @@ copy_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, size_t w
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
 	glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
-	glTexImage2D(target, 0, format == GL_BGRA_EXT ? GL_BGRA_EXT : (GLint)format, (GLsizei)w, (GLsizei)h, 0,
-	    format, type, base);
+	GLint ifmt = format == GL_RED ? GL_R8 : format == GL_RG ? GL_RG8 :
+	    type == GL_HALF_FLOAT ? GL_RGBA16F : (GLint)format;
+	glTexImage2D(target, 0, ifmt, (GLsizei)w, (GLsizei)h, 0, format, type, base);
 	GLenum e = glGetError();
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, align);
@@ -713,8 +772,13 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	if (img.format == PIPE_FORMAT_NONE && !multi) {
 		img.format = surface_format(fourcc, IOSurfaceGetBytesPerElementOfPlane(s, plane), &img.internalformat);
 	}
-	if (format && !multi && pitch % 64 != 0) {
-		return copy_surface(s, target, format, type, w, h, pitch, why);
+	if (!multi && pitch % 64 != 0) {
+		if (format == 0) {
+			upload_format(fourcc, IOSurfaceGetBytesPerElement(s), &format, &type);
+		}
+		if (format != 0) {
+			return copy_surface(s, target, format, type, w, h, pitch, why);
+		}
 	}
 	uint32_t handle = 0;
 	uint64_t size = 0;
