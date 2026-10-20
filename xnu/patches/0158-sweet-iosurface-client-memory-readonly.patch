@@ -1,0 +1,66 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -397,7 +397,7 @@
+ 	uint64_t size = md->getLength();
+ 	uint32_t handle;
+ 	struct sweet_gpu_bo *b = (size && !(size & PAGE_MASK) && size <= SWEET_GPU_MAX_BO_BYTES) ? newBo(&handle) : NULL;
+-	if (b == NULL || md->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++	if (b == NULL || md->prepare() != kIOReturnSuccess) {
+ 		s->release();
+ 		return b == NULL ? kIOReturnNoResources : kIOReturnVMError;
+ 	}
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -109,7 +109,7 @@
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+ 		/* the surface's own mode: write-combining managed (client) pages froze 0150a */
+-		kernelMap = memory->map(mapCache);
++		kernelMap = memory->map(mapCache | (readOnly ? kIOMapReadOnly : 0));
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -548,7 +548,8 @@
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache |
++	    (s->readOnly ? kIOMapReadOnly : 0));
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+ 		ref->release();
+@@ -711,10 +712,20 @@
+ 		uint64_t addr = address->unsigned64BitValue(), start = trunc_page_64(addr);
+ 		uint64_t len = round_page_64((addr - start) + (uint64_t)s->bytesPerRow *
+ 		    sweet_div_up(s->height, s->elementHeight));
+-		IOMemoryDescriptor *md = s->planeCount == 0 && addr != 0 && len <= SWEET_SURFACE_MAX_ALLOC ?
+-		    IOMemoryDescriptor::withAddressRange(start, len, kIODirectionInOut, fTask) : NULL;
+-		if (md == NULL || md->prepare() != kIOReturnSuccess) {
++		bool ok = s->planeCount == 0 && addr != 0 && len <= SWEET_SURFACE_MAX_ALLOC;
++		IOReturn prc = kIOReturnBadArgument, rorc = kIOReturnBadArgument;
++		IOMemoryDescriptor *md = ok ? IOMemoryDescriptor::withAddressRange(start, len, kIODirectionInOut, fTask) : NULL;
++		if (md != NULL && (prc = md->prepare()) != kIOReturnSuccess) {
++			/* CA's image bitmaps are often read-only (decoded/file-backed): wire them for reading */
+ 			OSSafeReleaseNULL(md);
++			md = IOMemoryDescriptor::withAddressRange(start, len, kIODirectionOut, fTask);
++			if (md != NULL && (rorc = md->prepare()) != kIOReturnSuccess) {
++				OSSafeReleaseNULL(md);
++			}
++			s->readOnly = md != NULL;
++		}
++		if (md == NULL) {
++			IOLog("SWEET SURF: client memory 0x%llx+0x%llx: prepare %#x, read-only %#x\n", addr, len, prc, rorc);
+ 			ret = kIOReturnVMError;
+ 		} else {
+ 			s->memory = md;
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -40,6 +40,7 @@
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 	bool                      clientMemory; /* the creator's pages (IOSurfaceAddress), prepared */
++	bool                      readOnly;     /* ...from a read-only mapping: mapped read-only */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
