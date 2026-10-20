@@ -126,6 +126,24 @@ main(void)
 		return 1;
 	}
 
+	/* the kernel brings the GPU up in its own thread: wait for it (up to 2 min) */
+	uint64_t probe = 0;
+	void *pp = pages(16384);
+	for (int i = 0; i < 120; i++) {
+		uint64_t in[2] = {(uint64_t)pp, 16384};
+		uint32_t n1 = 1;
+		kr = IOConnectCallScalarMethod(c, 0, in, 2, &probe, &n1);
+		if (kr != kIOReturnNotReady) {
+			break;
+		}
+		sleep(1);
+	}
+	if (kr != KERN_SUCCESS) {
+		say("GPU not ready: 0x%x\n", kr);
+		return 1;
+	}
+	IOConnectCallScalarMethod(c, 2, &probe, 1, NULL, NULL);
+
 	/* 1. correctness: 64x64 image at (16, 16) of a 128x128 dst (kernel api_selftest) */
 	uint32_t *s = pages(64 * 64 * 4), *d = pages(128 * 128 * 4);
 	for (uint32_t i = 0; i < 64 * 64; i++) {
@@ -213,6 +231,19 @@ main(void)
 	uint64_t t3 = mach_absolute_time();
 	say("750x1334 quad 0x%x: first %.2f ms, then %.2f ms each; CPU source-over %.2f ms\n",
 	    kr, ms(t1 - t0), ms(t2 - t1) / 9, ms(t3 - t2));
+	/* the whole per-draw cost if nothing stays mapped: wire + map both, quad, unmap both */
+	IOConnectCallScalarMethod(c, 2, &fsg, 1, NULL, NULL);
+	IOConnectCallScalarMethod(c, 2, &fdg, 1, NULL, NULL);
+	t0 = mach_absolute_time();
+	for (int i = 0; i < 10; i++) {
+		f.src_va = map(c, fs, len);
+		f.dst_va = map(c, fd, len);
+		kr = quad(c, &f);
+		IOConnectCallScalarMethod(c, 2, &f.src_va, 1, NULL, NULL);
+		IOConnectCallScalarMethod(c, 2, &f.dst_va, 1, NULL, NULL);
+	}
+	t1 = mach_absolute_time();
+	say("750x1334 map + map + quad + unmap + unmap: 0x%x, %.2f ms each\n", kr, ms(t1 - t0) / 10);
 	IOServiceClose(c);
 	return 0;
 }
