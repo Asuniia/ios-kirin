@@ -665,6 +665,54 @@ trace_draw_result(GLint prog)
 	trace_region("after");
 }
 
+/* SWEETGL_TRACE: vertex_color of the draw's first vertices (client arrays) or its constant value */
+static void
+trace_vertex_color(GLint prog, GLenum itype, const void *indices, GLint first)
+{
+	GLint loc = glGetAttribLocation(prog, "vertex_color"), on = 0;
+	if (loc < 0) {
+		return;
+	}
+	glGetVertexAttribiv(loc, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
+	if (!on) {
+		GLfloat f[4] = {0};
+		glGetVertexAttribfv(loc, GL_CURRENT_VERTEX_ATTRIB, f);
+		TRACE("  vertex_color constant %.3g,%.3g,%.3g,%.3g", f[0], f[1], f[2], f[3]);
+		return;
+	}
+	GLint size = 0, type = 0, stride = 0, norm = 0, buf = 0;
+	void *ptr = NULL;
+	glGetVertexAttribiv(loc, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+	glGetVertexAttribiv(loc, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
+	glGetVertexAttribiv(loc, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+	glGetVertexAttribiv(loc, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &norm);
+	glGetVertexAttribiv(loc, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buf);
+	glGetVertexAttribPointerv(loc, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr);
+	char line[300];
+	size_t len = (size_t)snprintf(line, sizeof(line), "  vertex_color size %d type %#x norm %d stride %d buf %d:", size,
+	    type, norm, stride, buf);
+	for (int v = 0; v < 4 && ptr != NULL && buf == 0; v++) {
+		GLint idx = first + v;
+		if (indices != NULL) {
+			idx = itype == GL_UNSIGNED_SHORT ? ((const GLushort *)indices)[v] :
+			      itype == GL_UNSIGNED_BYTE ? ((const GLubyte *)indices)[v] : (GLint)((const GLuint *)indices)[v];
+		}
+		int esz = type == GL_FLOAT ? 4 : type == GL_UNSIGNED_SHORT || type == GL_HALF_FLOAT ? 2 : 1;
+		const uint8_t *e = (const uint8_t *)ptr + (size_t)idx * (size_t)(stride ? stride : size * esz);
+		len += (size_t)snprintf(line + len, sizeof(line) - len, " [%d]", idx);
+		for (int c = 0; c < size && len < sizeof(line) - 16; c++) {
+			if (type == GL_FLOAT) {
+				len += (size_t)snprintf(line + len, sizeof(line) - len, " %.3g", ((const float *)e)[c]);
+			} else if (esz == 2) {
+				len += (size_t)snprintf(line + len, sizeof(line) - len, " %04x", ((const uint16_t *)e)[c]);
+			} else {
+				len += (size_t)snprintf(line + len, sizeof(line) - len, " %02x", e[c]);
+			}
+		}
+	}
+	TRACE("%s", line);
+}
+
 /* before a draw: each unit holds what the program samples there, rect scale set */
 static bool
 draw_prep(GLenum mode, GLsizei count)
@@ -781,6 +829,11 @@ sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count)
 {
 	SGL_CUR(rctx);
 	bool fresh = draw_prep(mode, count);
+	if (fresh) {
+		GLint prog = 0;
+		glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+		trace_vertex_color(prog, 0, NULL, first);
+	}
 	glDrawArrays(mode, first, count);
 	if (fresh) {
 		GLint prog = 0;
@@ -795,6 +848,12 @@ sgl_DrawElements(void *rctx, GLenum mode, GLsizei count, GLenum type, const void
 {
 	SGL_CUR(rctx);
 	bool fresh = draw_prep(mode, count);
+	if (fresh) {
+		GLint prog = 0, ebuf = 0;
+		glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+		glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebuf);
+		trace_vertex_color(prog, type, ebuf == 0 ? indices : NULL, 0);
+	}
 	glDrawElements(mode, count, type, indices);
 	if (fresh) {
 		GLint prog = 0;
