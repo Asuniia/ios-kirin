@@ -402,7 +402,8 @@ draw_prep(void)
 			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
 		}
 		glUniform2f(scale, w > 0 ? 1.0f / w : 1.0f, h > 0 ? 1.0f / h : 1.0f);
-		TRACE("rect program %d unit %d tex %u %dx%d", prog, unit, tex, w, h);
+		TRACE("rect program %d unit %d tex %u %dx%d; 2d %u %u %u %u rect %u %u held %u %u", prog, unit, tex, w, h,
+		    unit_2d[0], unit_2d[1], unit_2d[2], unit_2d[3], unit_rect[0], unit_rect[1], unit_held[0], unit_held[1]);
 	}
 	if (active >= 0) {
 		glActiveTexture(GL_TEXTURE0 + active);
@@ -413,6 +414,7 @@ void
 sgl_BindTexture(void *rctx, GLenum target, GLuint texture)
 {
 	SGL_CUR(rctx);
+	TRACE("BindTexture target %#x tex %u unit %d", target, texture, active_unit());
 	if (target == GL_TEXTURE_2D || target == 0x84F5) {
 		int u = active_unit();
 		*(target == GL_TEXTURE_2D ? &unit_2d[u] : &unit_rect[u]) = texture;
@@ -430,6 +432,7 @@ sgl_DeleteTextures(void *rctx, GLsizei n, const GLuint *textures)
 {
 	SGL_CUR(rctx);
 	for (GLsizei i = 0; i < n; i++) {
+		TRACE("DeleteTextures %u", textures[i]);
 		for (int u = 0; u < UNITS; u++) {
 			if (unit_2d[u] == textures[i]) {
 				unit_2d[u] = 0;
@@ -515,9 +518,10 @@ sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLs
     GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels)
 {
 	SGL_CUR(rctx);
+	GLenum asked = target;
 	target = SGL_TGT(target);
-	TRACE("TexImage2D target %#x level %d ifmt %#x %dx%d fmt %#x type %#x pixels %p", target, level,
-	    internalformat, width, height, format, type, pixels);
+	TRACE("TexImage2D target %#x unit %d tex %u level %d ifmt %#x %dx%d fmt %#x type %#x pixels %p", asked,
+	    active_unit(), unit_held[active_unit()], level, internalformat, width, height, format, type, pixels);
 	if (format == GL_BGRA_EXT && (internalformat == GL_RGBA || internalformat == GL_RGBA8)) {
 		internalformat = GL_BGRA_EXT;
 	}
@@ -816,6 +820,7 @@ m_tex_iosurface(id self, SEL cmd, IOSurfaceRef s, NSUInteger target, NSUInteger 
 		    height, format, type, plane, invert);
 	}
 	SGL_CUR(c);
+	TRACE("texImageIOSurface target %#lx unit %d", (unsigned long)target, active_unit());
 	return bind_surface(s, SGL_TGT((GLenum)target), (GLenum)format, (GLenum)type, plane, "texImageIOSurface");
 }
 
@@ -827,6 +832,7 @@ m_attach(id self, SEL cmd, NSUInteger target, IOSurfaceRef s, BOOL inverted)
 		return ((BOOL(*)(id, SEL, NSUInteger, IOSurfaceRef, BOOL))orig_attach)(self, cmd, target, s, inverted);
 	}
 	SGL_CUR(c);
+	TRACE("attachImage target %#lx unit %d", (unsigned long)target, active_unit());
 	return bind_surface(s, SGL_TGT((GLenum)target), 0, 0, 0, "attachImage");
 }
 
@@ -872,7 +878,7 @@ sweetgl_eagl_install(void)
 	const char *e = getenv("SWEETGL_GLERR");
 	sgl_check_errors = e && e[0] == '1';
 	const char *t = getenv("SWEETGL_TRACE");
-	trace_left = t && t[0] == '1' ? 600 : 0;
+	trace_left = t && t[0] == '1' ? 20000 : 0;
 	dump_shaders = trace_left > 0;
 	Class cls = objc_getClass("EAGLContext");
 	if (cls == Nil) {
