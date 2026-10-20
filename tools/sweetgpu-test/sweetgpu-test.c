@@ -27,6 +27,8 @@ struct sweet_gpu_quad {
 	uint32_t flags;
 };
 
+#define SWEET_GPU_QUAD_NEAREST  1u
+
 static int g_null = -1;
 
 static void

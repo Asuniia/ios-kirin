@@ -1,0 +1,71 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -222,12 +222,27 @@
+ static vm_offset_t mmcc;        /* MMSS clock controller, for the gfx3d clock */
+ 
+ static void
+-gpu_wait(unsigned secs)
++gpu_sleep(unsigned secs)
+ {
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(secs, NSEC_PER_SEC, &deadline);
+ 	(void)assert_wait_deadline(&gpu_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int g_level;     /* the sweetgpu boot-arg */
++
++/*
++ * Pauses between bring-up stages (11 s: a hang or panic shows which stage
++ * it was). Service mode (sweetgpu=8) skips them: backboardd waits for it.
++ */
++static void
++gpu_wait(unsigned secs)
++{
++	if (g_level >= 8 && secs > 2) {
++		return;
++	}
++	gpu_sleep(secs);
+ }
+ 
+ static uint32_t
+@@ -1335,7 +1350,7 @@
+ 	}
+ 	if (q->src_w == 0 || q->src_h == 0 || q->src_w > 16384 || q->src_h > 16384 ||
+ 	    q->dst_w == 0 || q->dst_h == 0 || q->dst_w > 16384 || q->dst_h > 16384 ||
+-	    q->src_pitch % 64 || q->dst_pitch % 64 || q->src_pitch < q->src_w * 4 || q->dst_pitch < q->dst_w * 4 ||
++	    q->src_pitch % 4 || q->dst_pitch % 4 || q->src_pitch < q->src_w * 4 || q->dst_pitch < q->dst_w * 4 ||
+ 	    (q->src_va & 63) || (q->dst_va & 63) || q->w == 0 || q->h == 0 ||
+ 	    q->x0 >= q->dst_w || q->y0 >= q->dst_h || q->w > q->dst_w - q->x0 || q->h > q->dst_h - q->y0) {
+ 		return EINVAL;
+@@ -1676,7 +1691,16 @@
+ gpu_thread(void *arg, wait_result_t result)
+ {
+ 	(void)result;
+-	gpu_wait(40);
++	g_level = (int)(uintptr_t)arg;
++	if (g_level >= 8) {
++		/* as soon as the PMIC answers (sweet_keys maps SPMI during boot) */
++		uint8_t t;
++		for (int i = 0; i < 60 && !sweet_pmic_read(GFX_S2, 0x04, &t); i++) {
++			gpu_sleep(1);
++		}
++	} else {
++		gpu_sleep(40);
++	}
+ 	vm_offset_t mm = ml_io_map(MMCC_PA, 0x10000);
+ 	vm_offset_t gcc = ml_io_map(GCC_PA + 0x9000, 0x1000);
+ 	vm_offset_t gcc46 = ml_io_map(GCC_PA + 0x46000, 0x1000);
+--- a/bsd/dev/sweet_gpu.h
++++ b/bsd/dev/sweet_gpu.h
+@@ -18,7 +18,9 @@
+  * texels (unnormalized), s = bilinear (flags bit 0: nearest) sample of src,
+  * clamped to its edge, times opacity; dst = s + dst * (1 - s.a). Images are
+  * 4 bytes per pixel, premultiplied, alpha in byte 3 (BGRA8 or RGBA8), at
+- * GPU VAs from sweet_gpu_vm_map; pitches in bytes, multiples of 64.
++ * GPU VAs from sweet_gpu_vm_map (64-byte aligned); pitches in bytes, multiples
++ * of 4 (whether the texture unit takes pitches that are not multiples of 64
++ * is what sweetgpu-ca's verify mode checks).
+  */
+ struct sweet_gpu_quad {
+ 	uint64_t src_va, dst_va;
