@@ -434,14 +434,53 @@ trace_empty_samplers(GLint prog)
 	}
 }
 
+/* SWEETGL_TRACE: each distinct draw state once (program, blend, stencil, depth, target) */
+static void
+trace_draw_state(GLint prog, GLenum mode, GLsizei count)
+{
+	static uint32_t seen[8192];
+	GLint v[16] = {0};
+	GLboolean m[4] = {0};
+	v[0] = glIsEnabled(GL_BLEND);
+	glGetIntegerv(GL_BLEND_SRC_RGB, &v[1]);
+	glGetIntegerv(GL_BLEND_DST_RGB, &v[2]);
+	glGetIntegerv(GL_BLEND_SRC_ALPHA, &v[3]);
+	glGetIntegerv(GL_BLEND_DST_ALPHA, &v[4]);
+	glGetIntegerv(GL_BLEND_EQUATION_RGB, &v[5]);
+	v[6] = glIsEnabled(GL_STENCIL_TEST);
+	glGetIntegerv(GL_STENCIL_FUNC, &v[7]);
+	glGetIntegerv(GL_STENCIL_PASS_DEPTH_PASS, &v[8]);
+	v[9] = glIsEnabled(GL_DEPTH_TEST);
+	v[10] = glIsEnabled(GL_SCISSOR_TEST);
+	glGetBooleanv(GL_COLOR_WRITEMASK, m);
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &v[11]);
+	GLint vp[4] = {0};
+	glGetIntegerv(GL_VIEWPORT, vp);
+	uint32_t key = 2166136261u;
+	for (int i = 0; i < 12; i++) {
+		key = (key ^ (uint32_t)v[i]) * 16777619u;
+	}
+	key = (key ^ (uint32_t)prog ^ (uint32_t)mode << 8 ^ (uint32_t)(m[0] | m[1] << 1 | m[2] << 2 | m[3] << 3) << 16) *
+	    16777619u;
+	key = (key ^ (uint32_t)vp[2] ^ (uint32_t)vp[3] << 16) * 16777619u;
+	if (seen[key % 8192] == key) {
+		return;
+	}
+	seen[key % 8192] = key;
+	TRACE("draw prog %d mode %#x n %d fb %d vp %dx%d blend %d %#x/%#x %#x/%#x eq %#x stencil %d func %#x pass %#x "
+	    "depth %d scissor %d mask %d%d%d%d", prog, mode, count, v[11], vp[2], vp[3], v[0], v[1], v[2], v[3], v[4],
+	    v[5], v[6], v[7], v[8], v[9], v[10], m[0], m[1], m[2], m[3]);
+}
+
 /* before a draw: each unit holds what the program samples there, rect scale set */
 static void
-draw_prep(void)
+draw_prep(GLenum mode, GLsizei count)
 {
 	GLint prog = 0, unit = -1, w = 0, h = 0, scale = -1;
 	glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
 	if (trace_left > 0 && prog != 0) {
 		trace_empty_samplers(prog);
+		trace_draw_state(prog, mode, count);
 	}
 	for (int i = 0; i < n_rect_programs; i++) {
 		if (rect_programs[i].program == (GLuint)prog) {
@@ -540,7 +579,7 @@ void
 sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count)
 {
 	SGL_CUR(rctx);
-	draw_prep();
+	draw_prep(mode, count);
 	glDrawArrays(mode, first, count);
 	SGL_POST(65);
 }
@@ -549,7 +588,7 @@ void
 sgl_DrawElements(void *rctx, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
 	SGL_CUR(rctx);
-	draw_prep();
+	draw_prep(mode, count);
 	glDrawElements(mode, count, type, indices);
 	SGL_POST(67);
 }
@@ -582,6 +621,12 @@ sgl_LinkProgramARB(void *rctx, GLhandleARB program)
 	glGetProgramiv(H(program), GL_LINK_STATUS, &ok);
 	if (ok) {
 		rect_link(H(program));
+	}
+	if (dump_shaders) {
+		GLuint sh[4] = {0};
+		GLsizei n = 0;
+		glGetAttachedShaders(H(program), 4, &n, sh);
+		sweet_drm_log("sweetgl: program %u = shaders %u %u", H(program), sh[0], sh[1]);
 	}
 	if (!ok) {
 		static char log[1024];
