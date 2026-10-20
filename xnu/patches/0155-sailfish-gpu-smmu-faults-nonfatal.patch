@@ -1,0 +1,93 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -445,7 +445,13 @@
+ 	SWR(cb, 0x20, (uint32_t)pt);             /* TTBR0, ASID 0 */
+ 	SWR(cb, 0x24, (uint32_t)(pt >> 32));
+ 	SWR(cb, 0x58, 0xffffffffu);              /* FSR: clear */
+-	SWR(cb, 0x0, (1u << 5) | (1u << 2) | (1u << 1) | 1u);    /* CFRE AFE TRE M */
++	/*
++	 * AFE TRE M, no CFRE: a faulting access is terminated without an abort
++	 * to the GPU (reads 0, writes dropped). Texture/vertex fetch reads a
++	 * little past buffer ends; with CFRE that hung the GPU (0154a/c).
++	 * Faults are still recorded in FSR/FAR: sweet_gpu_submit logs them.
++	 */
++	SWR(cb, 0x0, (1u << 2) | (1u << 1) | 1u);
+ 	SWR(smmu, 0x800, 1u << 31);             /* SMR0: stream 0 (gfx3d_user), mask 0 */
+ 	SWR(smmu, 0xc00, 0);                     /* S2CR0: translate, context bank 0 */
+ 	SWR(smmu, 0x68, 0);                      /* TLBIALLNSNH */
+@@ -454,7 +460,7 @@
+ 	uint32_t smr = rd(smmu, 0x800), s2cr = rd(smmu, 0xc00), cbar = rd(gr1, 0x0);
+ 	uint32_t sctlr = rd(cb, 0x0), tcr = rd(cb, 0x30), ttbr = rd(cb, 0x20);
+ 	bool ok = synced && smr == (1u << 31) && (s2cr & 0x300ff) == 0 &&
+-	    (cbar & (3u << 16)) == (1u << 16) && (sctlr & 0x27) == 0x27 && tcr == (28u | (1u << 23)) &&
++	    (cbar & (3u << 16)) == (1u << 16) && (sctlr & 0x27) == 0x07 && tcr == (28u | (1u << 23)) &&
+ 	    ttbr == (uint32_t)pt;
+ 	printf("SWEET GPU: SMMU identity %s: pt %llx SMR0 %08x S2CR0 %08x CBAR0 %08x SCTLR %08x TCR %08x TTBR0 %08x tlbsync %d\n",
+ 	    ok ? "ok" : "REJECTED", pt, smr, s2cr, cbar, sctlr, tcr, ttbr, synced);
+@@ -1549,6 +1555,35 @@
+ 	    fence_now(), g_submit_seq);
+ }
+ 
++/* VM lock held: log (rate-limited) and clear a recorded SMMU fault, with the mapping below it. */
++static void
++smmu_report(void)
++{
++	static uint32_t logged;
++	vm_offset_t cb = g_smmu + 0x8000;
++	uint32_t fsr = rd(cb, 0x58);
++	if (fsr == 0) {
++		return;
++	}
++	uint64_t far = ((uint64_t)rd(cb, 0x64) << 32) | rd(cb, 0x60);
++	if (logged < 32) {
++		logged++;
++		int64_t below = -1;
++		if (far >= GVA_BASE && far - GVA_BASE < (uint64_t)GVA_PAGES * PAGE_SIZE && g_owner != NULL) {
++			for (int64_t p = (int64_t)((far - GVA_BASE) / PAGE_SIZE); p >= 0 && below < 0; p--) {
++				uint32_t m = g_owner[p];
++				if (m != 0 && m != VM_GUARD) {
++					below = m;
++				}
++			}
++		}
++		printf("SWEET GPU: SMMU fault (non-fatal) FSR %08x FAR %llx FSYNR0 %08x; mapping below: %llx + %llx\n",
++		    fsr, far, rd(cb, 0x68), below >= 0 ? g_maps[below].va : 0,
++		    below >= 0 ? (uint64_t)g_maps[below].npages * PAGE_SIZE : 0);
++	}
++	wr(cb, 0x58, fsr);      /* write-1-to-clear */
++}
++
+ int
+ sweet_gpu_submit(const struct sweet_gpu_ib *ib, uint32_t n, uint32_t *seqno)
+ {
+@@ -1567,6 +1602,7 @@
+ 			ret = EFAULT;
+ 		}
+ 	}
++	smmu_report();
+ 	uint32_t need = 4 * n + 6 + 5;
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
+@@ -2082,12 +2118,17 @@
+ 	}
+ 	if (!(s2[6] & 0x80)) {
+ 		uint8_t vset = (uint8_t)((745 - (s2[1] == 9 ? 80 : 0)) / 5);
+-		bool ok = sweet_pmic_write(GFX_S2, 0x41, vset) && sweet_pmic_write(GFX_S2, 0x46, 0x80);
+-		delay(1000);
++		bool ok = false;
+ 		uint8_t en = 0, v = 0, st = 0;
+-		(void)(sweet_pmic_read(GFX_S2, 0x46, &en) && sweet_pmic_read(GFX_S2, 0x41, &v) &&
+-		    sweet_pmic_read(GFX_S2, 0x08, &st));
+-		printf("SWEET GPU: S2 enable %s: en %02x vset %u status %02x\n", ok ? "ok" : "FAILED", en, v, st);
++		/* the enable did not stick once (0154b: en 00, GPU never came up): retry */
++		for (int attempt = 0; attempt < 5 && !(ok && (en & 0x80)); attempt++) {
++			ok = sweet_pmic_write(GFX_S2, 0x41, vset) && sweet_pmic_write(GFX_S2, 0x46, 0x80);
++			delay(1000 + attempt * 10000);
++			(void)(sweet_pmic_read(GFX_S2, 0x46, &en) && sweet_pmic_read(GFX_S2, 0x41, &v) &&
++			    sweet_pmic_read(GFX_S2, 0x08, &st));
++			printf("SWEET GPU: S2 enable %s (try %d): en %02x vset %u status %02x\n",
++			    ok && (en & 0x80) ? "ok" : "FAILED", attempt + 1, en, v, st);
++		}
+ 		if (!ok || !(en & 0x80)) {
+ 			return;
+ 		}
