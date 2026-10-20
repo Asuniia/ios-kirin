@@ -93,6 +93,12 @@ sweetgl_init(void)
 	if (fscreen == NULL) {
 		int fd = sweet_drm_open();
 		if (fd >= 0) {
+			/*
+			 * Render straight to memory, no GMEM tiles: tile restore/resolve
+			 * covers whole 32-row blocks past the end of IOSurfaces that were
+			 * not padded for it (GPU fault on the display surface, boot 0154a).
+			 */
+			setenv("FD_MESA_DEBUG", "sysmem", 0);
 			/* fd_screen_create fills opts from opt_info (no xmlconfig: defaults) */
 			driParseOptionInfo(&opt_info, sweetgl_driconf, ARRAY_SIZE(sweetgl_driconf));
 			struct pipe_screen_config cfg = {.options = &opts, .options_info = &opt_info};
