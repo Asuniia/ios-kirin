@@ -1,0 +1,66 @@
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -424,6 +424,54 @@
+ 		    top_tab[best].pid, top_tab[best].delta * 100 / interval_ns);
+ 	}
+ 	printf("%s\n", line);
++}
++
++/*
++ * Read-only clock measurement through the GCC debug mux (downstream
++ * clock-gcc-8996.c gcc_debug_mux + clock-local2.c measure_get_rate): select
++ * the clock in GCC_DEBUG_CLK_CTL (0x362000), count it against XO/4
++ * (XO_DIV4_CBCR 0x343008) in CLOCK_FRQ_MEASURE_CTL/STATUS (0x362004/8).
++ * Nothing is changed but these debug registers (restored afterwards).
++ * bimc_clk (sel 0xad) is DDR/2: 902 MHz in TWRP's Linux, RPM vote 1.8 GHz.
++ */
++#define GCC_DBG_PA      0x00362000u
++#define GCC_XO4_PA      0x00343000u
++
++static uint32_t
++dbg_run(vm_offset_t dbg, uint32_t ticks)
++{
++	clk_wr(dbg, 0x4, ticks);
++	for (int i = 0; i < 1000000 && (clk_rd(dbg, 0x8) & (1u << 25)); i++) {
++	}
++	clk_wr(dbg, 0x4, (1u << 20) | ticks);
++	for (int i = 0; i < 100000000 && !(clk_rd(dbg, 0x8) & (1u << 25)); i++) {
++	}
++	return clk_rd(dbg, 0x8) & 0x1ffffffu;
++}
++
++static uint64_t
++clk_measure_mhz(uint32_t sel)
++{
++	static vm_offset_t dbg, xo4;
++	if (dbg == 0) {
++		dbg = ml_io_map(GCC_DBG_PA, 0x1000);
++		xo4 = ml_io_map(GCC_XO4_PA, 0x1000);
++	}
++	if (dbg == 0 || xo4 == 0) {
++		return 0;
++	}
++	uint32_t ctl = clk_rd(dbg, 0x0), cbcr = clk_rd(xo4, 0x8), pad = clk_rd(dbg, 0xc);
++	clk_wr(dbg, 0xc, 0x51a00);                      /* plltest_val */
++	clk_wr(dbg, 0x0, (sel & 0x3ff) | (1u << 16));   /* select, enable */
++	clk_wr(xo4, 0x8, cbcr | 1u);                    /* XO/4 branch on */
++	uint32_t s = dbg_run(dbg, 0x1000), f = dbg_run(dbg, 0x10000);
++	clk_wr(xo4, 0x8, cbcr);
++	clk_wr(dbg, 0x0, ctl);
++	clk_wr(dbg, 0xc, pad);
++	if (f == s) {
++		return 0;                               /* not running */
++	}
++	return (((uint64_t)f * 10 + 15) * 4800000 / (0x10000 * 10 + 35)) / 1000000;
+ }
+ 
+ static void
+@@ -457,6 +505,8 @@
+ 		    ms ? ds * 1000 / ms : 0, ms ? ds * 10000 / ms % 10 : 0,
+ 		    ms ? dp * 1000 / ms : 0, ms ? dp * 10000 / ms % 10 : 0,
+ 		    dp ? perf_ns(dabs) / 1000 / dp : 0);
++		uint64_t bimc = clk_measure_mhz(0xad);
++		printf("SWEET PERF: bimc %llu MHz (DDR %llu MHz)\n", bimc, bimc * 2);
+ 		printf("SWEET PERF: panel kicks %llu (after done %llu, after 50 ms timeout %llu)\n",
+ 		    sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout);
+ 		perf_top(perf_ns(now - t));
