@@ -348,6 +348,45 @@ fbfetch_rewrite(char *src)
 	return out;
 }
 
+/*
+ * CA's GL renderer has no tex_fragment_shaders entry for its vibrant color
+ * matrix (texture function 0x2d, render_vibrant_color_matrix): those layers
+ * (Control Center off circles, App Library plates) were never composited.
+ * sgl_install_vcm() points the entry at "sgl_vcm(s0)"; this adds the
+ * function: the SW renderer's tex_vibrant_color_matrix, i.e. the destination
+ * through the colour matrix (color_matrix[0..3] columns, [4] bias, on
+ * unpremultiplied colour) mixed in by the source's alpha.
+ */
+static const char vcm_func[] =
+    "lowp vec4 sgl_vcm(lowp vec4 s) {\n"
+    "  lowp vec4 d = gl_LastFragData[0];\n"
+    "  lowp vec4 u = vec4(d.rgb / max(d.a, .005), d.a);\n"
+    "  u = clamp(u.r * color_matrix[0] + u.g * color_matrix[1] + u.b * color_matrix[2]\n"
+    "    + u.a * color_matrix[3] + color_matrix[4], 0., 1.);\n"
+    "  u.rgb *= u.a;\n"
+    "  return mix(d, d.a > 0. ? u : vec4(0.), s.a);\n"
+    "}\n";
+
+/* vcm_func (and color_matrix if undeclared) before main (src is freed) */
+static char *
+vcm_rewrite(char *src)
+{
+	const char *decl = strstr(src, " color_matrix[5];") ? "" : "uniform lowp vec4 color_matrix[5];\n";
+	char *at = strstr(src, "void main");
+	if (at == NULL) {
+		return src;
+	}
+	size_t n = strlen(src), dl = strlen(decl);
+	char *out = malloc(n + dl + sizeof(vcm_func));
+	size_t pre = (size_t)(at - src);
+	memcpy(out, src, pre);
+	memcpy(out + pre, decl, dl);
+	memcpy(out + pre + dl, vcm_func, sizeof(vcm_func) - 1);
+	memcpy(out + pre + dl + sizeof(vcm_func) - 1, at, n - pre + 1);
+	free(src);
+	return out;
+}
+
 static const char rect_prelude[] =
     "#define sampler2DRect sampler2D\n"
     "#define texture2DRect(s, c) texture2D(s, (c) * sgl_rect_scale)\n"
@@ -397,7 +436,10 @@ sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GLcharA
 		memmove(src + at + sizeof(rect_prelude) - 1, src + at, n - at + 1);
 		memcpy(src + at, rect_prelude, sizeof(rect_prelude) - 1);
 	}
-	if (strstr(src, "GL_EXT_shader_framebuffer_fetch") != NULL) {
+	if (strstr(src, "sgl_vcm(") != NULL) {
+		src = vcm_rewrite(src);
+	}
+	if (strstr(src, "GL_EXT_shader_framebuffer_fetch") != NULL || strstr(src, "gl_LastFragData") != NULL) {
 		src = fbfetch_rewrite(src);
 		if (n_fbfetch_shaders < FBFETCH_MAX) {
 			fbfetch_shaders[n_fbfetch_shaders++] = H(shader);
@@ -1767,7 +1809,7 @@ sgl_fmt_hook(void)
  * calls in full, then counts), replaying the 4 overwritten prologue
  * instructions (position independent stack stores only).
  */
-#define SGL_HOOKS 7
+#define SGL_HOOKS 12
 static const struct {
 	uint64_t addr;          /* dsc-8, unslid */
 	uint32_t code[4];
@@ -1780,6 +1822,11 @@ static const struct {
 	{0x188372f74, {0xd10703ff, 0x6d1523e9, 0xa9166ffc, 0xa91767fa}, "MaskNode::apply"},
 	{0x18834d888, {0x6db63bef, 0x6d0133ed, 0x6d022beb, 0x6d0323e9}, "prepare_filters"},
 	{0x18834f480, {0xd10303ff, 0x6d0623e9, 0xa90767fa, 0xa9085ff8}, "emit_filter_quads_color"},
+	{0x1882d30b8, {0xd10243ff, 0x6d0323e9, 0xa90467fa, 0xa9055ff8}, "render_background"},
+	{0x188311534, {0x6db923e9, 0xa9016ffc, 0xa90267fa, 0xa9035ff8}, "render_solid_background"},
+	{0x1884d504c, {0xd10483ff, 0x6d0d23e9, 0xa90e6ffc, 0xa90f57f6}, "fill_round_rect"},
+	{0x1882f1298, {0xd10203ff, 0xa9045ff8, 0xa90557f6, 0xa9064ff4}, "fill_color_rect"},
+	{0x1884af0d8, {0xa9ba6ffc, 0xa90167fa, 0xa9025ff8, 0xa90357f6}, "create_shader"},
 };
 uint64_t sgl_hook_cont[SGL_HOOKS];
 void sgl_hook_log(uint64_t id, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t lr);
@@ -1788,7 +1835,62 @@ void
 sgl_hook_log(uint64_t id, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t lr)
 {
 	static unsigned calls[SGL_HOOKS];
+	static __thread int armed;
 	unsigned c = ++calls[id];
+	if (id == 7 || id == 8) {
+		/* x1 OGL::Layer: +0x18 Render::Layer (bg colour float4 at +0x10, bounds 4 doubles at +0x40) */
+		static unsigned shown;
+		uint64_t rl = *(const uint64_t *)(uintptr_t)(x1 + 0x18);
+		const double *b = (const double *)(uintptr_t)(rl + 0x40);
+		const float *bg = (const float *)(uintptr_t)(rl + 0x10);
+		armed = 0;
+		if (b[2] >= 40 && b[2] <= 160 && b[2] == b[3] && shown++ < 600) {
+			uint64_t gs = *(const uint64_t *)(uintptr_t)(x0 + 0x100);
+			const __fp16 *g = (const __fp16 *)(uintptr_t)(gs + 0x20);
+			const __fp16 *col = (const __fp16 *)(uintptr_t)x2;
+			sweet_drm_log("sweetgl: %s L %#llx %gx%g bg %g,%g,%g,%g fl %#x/%#x mode %u gcol %g,%g,%g,%g arg %g,%g,%g,%g "
+			    "from %#llx", id == 7 ? "bg" : "solid", (unsigned long long)x1, b[2], b[3], bg[0], bg[1], bg[2], bg[3],
+			    *(const uint32_t *)(uintptr_t)(x1 + 0x20), *(const uint16_t *)(uintptr_t)(x1 + 0x24),
+			    *(const uint8_t *)(uintptr_t)(x1 + 0x26), id == 8 ? (float)g[0] : 0.f, id == 8 ? (float)g[1] : 0.f,
+			    id == 8 ? (float)g[2] : 0.f, id == 8 ? (float)g[3] : 0.f, id == 8 ? (float)col[0] : 0.f,
+			    id == 8 ? (float)col[1] : 0.f, id == 8 ? (float)col[2] : 0.f, id == 8 ? (float)col[3] : 0.f,
+			    (unsigned long long)(lr - sgl_cache_slide));
+			armed = id == 8 ? 4 : 0;
+		}
+		return;
+	}
+	if (id == 11) {
+		/* x1 GLShader: byte 0 = texture function (tex_fragment_shaders index); log each variant once */
+		static uint8_t seen[256][16];
+		static int n;
+		const uint8_t *sh = (const uint8_t *)(uintptr_t)x1;
+		for (int i = 0; i < n; i++) {
+			if (memcmp(seen[i], sh, 16) == 0) {
+				return;
+			}
+		}
+		if (n < 256) {
+			memcpy(seen[n++], sh, 16);
+		}
+		const char *const *tex = (const char *const *)(uintptr_t)(0x1d5b44a10ull + sgl_cache_slide);
+		char hex[3 * 0x30 + 1];
+		for (int i = 0; i < 0x30; i++) {
+			snprintf(hex + 3 * i, 4, "%02x ", sh[i]);
+		}
+		sweet_drm_log("sweetgl: create_shader fn %#x%s: %s", sh[0], sh[0] < 90 && tex[sh[0]] == NULL ? " MISSING" : "",
+		    hex);
+		return;
+	}
+	if (id == 9 || id == 10) {
+		if (armed > 0) {
+			armed--;
+			uint64_t st = *(const uint64_t *)(uintptr_t)(x0 + 0x10);
+			sweet_drm_log("sweetgl:   %s shader %u blend %u from %#llx", sgl_hook_def[id].name,
+			    *(const uint8_t *)(uintptr_t)(st + 0x10), *(const uint8_t *)(uintptr_t)(st + 0x1b0),
+			    (unsigned long long)(lr - sgl_cache_slide));
+		}
+		return;
+	}
 	if (id == 6) {
 		/* x0 Context*, x1 Surface*: surface rect at +0x20 and the context clip shape */
 		static unsigned shown;
@@ -1857,8 +1959,14 @@ SGL_HOOK_STUB(3, 0xa9bc5ff8, 0xa90157f6, 0xa9024ff4, 0xa9037bfd)
 SGL_HOOK_STUB(4, 0xd10703ff, 0x6d1523e9, 0xa9166ffc, 0xa91767fa)
 SGL_HOOK_STUB(5, 0x6db63bef, 0x6d0133ed, 0x6d022beb, 0x6d0323e9)
 SGL_HOOK_STUB(6, 0xd10303ff, 0x6d0623e9, 0xa90767fa, 0xa9085ff8)
+SGL_HOOK_STUB(7, 0xd10243ff, 0x6d0323e9, 0xa90467fa, 0xa9055ff8)
+SGL_HOOK_STUB(8, 0x6db923e9, 0xa9016ffc, 0xa90267fa, 0xa9035ff8)
+SGL_HOOK_STUB(9, 0xd10483ff, 0x6d0d23e9, 0xa90e6ffc, 0xa90f57f6)
+SGL_HOOK_STUB(10, 0xd10203ff, 0xa9045ff8, 0xa90557f6, 0xa9064ff4)
+SGL_HOOK_STUB(11, 0xa9ba6ffc, 0xa90167fa, 0xa9025ff8, 0xa90357f6)
 static void (*const sgl_hook_stub[SGL_HOOKS])(void) = {sgl_hook_stub0, sgl_hook_stub1, sgl_hook_stub2, sgl_hook_stub3,
-    sgl_hook_stub4, sgl_hook_stub5, sgl_hook_stub6};
+    sgl_hook_stub4, sgl_hook_stub5, sgl_hook_stub6, sgl_hook_stub7, sgl_hook_stub8, sgl_hook_stub9, sgl_hook_stub10,
+    sgl_hook_stub11};
 
 /* 16 bytes at t become ldr x16, #8; br x16; .quad to (after checking they are want) */
 static bool
@@ -1927,6 +2035,52 @@ sgl_install_fmt_hook(void)
 	sgl_install_hooks();
 }
 
+/*
+ * QuartzCore (dsc-8) GL renderer fix, see vcm_func: tex_fragment_shaders[0x2d]
+ * = "sgl_vcm(s0)", and create_shader's per-function uniform switch (byte
+ * table, index function - 0x11) looks up color_matrix for 0x2d like for
+ * colorMatrix4x4Bias (0x13, case 0) instead of nothing (case 0xde).
+ */
+static const char vcm_expr[] = "sgl_vcm(s0)";
+
+static bool
+sgl_write_const(void *at, const void *val, size_t len, vm_prot_t back)
+{
+	vm_address_t page = (vm_address_t)at & ~(vm_address_t)vm_page_mask;
+	if (vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) !=
+	    KERN_SUCCESS) {
+		return false;
+	}
+	memcpy(at, val, len);
+	vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, back);
+	return true;
+}
+
+static void
+sgl_install_vcm(void)
+{
+	size_t len = 0;
+	const uint8_t *cache = _dyld_get_shared_cache_range(&len);
+	if (cache == NULL) {
+		return;
+	}
+	uint64_t slide = (uint64_t)(uintptr_t)cache - 0x180000000ull;
+	const char **entry = (const char **)(uintptr_t)(0x1d5b44a10ull + 0x2d * 8 + slide);
+	uint8_t *cases = (uint8_t *)(uintptr_t)(0x18855a1e4ull + (0x2d - 0x11) + slide);
+	const char *e13 = *(const char **)(uintptr_t)(0x1d5b44a10ull + 0x13 * 8 + slide);
+	if (*entry != NULL || *cases != 0xde || cases[0x13 - 0x2d] != 0 || e13 == NULL ||
+	    strcmp(e13, "colorMatrix4x4Bias(s0)") != 0) {
+		sweet_drm_log("sweetgl: vcm fix: unexpected QuartzCore (%p %#x), not installed", (void *)*entry, *cases);
+		return;
+	}
+	const char *expr = vcm_expr;
+	uint8_t zero = 0;
+	bool ok = sgl_write_const(entry, &expr, sizeof(expr), VM_PROT_READ) &&
+	    sgl_write_const(cases, &zero, 1, VM_PROT_READ | VM_PROT_EXECUTE);
+	sys_icache_invalidate(cases, 1);
+	sweet_drm_log("sweetgl: vcm fix %s", ok ? "installed" : "FAILED");
+}
+
 /* Called at load. CA picks its GLES renderer by itself once initWithAPI:3 succeeds. */
 void
 sweetgl_eagl_install(void)
@@ -1936,6 +2090,7 @@ sweetgl_eagl_install(void)
 	const char *t = getenv("SWEETGL_TRACE");
 	trace_left = t && t[0] == '1' ? 20000 : 0;
 	dump_shaders = trace_left > 0;
+	sgl_install_vcm();
 	if (trace_left > 0) {
 		sgl_install_fmt_hook();
 	}
