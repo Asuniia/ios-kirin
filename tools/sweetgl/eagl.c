@@ -372,6 +372,7 @@ struct copied {
 static struct copied copies[TEXSZ_MAX];
 static bool copy_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, size_t w, size_t h,
     size_t pitch, const char *why);
+static void set_swizzle(GLenum target, bool argb);
 
 static void
 copy_forget(GLuint tex)
@@ -643,6 +644,7 @@ sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLs
 	TRACE("TexImage2D target %#x unit %d tex %u level %d ifmt %#x %dx%d fmt %#x type %#x row %d", asked,
 	    active_unit(), unit_held[active_unit()], level, internalformat, width, height, format, type, unpack_row());
 	copy_forget(unit_held[active_unit()]);
+	set_swizzle(target, false);
 	if (format == GL_BGRA_EXT && (internalformat == GL_RGBA || internalformat == GL_RGBA8)) {
 		internalformat = GL_BGRA_EXT;
 	}
@@ -778,6 +780,23 @@ surface_format(uint32_t fourcc, size_t bpe, unsigned *internalformat)
 #define FCC_C(c) ((c) >= 0x20 && (c) < 0x7f ? (c) : '.')
 #define FCC(f) FCC_C((f) >> 24), FCC_C(((f) >> 16) & 0xff), FCC_C(((f) >> 8) & 0xff), FCC_C((f) & 0xff)
 
+/* texture swizzle of the bound texture: identity, or A,R,G,B bytes read as RGBA */
+static uint8_t tex_argb[TEXSZ_MAX];
+
+static void
+set_swizzle(GLenum target, bool argb)
+{
+	GLuint tex = unit_held[active_unit()];
+	if (tex >= TEXSZ_MAX || tex_argb[tex] == argb) {
+		return;
+	}
+	tex_argb[tex] = argb;
+	glTexParameteri(target, GL_TEXTURE_SWIZZLE_R, argb ? GL_GREEN : GL_RED);
+	glTexParameteri(target, GL_TEXTURE_SWIZZLE_G, argb ? GL_BLUE : GL_GREEN);
+	glTexParameteri(target, GL_TEXTURE_SWIZZLE_B, argb ? GL_ALPHA : GL_BLUE);
+	glTexParameteri(target, GL_TEXTURE_SWIZZLE_A, argb ? GL_RED : GL_ALPHA);
+}
+
 /* GL upload format/type of a surface CA gave none for (as surface_format) */
 static void
 upload_format(uint32_t fourcc, size_t bpe, GLenum *format, GLenum *type)
@@ -878,6 +897,17 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	if (img.format == PIPE_FORMAT_NONE && !multi) {
 		img.format = surface_format(fourcc, IOSurfaceGetBytesPerElementOfPlane(s, plane), &img.internalformat);
 	}
+	/*
+	 * CA's own 32-bit images without an IOSurface format (attached, no GL
+	 * format) are A,R,G,B in memory and sampled as RGBA by its shaders.
+	 */
+	bool argb = format == 0 && fourcc == 0 && !multi && IOSurfaceGetBytesPerElement(s) == 4;
+	if (argb) {
+		format = GL_RGBA;
+		type = GL_UNSIGNED_BYTE;
+		img.format = gl_format(format, type, &img.internalformat);
+	}
+	set_swizzle(target, argb);
 	if (!multi && pitch % 64 != 0) {
 		if (format == 0) {
 			upload_format(fourcc, IOSurfaceGetBytesPerElement(s), &format, &type);
