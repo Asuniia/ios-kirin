@@ -103,6 +103,7 @@ sweetgl_init(void)
 			} else {
 				fscreen = calloc(1, sizeof(*fscreen));
 				fscreen->screen = screen;
+				sweetgl_image_hooks(fscreen);  /* before any context: st checks them at creation */
 				sweet_drm_log("sweetgl: screen %s (%s)", screen->get_name(screen),
 				    screen->get_vendor(screen));
 			}
@@ -111,6 +112,12 @@ sweetgl_init(void)
 	bool ok = fscreen != NULL;
 	pthread_mutex_unlock(&init_lock);
 	return ok;
+}
+
+struct pipe_screen *
+sweetgl_screen(void)
+{
+	return fscreen ? fscreen->screen : NULL;
 }
 
 struct sweetgl_ctx *
@@ -275,6 +282,7 @@ selftest_thread(void *arg)
 __attribute__((constructor)) static void
 sweetgl_load(void)
 {
+	sweetgl_eagl_install();
 	const char *t = getenv("SWEETGL_TEST");
 	if (t && t[0] == '1') {
 		pthread_t th;

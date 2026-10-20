@@ -465,7 +465,7 @@ sweet_drm_bo_map(int fd, uint64_t offset)
 }
 
 int
-sweet_drm_import_iosurface(uint32_t surface_id, uint32_t *handle, uint64_t *size)
+sweet_drm_import_iosurface(uint32_t surface_id, uint64_t map, uint32_t *handle, uint64_t *size)
 {
 	if (!conn) {
 		return -ENODEV;
@@ -476,7 +476,7 @@ sweet_drm_import_iosurface(uint32_t surface_id, uint32_t *handle, uint64_t *size
 		return -ENOENT;
 	}
 	pthread_mutex_lock(&lock);
-	int ret = sbo_add((uint32_t)out[0], out[1], 0, out[2]);
+	int ret = sbo_add((uint32_t)out[0], out[1], map, out[2]);
 	pthread_mutex_unlock(&lock);
 	if (ret) {
 		IOConnectCallScalarMethod(conn, 11, out, 1, NULL, NULL);

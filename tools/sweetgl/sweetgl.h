@@ -22,4 +22,10 @@ SWEETGL_API void sweetgl_destroy(struct sweetgl_ctx *c);
 /* Offscreen triangle, read back and checked; result in the kernel log. */
 SWEETGL_API bool sweetgl_selftest(void);
 
+/* internal (eagl.c) */
+struct pipe_screen *sweetgl_screen(void);
+struct pipe_frontend_screen;
+void sweetgl_image_hooks(struct pipe_frontend_screen *fscreen);
+void sweetgl_eagl_install(void);
+
 #endif

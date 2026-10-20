@@ -11,7 +11,7 @@ int sweet_drm_open(void);
 void *sweet_drm_bo_map(int fd, uint64_t offset);
 
 /* A GEM handle for an IOSurface's memory: 0 or -errno. */
-int sweet_drm_import_iosurface(uint32_t surface_id, uint32_t *handle, uint64_t *size);
+int sweet_drm_import_iosurface(uint32_t surface_id, uint64_t map, uint32_t *handle, uint64_t *size);
 
 /* printf-style line to the kernel log (writes to /dev/null are teed there). */
 void sweet_drm_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
