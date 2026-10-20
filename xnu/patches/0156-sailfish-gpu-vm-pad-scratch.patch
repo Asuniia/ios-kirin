@@ -1,0 +1,99 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -747,16 +747,19 @@
+  * GPU VA window 8-16 GB: L1[8..15] -> L2 (512 x 2 MB) -> L3 (512 x 4 KB).
+  * L2/L3 tables are 4 KB, carved from 16 KB pages; L3 tables are allocated
+  * on first use of a 2 MB chunk and kept. Mappings are page (16 KB)
+- * granular, first fit from a rover, each followed by one unmapped guard
+- * page (a GPU overrun faults instead of hitting the next buffer): Mesa
+- * makes thousands of small buffers, whole 2 MB chunks ran out at 4096.
+- * g_owner[page] is the mapping index (0 free, VM_GUARD guard).
++ * granular, first fit from a rover, each followed by VM_PAD padding pages
++ * that all map one shared scratch page: texture/vertex fetch reads past
++ * buffer ends, and a fault there hung the A530 even with faults
++ * terminated (0154a/c, 0155a), so overruns land in scratch instead.
++ * Mesa makes thousands of small buffers, whole 2 MB chunks ran out at 4096.
++ * g_owner[page] is the mapping index (0 free, VM_GUARD padding).
+  */
+ #define GVA_BASE        0x200000000ull
+ #define GVA_CHUNKS      4096u                   /* 8 GB / 2 MB */
+ #define GVA_PAGES       ((uint32_t)((8ull << 30) / PAGE_SIZE))
+ #define VM_MAPS         16384u                  /* index 0 unused */
+ #define VM_GUARD        0xffffu
++#define VM_PAD          8u                      /* 128 KB */
+ #define PTE_ATTRS       ((1u << 6) | (2u << 8) | (1u << 10))    /* AP[1], SH outer, AF; AttrIndx 0 */
+ 
+ static LCK_GRP_DECLARE(sweet_gpu_grp, "sweet_gpu");
+@@ -773,6 +776,7 @@
+ static struct vm_mapping *g_maps;
+ static uint16_t *g_owner;
+ static uint32_t g_rover, g_map_rover = 1;
++static uint64_t g_pad_pa[VM_PAD];               /* VM_PAD x the scratch page */
+ 
+ /* A 4 KB table from the current 16 KB pool page; *pa gets its PA. */
+ static uint64_t *
+@@ -807,8 +811,13 @@
+ 	g_smmu = smmu;
+ 	g_maps = kalloc_data(VM_MAPS * sizeof(g_maps[0]), Z_WAITOK | Z_ZERO);
+ 	g_owner = kalloc_data(GVA_PAGES * sizeof(g_owner[0]), Z_WAITOK | Z_ZERO);
+-	if (g_maps == NULL || g_owner == NULL) {
++	vm_offset_t pad_va;
++	uint64_t pad = gpu_page(&pad_va);
++	if (g_maps == NULL || g_owner == NULL || pad == 0) {
+ 		return false;
++	}
++	for (unsigned i = 0; i < VM_PAD; i++) {
++		g_pad_pa[i] = pad;
+ 	}
+ 	for (unsigned gb = 0; gb < 8; gb++) {
+ 		uint64_t pa;
+@@ -899,8 +908,8 @@
+ 		uint32_t i = 1 + (g_map_rover - 1 + k) % (VM_MAPS - 1);
+ 		m = g_maps[i].va == 0 ? i : 0;
+ 	}
+-	int64_t first = m ? vm_find(npages + 1) : -1;
+-	if (first < 0 || !vm_tables((uint32_t)first, npages)) {
++	int64_t first = m ? vm_find(npages + VM_PAD) : -1;
++	if (first < 0 || !vm_tables((uint32_t)first, npages + VM_PAD)) {
+ 		lck_mtx_unlock(&sweet_gpu_vm_lock);
+ 		kfree_data(pages, npages * sizeof(uint64_t));
+ 		return 0;
+@@ -908,12 +917,15 @@
+ 	for (uint32_t p = 0; p < npages; p++) {
+ 		g_owner[first + p] = (uint16_t)m;
+ 	}
+-	g_owner[first + npages] = VM_GUARD;
+-	g_rover = (uint32_t)first + npages + 1;
++	for (uint32_t p = 0; p < VM_PAD; p++) {
++		g_owner[first + npages + p] = VM_GUARD;
++	}
++	g_rover = (uint32_t)first + npages + VM_PAD;
+ 	g_map_rover = m + 1;
+ 	uint64_t va = GVA_BASE + (uint64_t)first * PAGE_SIZE;
+ 	g_maps[m] = (struct vm_mapping){ .va = va, .pa = pages, .npages = npages, .ro = readonly };
+ 	vm_ptes((uint32_t)first, npages, pages, readonly);
++	vm_ptes((uint32_t)first + npages, VM_PAD, g_pad_pa, false);
+ 	smmu_tlb_flush();
+ 	lck_mtx_unlock(&sweet_gpu_vm_lock);
+ 	return va;
+@@ -934,9 +946,9 @@
+ 	}
+ 	uint32_t n = g_maps[m].npages;
+ 	uint64_t *pages = g_maps[m].pa;
+-	vm_ptes(first, n, NULL, false);
++	vm_ptes(first, n + VM_PAD, NULL, false);
+ 	smmu_tlb_flush();
+-	for (uint32_t p = 0; p <= n; p++) {
++	for (uint32_t p = 0; p < n + VM_PAD; p++) {
+ 		g_owner[first + p] = 0;
+ 	}
+ 	g_maps[m] = (struct vm_mapping){ 0 };
+@@ -1562,7 +1574,7 @@
+ 	static uint32_t logged;
+ 	vm_offset_t cb = g_smmu + 0x8000;
+ 	uint32_t fsr = rd(cb, 0x58);
+-	if (fsr == 0) {
++	if ((fsr & ~0x600u) == 0) {     /* bits 9-10: descriptor format only */
+ 		return;
+ 	}
+ 	uint64_t far = ((uint64_t)rd(cb, 0x64) << 32) | rd(cb, 0x60);
