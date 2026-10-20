@@ -54,6 +54,9 @@ struct sgl_image {
 
 __thread void *sgl_current;
 int sgl_check_errors;
+static int trace_left;          /* SWEETGL_TRACE=1: this many trace lines */
+
+#define TRACE(...) do { if (trace_left > 0) { trace_left--; sweet_drm_log("sweetgl: trace " __VA_ARGS__); } } while (0)
 
 /* ponytail: linear table of contexts; backboardd makes one or two */
 #define MAX_CTX 32
@@ -313,6 +316,7 @@ rect_fixup(void)
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
 		glActiveTexture(active);
 		glUniform2f(rect_programs[i].scale, w > 0 ? 1.0f / w : 1.0f, h > 0 ? 1.0f / h : 1.0f);
+		TRACE("rect program %d unit %d texture %dx%d", prog, unit, w, h);
 		return;
 	}
 }
@@ -378,6 +382,8 @@ sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLs
 {
 	SGL_CUR(rctx);
 	target = SGL_TGT(target);
+	TRACE("TexImage2D target %#x level %d ifmt %#x %dx%d fmt %#x type %#x pixels %p", target, level,
+	    internalformat, width, height, format, type, pixels);
 	if (format == GL_BGRA_EXT && (internalformat == GL_RGBA || internalformat == GL_RGBA8)) {
 		internalformat = GL_BGRA_EXT;
 	}
@@ -560,6 +566,15 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	_mesa_EGLImageTargetTexture2DOES(target, (GLeglImageOES)&img);
 	GLenum e = glGetError();
 	pipe_resource_reference(&img.res, NULL);
+	if (trace_left > 0) {
+		const uint8_t *base = IOSurfaceGetBaseAddress(s);
+		const uint8_t *c = base ? base + (h / 2) * pitch + (w / 2) * IOSurfaceGetBytesPerElement(s) : NULL;
+		GLint tex = 0;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+		TRACE("%s surf %u %c%c%c%c %zux%zu pitch %zu fmt %#x/%#x -> pipe %d tex %d, center %02x%02x%02x%02x, err %#x",
+		    why, IOSurfaceGetID(s), fourcc >> 24, (fourcc >> 16) & 0xff, (fourcc >> 8) & 0xff, fourcc & 0xff,
+		    w, h, pitch, format, type, img.format, tex, c ? c[0] : 0, c ? c[1] : 0, c ? c[2] : 0, c ? c[3] : 0, e);
+	}
 	if (e != GL_NO_ERROR && logged++ < 50) {
 		sweet_drm_log("sweetgl: %s: surface %u %zux%zu pitch %zu: EGLImageTargetTexture2D error %#x", why,
 		    IOSurfaceGetID(s), w, h, pitch, e);
@@ -715,6 +730,8 @@ sweetgl_eagl_install(void)
 {
 	const char *e = getenv("SWEETGL_GLERR");
 	sgl_check_errors = e && e[0] == '1';
+	const char *t = getenv("SWEETGL_TRACE");
+	trace_left = t && t[0] == '1' ? 600 : 0;
 	Class cls = objc_getClass("EAGLContext");
 	if (cls == Nil) {
 		sweet_drm_log("sweetgl: no EAGLContext class");
