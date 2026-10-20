@@ -27,7 +27,8 @@ special = {n: 'sgl_' + n[2:] for n in (
     'glDeleteObjectARB', 'glGetObjectParameterivARB', 'glGetInfoLogARB', 'glGetAttachedObjectsARB',
     'glGetHandleARB', 'glDiscardFramebufferEXT', 'glGetShaderPrecisionFormatOES',
     'glReleaseShaderCompilerOES', 'glShaderBinaryOES', 'glGetIntegerIndexedv', 'glTexImage2D',
-    'glFinishObjectAPPLE', 'glTestObjectAPPLE', 'glFlush', 'glGetString', 'glCompileShaderARB', 'glLinkProgramARB')}
+    'glFinishObjectAPPLE', 'glTestObjectAPPLE', 'glFlush', 'glGetString', 'glCompileShaderARB', 'glLinkProgramARB', 'glShaderSourceARB',
+    'glDrawArrays', 'glDrawElements')}
 
 
 def split(param):
@@ -79,7 +80,9 @@ for i in range(n):
     ret, params = protos[name]
     tret, tparams = protos[target]
     sp = [split(p) for p in params]
-    args = ', '.join(conv(v, t, split(tp)[0]) for (t, v), tp in zip(sp, tparams))
+    # rectangle textures are plain 2D ones here (shaders rewritten in eagl.c)
+    args = ', '.join(conv('SGL_TGT(%s)' % v if v in ('target', 'textarget') else v, t, split(tp)[0])
+                     for (t, v), tp in zip(sp, tparams))
     call = '%s(%s)' % (target, args)
     decl = ', '.join(['void *rctx'] + params)
     if ret == 'void':

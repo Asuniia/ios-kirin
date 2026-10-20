@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #define SGL_SLOTS 1036
+#define SGL_TGT(t) ((t) == 0x84F5 /* GL_TEXTURE_RECTANGLE */ ? GL_TEXTURE_2D : (t))
 
 /* rctx of the GLI calls: the shim's context; made current on the calling thread if it is not */
 extern __thread void *sgl_current;
@@ -44,5 +45,9 @@ void sgl_Flush(void *rctx);
 const GLubyte *sgl_GetString(void *rctx, GLenum name);
 void sgl_CompileShaderARB(void *rctx, GLhandleARB shader);
 void sgl_LinkProgramARB(void *rctx, GLhandleARB program);
+void sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GLcharARB **string,
+    const GLint *length);
+void sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count);
+void sgl_DrawElements(void *rctx, GLenum mode, GLsizei count, GLenum type, const void *indices);
 
 #endif

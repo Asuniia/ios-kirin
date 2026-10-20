@@ -98,10 +98,13 @@ sgl_unsupported(int slot, const char *name)
 void
 sgl_post(int slot)
 {
-	static int logged;
+	static unsigned char logged[SGL_SLOTS][8];     /* per slot and error, the first 3 */
 	GLenum e = glGetError();
-	if (e != GL_NO_ERROR && logged < 200) {
-		logged++;
+	unsigned k = e - GL_INVALID_ENUM;
+	if (e != GL_NO_ERROR && (k >= 8 || logged[slot][k] < 3)) {
+		if (k < 8) {
+			logged[slot][k]++;
+		}
 		sweet_drm_log("sweetgl: GL error %#x after slot %d %s", e, slot, sgl_slot_names[slot]);
 	}
 }
@@ -217,6 +220,121 @@ sgl_GetString(void *rctx, GLenum name)
 	return s;
 }
 
+/*
+ * GL_TEXTURE_RECTANGLE (Apple's ES has it, Mesa's ES does not): such
+ * textures are 2D ones (SGL_TGT), and shaders sampling them as
+ * sampler2DRect get texel coordinates scaled by sgl_rect_scale, set before
+ * each draw to 1/size of the texture on that sampler's unit.
+ * ponytail: one rect sampler per shader (CA's), small fixed tables.
+ */
+#define RECT_MAX 64
+static struct { GLuint shader; char sampler[32]; } rect_shaders[RECT_MAX];
+static struct { GLuint program; GLint scale, sampler; } rect_programs[RECT_MAX];
+static int n_rect_shaders, n_rect_programs;
+
+static const char rect_prelude[] =
+    "#define sampler2DRect sampler2D\n"
+    "#define texture2DRect(s, c) texture2D(s, (c) * sgl_rect_scale)\n"
+    "uniform highp vec2 sgl_rect_scale;\n";
+
+void
+sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GLcharARB **string, const GLint *length)
+{
+	SGL_CUR(rctx);
+	size_t n = 0;
+	for (GLsizei i = 0; i < count; i++) {
+		n += length && length[i] >= 0 ? (size_t)length[i] : strlen(string[i]);
+	}
+	char *src = malloc(n + sizeof(rect_prelude) + 1), *p = src;
+	for (GLsizei i = 0; i < count; i++) {
+		size_t l = length && length[i] >= 0 ? (size_t)length[i] : strlen(string[i]);
+		memcpy(p, string[i], l);
+		p += l;
+	}
+	*p = 0;
+	const char *rect = strstr(src, "sampler2DRect");
+	if (rect != NULL && n_rect_shaders < RECT_MAX) {
+		const char *name = rect + strlen("sampler2DRect");
+		while (*name == ' ' || *name == '\t') {
+			name++;
+		}
+		size_t l = strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_");
+		rect_shaders[n_rect_shaders].shader = H(shader);
+		snprintf(rect_shaders[n_rect_shaders].sampler, sizeof(rect_shaders[0].sampler), "%.*s", (int)l, name);
+		n_rect_shaders++;
+		/* after a leading #version line, if any */
+		size_t at = strncmp(src, "#version", 8) == 0 && strchr(src, '\n') ? (size_t)(strchr(src, '\n') - src + 1) : 0;
+		memmove(src + at + sizeof(rect_prelude) - 1, src + at, n - at + 1);
+		memcpy(src + at, rect_prelude, sizeof(rect_prelude) - 1);
+	}
+	const GLchar *one = src;
+	glShaderSource(H(shader), 1, &one, NULL);
+	free(src);
+}
+
+static void
+rect_link(GLuint program)
+{
+	GLuint attached[8];
+	GLsizei na = 0;
+	glGetAttachedShaders(program, 8, &na, attached);
+	for (GLsizei a = 0; a < na; a++) {
+		for (int i = 0; i < n_rect_shaders; i++) {
+			if (rect_shaders[i].shader == attached[a] && n_rect_programs < RECT_MAX) {
+				rect_programs[n_rect_programs].program = program;
+				rect_programs[n_rect_programs].scale = glGetUniformLocation(program, "sgl_rect_scale");
+				rect_programs[n_rect_programs].sampler = glGetUniformLocation(program, rect_shaders[i].sampler);
+				n_rect_programs++;
+				return;
+			}
+		}
+	}
+}
+
+static void
+rect_fixup(void)
+{
+	if (n_rect_programs == 0) {
+		return;
+	}
+	GLint prog = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+	for (int i = 0; i < n_rect_programs; i++) {
+		if (rect_programs[i].program != (GLuint)prog || rect_programs[i].scale < 0) {
+			continue;
+		}
+		GLint unit = 0, active = GL_TEXTURE0, w = 0, h = 0;
+		if (rect_programs[i].sampler >= 0) {
+			glGetUniformiv(prog, rect_programs[i].sampler, &unit);
+		}
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+		glActiveTexture(GL_TEXTURE0 + unit);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+		glActiveTexture(active);
+		glUniform2f(rect_programs[i].scale, w > 0 ? 1.0f / w : 1.0f, h > 0 ? 1.0f / h : 1.0f);
+		return;
+	}
+}
+
+void
+sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count)
+{
+	SGL_CUR(rctx);
+	rect_fixup();
+	glDrawArrays(mode, first, count);
+	SGL_POST(65);
+}
+
+void
+sgl_DrawElements(void *rctx, GLenum mode, GLsizei count, GLenum type, const void *indices)
+{
+	SGL_CUR(rctx);
+	rect_fixup();
+	glDrawElements(mode, count, type, indices);
+	SGL_POST(67);
+}
+
 /* failures logged with the info log and source: CA does not ask for them */
 void
 sgl_CompileShaderARB(void *rctx, GLhandleARB shader)
@@ -243,6 +361,9 @@ sgl_LinkProgramARB(void *rctx, GLhandleARB program)
 	glLinkProgram(H(program));
 	GLint ok = 0;
 	glGetProgramiv(H(program), GL_LINK_STATUS, &ok);
+	if (ok) {
+		rect_link(H(program));
+	}
 	if (!ok) {
 		static char log[1024];
 		glGetProgramInfoLog(H(program), sizeof(log), NULL, log);
@@ -256,6 +377,7 @@ sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLs
     GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels)
 {
 	SGL_CUR(rctx);
+	target = SGL_TGT(target);
 	if (format == GL_BGRA_EXT && (internalformat == GL_RGBA || internalformat == GL_RGBA8)) {
 		internalformat = GL_BGRA_EXT;
 	}
@@ -538,7 +660,7 @@ m_tex_iosurface(id self, SEL cmd, IOSurfaceRef s, NSUInteger target, NSUInteger 
 		    height, format, type, plane, invert);
 	}
 	SGL_CUR(c);
-	return bind_surface(s, (GLenum)target, (GLenum)format, (GLenum)type, plane, "texImageIOSurface");
+	return bind_surface(s, SGL_TGT((GLenum)target), (GLenum)format, (GLenum)type, plane, "texImageIOSurface");
 }
 
 static BOOL
@@ -549,7 +671,7 @@ m_attach(id self, SEL cmd, NSUInteger target, IOSurfaceRef s, BOOL inverted)
 		return ((BOOL(*)(id, SEL, NSUInteger, IOSurfaceRef, BOOL))orig_attach)(self, cmd, target, s, inverted);
 	}
 	SGL_CUR(c);
-	return bind_surface(s, (GLenum)target, 0, 0, 0, "attachImage");
+	return bind_surface(s, SGL_TGT((GLenum)target), 0, 0, 0, "attachImage");
 }
 
 static __thread id current_eagl;
