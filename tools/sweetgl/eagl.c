@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <mach/vm_page_size.h>
 
 #include "eagl.h"
 
@@ -514,6 +515,10 @@ surface_format(uint32_t fourcc, size_t bpe, unsigned *internalformat)
 	}
 }
 
+/* fourcc as 4 printable characters ('.' for the rest) */
+#define FCC_C(c) ((c) >= 0x20 && (c) < 0x7f ? (c) : '.')
+#define FCC(f) FCC_C((f) >> 24), FCC_C(((f) >> 16) & 0xff), FCC_C(((f) >> 8) & 0xff), FCC_C((f) & 0xff)
+
 /* The surface's pages as the storage of the texture bound to target. */
 static bool
 bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t plane, const char *why)
@@ -548,6 +553,8 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 			.type = WINSYS_HANDLE_TYPE_KMS,
 			.handle = handle,
 			.stride = (unsigned)pitch,
+			/* client-memory surfaces start inside their first page (kernel 0157) */
+			.offset = (unsigned)((uintptr_t)IOSurfaceGetBaseAddressOfPlane(s, plane) & vm_page_mask),
 			.format = img.format,
 			.modifier = DRM_FORMAT_MOD_LINEAR,
 		};
@@ -558,8 +565,7 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	if (img.res == NULL) {
 		if (logged++ < 50) {
 			sweet_drm_log("sweetgl: %s: surface %u %c%c%c%c %zux%zu pitch %zu plane %u: %s failed",
-			    why, IOSurfaceGetID(s), fourcc >> 24, (fourcc >> 16) & 0xff, (fourcc >> 8) & 0xff,
-			    fourcc & 0xff, w, h, pitch, plane, step);
+			    why, IOSurfaceGetID(s), FCC(fourcc), w, h, pitch, plane, step);
 		}
 		return false;
 	}
@@ -572,7 +578,7 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 		GLint tex = 0;
 		glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
 		TRACE("%s surf %u %c%c%c%c %zux%zu pitch %zu fmt %#x/%#x -> pipe %d tex %d, center %02x%02x%02x%02x, err %#x",
-		    why, IOSurfaceGetID(s), fourcc >> 24, (fourcc >> 16) & 0xff, (fourcc >> 8) & 0xff, fourcc & 0xff,
+		    why, IOSurfaceGetID(s), FCC(fourcc),
 		    w, h, pitch, format, type, img.format, tex, c ? c[0] : 0, c ? c[1] : 0, c ? c[2] : 0, c ? c[3] : 0, e);
 	}
 	if (e != GL_NO_ERROR && logged++ < 50) {
