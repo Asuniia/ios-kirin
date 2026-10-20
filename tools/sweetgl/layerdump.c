@@ -44,16 +44,17 @@ desc(id o, char *buf, size_t len)
 static int lines;
 
 static void
-walk(id layer, int depth)
+walk(id layer, int depth, bool deep)
 {
-	if (layer == nil || lines > 600) {
+	if (layer == nil || lines > 900) {
 		return;
 	}
 	id cf = call(layer, "compositingFilter"), filters = call(layer, "filters");
 	const char *cls = object_getClassName(layer);
 	id delegate = call(layer, "delegate");
 	const char *view = delegate ? object_getClassName(delegate) : "-";
-	bool interesting = cf != nil || count(filters) > 0 || strstr(cls, "Backdrop") || strstr(cls, "Material") ||
+	deep = deep || strstr(view, "PodBackground") != NULL;
+	bool interesting = deep || cf != nil || count(filters) > 0 || strstr(cls, "Backdrop") || strstr(cls, "Material") ||
 	    strstr(view, "Material") || strstr(view, "RoundButton") || strstr(view, "Pod") || strstr(view, "Visual");
 	if (interesting) {
 		rect_t b = ((rect_t (*)(id, SEL))objc_msgSend)(layer, S("bounds"));
@@ -67,13 +68,31 @@ walk(id layer, int depth)
 		    depth, cls, view, r.x, r.y, r.w, r.h, op, hid, rad, call(layer, "mask") != nil,
 		    call(layer, "contents") != nil, desc((id)bg, b3, sizeof(b3)), desc(cf, b1, sizeof(b1)));
 		for (unsigned long i = 0; i < count(filters) && i < 4; i++) {
-			sweet_drm_log("sweetgl:   filter %lu: %.300s", i, desc(at(filters, i), b2, sizeof(b2)));
+			id f = at(filters, i);
+			sweet_drm_log("sweetgl:   filter %lu: %.300s", i, desc(f, b2, sizeof(b2)));
+			if (deep) {
+				static const char *keys[] = {"inputColorMatrix", "inputAmount", "inputColor", "inputRadius", "enabled"};
+				for (int k = 0; k < 5; k++) {
+					id key = ((id (*)(id, SEL, const char *))objc_msgSend)((id)objc_getClass("NSString"),
+					    S("stringWithUTF8String:"), keys[k]);
+					id v = ((id (*)(id, SEL, id))objc_msgSend)(f, S("valueForKey:"), key);
+					if (v != nil) {
+						sweet_drm_log("sweetgl:     %s = %.300s", keys[k], desc(v, b2, sizeof(b2)));
+					}
+				}
+			}
+		}
+		if (deep) {
+			sweet_drm_log("sweetgl:     contentsFormat %.60s cornerCurve %.40s masksToBounds %d compositingFilter %.100s",
+			    desc(call(layer, "contentsFormat"), b1, sizeof(b1)), desc(call(layer, "cornerCurve"), b2, sizeof(b2)),
+			    ((BOOL (*)(id, SEL))objc_msgSend)(layer, S("masksToBounds")), desc(cf, b3, sizeof(b3)));
 		}
 		lines++;
 	}
+	bool sub_deep = deep || strstr(view, "RoundButton") || strstr(view, "PodBackground");
 	id subs = call(layer, "sublayers");
 	for (unsigned long i = 0; i < count(subs); i++) {
-		walk(at(subs, i), depth + 1);
+		walk(at(subs, i), depth + 1, sub_deep);
 	}
 }
 
@@ -89,7 +108,7 @@ dump(void *ctx)
 	for (unsigned long i = 0; i < count(wins); i++) {
 		id win = at(wins, i);
 		sweet_drm_log("sweetgl: window %s", object_getClassName(win));
-		walk(call(win, "layer"), 0);
+		walk(call(win, "layer"), 0, false);
 	}
 	if (++round < 8) {
 		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, dump);

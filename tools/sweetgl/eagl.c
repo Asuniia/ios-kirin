@@ -1762,6 +1762,137 @@ sgl_fmt_hook(void)
 	    "br x16\n");
 }
 
+/*
+ * Research entry hooks: log calls of QuartzCore renderer functions (first
+ * calls in full, then counts), replaying the 4 overwritten prologue
+ * instructions (position independent stack stores only).
+ */
+#define SGL_HOOKS 7
+static const struct {
+	uint64_t addr;          /* dsc-8, unslid */
+	uint32_t code[4];
+	const char *name;
+} sgl_hook_def[SGL_HOOKS] = {
+	{0x188424e54, {0xd103c3ff, 0x6d072beb, 0x6d0823e9, 0xa9096ffc}, "emit_filter"},
+	{0x188427248, {0x6db923e9, 0xa9016ffc, 0xa90267fa, 0xa9035ff8}, "render_vibrant_color_matrix"},
+	{0x188427018, {0xd102c3ff, 0x6d0533ed, 0x6d062beb, 0x6d0723e9}, "render_vibrant_filter"},
+	{0x1883900d0, {0xa9bc5ff8, 0xa90157f6, 0xa9024ff4, 0xa9037bfd}, "filter_node"},
+	{0x188372f74, {0xd10703ff, 0x6d1523e9, 0xa9166ffc, 0xa91767fa}, "MaskNode::apply"},
+	{0x18834d888, {0x6db63bef, 0x6d0133ed, 0x6d022beb, 0x6d0323e9}, "prepare_filters"},
+	{0x18834f480, {0xd10303ff, 0x6d0623e9, 0xa90767fa, 0xa9085ff8}, "emit_filter_quads_color"},
+};
+uint64_t sgl_hook_cont[SGL_HOOKS];
+void sgl_hook_log(uint64_t id, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t lr);
+
+void
+sgl_hook_log(uint64_t id, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t lr)
+{
+	static unsigned calls[SGL_HOOKS];
+	unsigned c = ++calls[id];
+	if (id == 6) {
+		/* x0 Context*, x1 Surface*: surface rect at +0x20 and the context clip shape */
+		static unsigned shown;
+		const int32_t *r = (const int32_t *)(uintptr_t)(x1 + 0x20);
+		uint64_t clip = *(const uint64_t *)(uintptr_t)(*(const uint64_t *)(uintptr_t)(x0 + 0x100) + 8);
+		if (x1 != 0 && r[2] >= 60 && r[2] <= 700 && r[3] >= 60 && r[3] <= 700 && shown++ < 300) {
+			if (clip & 1 || clip == 0) {
+				sweet_drm_log("sweetgl: quads_color #%u surface %d,%d %dx%d clip %#llx", c, r[0], r[1], r[2], r[3],
+				    (unsigned long long)clip);
+			} else {
+				const int32_t *sh = (const int32_t *)(uintptr_t)clip;
+				sweet_drm_log("sweetgl: quads_color #%u surface %d,%d %dx%d clip type %d [%d %d %d %d %d]", c, r[0],
+				    r[1], r[2], r[3], sh[1], sh[5], sh[6], sh[7], sh[8], sh[9]);
+			}
+		}
+	}
+	if (c <= 12 || (c & (c - 1)) == 0) {
+		sweet_drm_log("sweetgl: hook %s #%u from %#llx x0 %#llx x1 %#llx x2 %#llx x3 %#llx", sgl_hook_def[id].name, c,
+		    (unsigned long long)(lr - sgl_cache_slide), (unsigned long long)x0, (unsigned long long)x1,
+		    (unsigned long long)x2, (unsigned long long)x3);
+	}
+}
+
+#define SGL_HOOK_STUB(n, w0, w1, w2, w3)                                                        \
+	__attribute__((naked)) static void sgl_hook_stub##n(void)                               \
+	{                                                                                       \
+		__asm__ volatile(                                                               \
+		    "stp x29, x30, [sp, #-224]!\n"                                              \
+		    "mov x29, sp\n"                                                             \
+		    "stp x0, x1, [sp, #16]\n"                                                   \
+		    "stp x2, x3, [sp, #32]\n"                                                   \
+		    "stp x4, x5, [sp, #48]\n"                                                   \
+		    "stp x6, x7, [sp, #64]\n"                                                   \
+		    "stp q0, q1, [sp, #80]\n"                                                   \
+		    "stp q2, q3, [sp, #112]\n"                                                  \
+		    "stp q4, q5, [sp, #144]\n"                                                  \
+		    "stp q6, q7, [sp, #176]\n"                                                  \
+		    "str x8, [sp, #208]\n"                                                      \
+		    "mov x5, x30\n"                                                             \
+		    "mov x4, x3\n"                                                              \
+		    "mov x3, x2\n"                                                              \
+		    "mov x2, x1\n"                                                              \
+		    "mov x1, x0\n"                                                              \
+		    "mov x0, #" #n "\n"                                                         \
+		    "bl _sgl_hook_log\n"                                                        \
+		    "ldp x0, x1, [sp, #16]\n"                                                   \
+		    "ldp x2, x3, [sp, #32]\n"                                                   \
+		    "ldp x4, x5, [sp, #48]\n"                                                   \
+		    "ldp x6, x7, [sp, #64]\n"                                                   \
+		    "ldp q0, q1, [sp, #80]\n"                                                   \
+		    "ldp q2, q3, [sp, #112]\n"                                                  \
+		    "ldp q4, q5, [sp, #144]\n"                                                  \
+		    "ldp q6, q7, [sp, #176]\n"                                                  \
+		    "ldr x8, [sp, #208]\n"                                                      \
+		    "ldp x29, x30, [sp], #224\n"                                                \
+		    ".long " #w0 "\n.long " #w1 "\n.long " #w2 "\n.long " #w3 "\n"              \
+		    "adrp x16, _sgl_hook_cont@PAGE\n"                                           \
+		    "add x16, x16, _sgl_hook_cont@PAGEOFF\n"                                    \
+		    "ldr x16, [x16, #" #n " * 8]\n"                                             \
+		    "br x16\n");                                                                \
+	}
+SGL_HOOK_STUB(0, 0xd103c3ff, 0x6d072beb, 0x6d0823e9, 0xa9096ffc)
+SGL_HOOK_STUB(1, 0x6db923e9, 0xa9016ffc, 0xa90267fa, 0xa9035ff8)
+SGL_HOOK_STUB(2, 0xd102c3ff, 0x6d0533ed, 0x6d062beb, 0x6d0723e9)
+SGL_HOOK_STUB(3, 0xa9bc5ff8, 0xa90157f6, 0xa9024ff4, 0xa9037bfd)
+SGL_HOOK_STUB(4, 0xd10703ff, 0x6d1523e9, 0xa9166ffc, 0xa91767fa)
+SGL_HOOK_STUB(5, 0x6db63bef, 0x6d0133ed, 0x6d022beb, 0x6d0323e9)
+SGL_HOOK_STUB(6, 0xd10303ff, 0x6d0623e9, 0xa90767fa, 0xa9085ff8)
+static void (*const sgl_hook_stub[SGL_HOOKS])(void) = {sgl_hook_stub0, sgl_hook_stub1, sgl_hook_stub2, sgl_hook_stub3,
+    sgl_hook_stub4, sgl_hook_stub5, sgl_hook_stub6};
+
+/* 16 bytes at t become ldr x16, #8; br x16; .quad to (after checking they are want) */
+static bool
+sgl_patch(uint32_t *t, const uint32_t want[4], void (*to)(void))
+{
+	if (memcmp(t, want, 16) != 0) {
+		sweet_drm_log("sweetgl: patch: unexpected code at %p (%08x)", (void *)t, t[0]);
+		return false;
+	}
+	vm_address_t page = (vm_address_t)t & ~(vm_address_t)vm_page_mask;
+	if (vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) !=
+	    KERN_SUCCESS) {
+		return false;
+	}
+	uint32_t patch[4] = {0x58000050, 0xd61f0200, 0, 0};
+	uint64_t target = (uint64_t)(uintptr_t)to;
+	memcpy(&patch[2], &target, 8);
+	memcpy(t, patch, sizeof(patch));
+	vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	sys_icache_invalidate(t, sizeof(patch));
+	return true;
+}
+
+static void
+sgl_install_hooks(void)
+{
+	for (int i = 0; i < SGL_HOOKS; i++) {
+		uint32_t *t = (uint32_t *)(uintptr_t)(sgl_hook_def[i].addr + sgl_cache_slide);
+		sgl_hook_cont[i] = (uint64_t)(uintptr_t)t + 16;
+		bool ok = sgl_patch(t, sgl_hook_def[i].code, sgl_hook_stub[i]);
+		sweet_drm_log("sweetgl: hook %s at %p: %s", sgl_hook_def[i].name, (void *)t, ok ? "installed" : "FAILED");
+	}
+}
+
 static void
 sgl_install_fmt_hook(void)
 {
@@ -1793,6 +1924,7 @@ sgl_install_fmt_hook(void)
 	sys_icache_invalidate(t, sizeof(patch));
 	sweet_drm_log("sweetgl: format hook installed at %p (slide %#llx), protect back %d", (void *)t,
 	    (unsigned long long)sgl_cache_slide, kr);
+	sgl_install_hooks();
 }
 
 /* Called at load. CA picks its GLES renderer by itself once initWithAPI:3 succeeds. */
