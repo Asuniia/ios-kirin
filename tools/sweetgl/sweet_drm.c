@@ -48,7 +48,6 @@ static struct sbo *bos;
 static uint32_t nbos;
 static uint32_t chip_id, gmem_size;
 static uint64_t gmem_base, max_freq;
-static volatile const uint32_t *fence_page;
 static uint32_t queues;
 
 /* Lock held. The GPU comes up a while after boot: callers may retry. */
@@ -73,7 +72,6 @@ connect_dev(void)
 	gmem_size = (uint32_t)out[1];
 	gmem_base = out[2];
 	max_freq = out[3];
-	fence_page = (volatile const uint32_t *)(uintptr_t)out[4];
 	dev_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
 }
 
@@ -128,16 +126,11 @@ sbo_add(uint32_t handle, uint64_t iova, uint64_t map, uint64_t size)
 	return 0;
 }
 
-static uint32_t
-fence_done(void)
-{
-	return fence_page ? *fence_page : 0;
-}
-
 static int
 fence_passed(uint32_t seq)
 {
-	return (int32_t)(fence_done() - seq) >= 0;
+	uint64_t in[2] = {seq, 0};
+	return IOConnectCallScalarMethod(conn, 14, in, 2, NULL, NULL) == KERN_SUCCESS;
 }
 
 /* Wait until seq completed, at most ms milliseconds (UINT64_MAX: forever). */
@@ -155,7 +148,7 @@ fence_wait(uint32_t seq, uint64_t ms)
 			return 0;
 		}
 		if (kr != kIOReturnTimeout) {
-			sweet_drm_log("sweetgl: wait for %u failed: %x (fence %u)", seq, kr, fence_done());
+			sweet_drm_log("sweetgl: wait for %u failed: %x", seq, kr);
 			return -EIO;
 		}
 		if (ms != UINT64_MAX) {
@@ -288,13 +281,18 @@ cpu_prep(struct drm_msm_gem_cpu_prep *r)
 	if (!b) {
 		return -ENOENT;
 	}
-	if (!used || fence_passed(seq)) {
-		return 0;
+	if (used && !fence_passed(seq)) {
+		if (r->op & MSM_PREP_NOSYNC) {
+			return -EBUSY;
+		}
+		int e = fence_wait(seq, timeout_ms(&r->timeout));
+		if (e) {
+			return e;
+		}
 	}
-	if (r->op & MSM_PREP_NOSYNC) {
-		return -EBUSY;
-	}
-	return fence_wait(seq, timeout_ms(&r->timeout));
+	/* the bo is CPU-cached: drop stale lines over what the GPU wrote */
+	uint64_t in = r->handle;
+	return !used || IOConnectCallScalarMethod(conn, 16, &in, 1, NULL, NULL) == KERN_SUCCESS ? 0 : -EIO;
 }
 
 static int

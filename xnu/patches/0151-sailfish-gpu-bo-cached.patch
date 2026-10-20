@@ -1,0 +1,146 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -17,19 +17,19 @@
+  * Buffer objects and command streams, for a user-space driver (Mesa
+  * freedreno through tools/sweetgl's msm emulation):
+  *   10 bo new           in: size              out: handle, GPU VA, address
+- *                       (zeroed wired memory, write-combined in the
+- *                       caller, uncached for the GPU)
++ *                       (zeroed wired memory, cached in the caller,
++ *                       uncached for the GPU)
+  *   11 bo free          in: handle (waits for the last submit using it)
+  *   12 bo import        in: IOSurface id      out: handle, GPU VA, size
+- *                       (the surface's pages; CPU cache cleaned and
+- *                       invalidated around every submit that lists it)
++ *                       (the surface's pages)
+  *   13 submit           struct in: struct sweet_gpu_submit + ibs[nr_ibs] +
+  *                       u32 handles[nr_bos] (every bo the IBs touch)
+  *                       out: sequence number
+- *   14 wait             in: sequence number, timeout ms
+- *   15 info             out: chip id, GMEM size, GMEM base, max Hz, address
+- *                       of the read-only fence page (u32 last completed
+- *                       sequence number at +0)
++ *   14 wait             in: sequence number, timeout ms (0: poll)
++ *   15 info             out: chip id, GMEM size, GMEM base, max Hz, 0
++ *   16 bo cpu prep      in: handle (after its last submit completed: drops
++ *                       the CPU's cached lines, so the CPU sees GPU writes)
++ * The CPU cache is cleaned and invalidated over every bo a submit lists.
+  * The GPU executes these streams as they are, with access to every GPU VA
+  * mapping (one address space): a client can read and write other clients'
+  * GPU memory. Acceptable on this single-user bring-up device only.
+@@ -103,7 +103,7 @@
+ 	IOMemoryDescriptor *md;         /* own buffer or a surface's memory; wired */
+ 	IOMemoryMap *umap;              /* own buffers: the client's mapping */
+ 	SweetSurface *surface;          /* imports */
+-	uint64_t *pa;                   /* imports: pages, for cache maintenance */
++	uint64_t *pa;                   /* pages, for cache maintenance */
+ 	uint32_t npages;
+ 	uint32_t last_seq;              /* last submit listing it */
+ 	bool used;                      /* listed in a submit at least once */
+@@ -118,7 +118,6 @@
+ 	struct sweet_gpu_bo *fBos;
+ 	uint32_t fBoCap;
+ 	uint64_t fBoBytes;
+-	IOMemoryMap *fFenceMap;
+ 
+ 	IOReturn mapDescriptor(IOMemoryDescriptor *md, uint64_t offset, uint64_t len,
+ 	    SweetSurface *surface, bool readonly, uint64_t *gvaOut);
+@@ -173,7 +172,6 @@
+ 		IOFreeData(fBos, fBoCap * sizeof(fBos[0]));
+ 		fBos = NULL;
+ 	}
+-	OSSafeReleaseNULL(fFenceMap);
+ 	IOUserClient::free();
+ }
+ 
+@@ -320,9 +318,9 @@
+ 	}
+ 	sweet_gpu_vm_unmap(b->iova);
+ 	OSSafeReleaseNULL(b->umap);
++	IOFreeData(b->pa, b->npages * sizeof(uint64_t));
+ 	if (b->surface != NULL) {
+ 		b->md->complete();
+-		IOFreeData(b->pa, b->npages * sizeof(uint64_t));
+ 		b->surface->release();
+ 	} else {
+ 		fBoBytes -= b->size;
+@@ -362,18 +360,23 @@
+ 		}
+ 	}
+ 	uint64_t gva = ok ? sweet_gpu_vm_map(pa, npages, false) : 0;
+-	if (pa != NULL) {
+-		IOFreeData(pa, npages * sizeof(uint64_t));
+-	}
+-	IOMemoryMap *umap = gva ? md->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : NULL;
++	/*
++	 * Cached in the caller like everywhere else: a write-combined user
++	 * mapping of managed pages makes the pmap rewrite their physmap PTEs
++	 * (froze boot 0150a). Cache maintenance at submit and cpu prep instead.
++	 */
++	IOMemoryMap *umap = gva ? md->createMappingInTask(fTask, 0, kIOMapAnywhere) : NULL;
+ 	if (umap == NULL) {
+ 		if (gva) {
+ 			sweet_gpu_vm_unmap(gva);
++		}
++		if (pa != NULL) {
++			IOFreeData(pa, npages * sizeof(uint64_t));
+ 		}
+ 		md->release();
+ 		return kIOReturnNoMemory;
+ 	}
+-	*b = (struct sweet_gpu_bo){ .iova = gva, .size = size, .md = md, .umap = umap };
++	*b = (struct sweet_gpu_bo){ .iova = gva, .size = size, .md = md, .umap = umap, .pa = pa, .npages = npages };
+ 	fBoBytes += size;
+ 	out[0] = handle;
+ 	out[1] = gva;
+@@ -443,11 +446,10 @@
+ 		if (b == NULL) {
+ 			return kIOReturnBadArgument;
+ 		}
+-		if (b->surface != NULL) {
+-			/* CPU-cached surface: its CPU writes to memory, no stale lines over GPU writes */
+-			for (uint32_t p = 0; p < b->npages; p++) {
+-				flush_dcache64((addr64_t)b->pa[p], PAGE_SIZE, TRUE);
+-			}
++		/* CPU-cached: its CPU writes to memory, no stale lines over GPU writes */
++		/* ponytail: whole bo every submit; track CPU-dirty bos if this shows in profiles */
++		for (uint32_t p = 0; p < b->npages; p++) {
++			flush_dcache64((addr64_t)b->pa[p], PAGE_SIZE, TRUE);
+ 		}
+ 	}
+ 	uint32_t seq = 0;
+@@ -531,23 +533,25 @@
+ 		if (args->scalarOutputCount >= 5) {
+ 			struct sweet_gpu_info info;
+ 			sweet_gpu_get_info(&info);
+-			if (fFenceMap == NULL && gFencePage != NULL) {
+-				fFenceMap = gFencePage->createMappingInTask(fTask, 0,
+-				    kIOMapAnywhere | kIOMapReadOnly | kIOMapWriteCombineCache);
+-			}
+-			if (fFenceMap == NULL) {
+-				ret = kIOReturnNoMemory;
+-				break;
+-			}
+ 			args->scalarOutput[0] = info.chip_id;
+ 			args->scalarOutput[1] = info.gmem_size;
+ 			args->scalarOutput[2] = info.gmem_base;
+ 			args->scalarOutput[3] = info.max_freq;
+-			args->scalarOutput[4] = fFenceMap->getAddress();
++			args->scalarOutput[4] = 0;      /* fence page no longer mapped: poll with 14 */
+ 			args->scalarOutputCount = 5;
+ 			ret = kIOReturnSuccess;
+ 		}
+ 		break;
++	case 16:                /* bo cpu prep */
++		if (args->scalarInputCount == 1) {
++			struct sweet_gpu_bo *b = bo(args->scalarInput[0]);
++			ret = b == NULL ? kIOReturnNotFound :
++			    b->used && sweet_gpu_wait(b->last_seq, 0) != 0 ? kIOReturnBusy : kIOReturnSuccess;
++			for (uint32_t p = 0; ret == kIOReturnSuccess && p < b->npages; p++) {
++				flush_dcache64((addr64_t)b->pa[p], PAGE_SIZE, TRUE);
++			}
++		}
++		break;
+ 
+ 	case 0:                 /* map user memory */
+ 		if ((args->scalarInputCount == 2 || args->scalarInputCount == 3) && args->scalarOutputCount >= 1) {
