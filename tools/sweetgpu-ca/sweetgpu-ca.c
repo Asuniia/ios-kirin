@@ -206,12 +206,40 @@ static const struct {
 	{0x188451f74ull, SWEET_GPU_FMT_RGBA8, SWIZ(2, 1, 0, 3), false, "RGBA8"},       /* bytes R G B A */
 	{0x1884547f4ull, SWEET_GPU_FMT_RGBA8, SWIZ(1, 2, 3, 0), false, "ABGR8"},       /* bytes A B G R */
 	{0x188450950ull, SWEET_GPU_FMT_R8, SWIZ(0, 0, 0, 0), true, "A8"},
-	{0x188456640ull, SWEET_GPU_FMT_RG8, SWIZ(0, 0, 0, 1), false, "LA8"},           /* L L L A */
 };
 
-static bool
-plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
+/*
+ * The 3 or 4 vertices in convex order around their centroid (12-float
+ * stride kept): some quads come in strip order (TL TR BL BR), which made
+ * the edges a bow-tie that covered nothing (0149a).
+ */
+static void
+hull_order(const float *f, uint32_t n, float *out)
 {
+	float cx = 0, cy = 0, ang[4];
+	uint32_t idx[4];
+	for (uint32_t i = 0; i < n; i++) {
+		cx += f[i * 12] / n, cy += f[i * 12 + 1] / n;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		ang[i] = atan2f(f[i * 12 + 1] - cy, f[i * 12] - cx);
+		idx[i] = i;
+	}
+	for (uint32_t i = 1; i < n; i++) {
+		for (uint32_t k = i; k > 0 && ang[idx[k]] < ang[idx[k - 1]]; k--) {
+			uint32_t t = idx[k];
+			idx[k] = idx[k - 1], idx[k - 1] = t;
+		}
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		memcpy(out + i * 12, f + idx[i] * 12, 12 * sizeof(float));
+	}
+}
+
+static bool
+plan(struct plan *pl, const float *fin, uint32_t n, const uint8_t *r)
+{
+	float f[4 * 12];
 	const uint8_t *ctx = *(const uint8_t *const *)r;
 	const uint8_t *state = *(const uint8_t *const *)(ctx + 0x10);
 	const uint8_t *tex = r + 8;
@@ -222,6 +250,7 @@ plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
 	    (fn != 1 && fn != 3) || n < 3 || n > 4) {
 		return skip(13);
 	}
+	hull_order(fin, n, f);
 	const uint64_t *table = *(const uint64_t *const *)(tex + 0x30);
 	int fi = -1;
 	for (int i = 0; table != NULL && i < (int)(sizeof(formats) / sizeof(formats[0])); i++) {
@@ -343,15 +372,51 @@ plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
 }
 
 /*
- * Offload pays only where the CPU is slow: plain identity copies / source-overs
- * of ARGB8 or XRGB8 images take the CPU ~1.3 ms/Mpx, the GPU ~2.5 (0142a).
+ * Offload where it pays. GPU path cost ~0.6 ms + 4.3 ms/Mpx (0149a: map +
+ * quad + unmap); the CPU's cost per pixel is measured per kind of draw
+ * (plan key) whenever the CPU draws one, and offloaded kinds go back to the
+ * CPU every 64th draw to keep that current. Unknown kinds: CPU first.
  */
+#define NCOST 256
+static struct {
+	uint32_t key, n;
+	float cpu_ns_px;                /* EMA */
+} cost[NCOST];
+
+static uint32_t
+cost_slot(uint32_t key)
+{
+	uint32_t h = (key * 2654435761u) >> 24;
+	for (uint32_t i = 0; i < NCOST; i++, h = (h + 1) % NCOST) {
+		if (cost[h].key == key || cost[h].n == 0) {
+			cost[h].key = key;
+			return h;
+		}
+	}
+	return NCOST;
+}
+
 static bool
 gpu_wins(const struct plan *pl)
 {
-	uint32_t fn = pl->key & 0xff, fi = (pl->key >> 16) & 7, blend = (pl->key >> 21) & 0xff;
-	bool ident = (pl->key >> 19) & 1, nearest = pl->flags & SWEET_GPU_QUAD_NEAREST;
-	return !(fn == 1 && ident && nearest && fi <= 1 && (blend == 1 || blend == 3) && pl->nedges == 0);
+	uint32_t c = cost_slot(pl->key);
+	if (c == NCOST || cost[c].n == 0 || ++cost[c].n % 64 == 0) {
+		return false;
+	}
+	float px = (float)(pl->X1 - pl->X0) * (pl->Y1 - pl->Y0);
+	return cost[c].cpu_ns_px * px > 1.1f * (600000.0f + 4.3f * px);
+}
+
+static void
+cost_cpu(const struct plan *pl, uint64_t abs)
+{
+	uint32_t c = cost_slot(pl->key);
+	if (c == NCOST) {
+		return;
+	}
+	float ns = (float)(ms(abs) * 1e6), px = (float)(pl->X1 - pl->X0) * (pl->Y1 - pl->Y0);
+	cost[c].cpu_ns_px = cost[c].n ? 0.75f * cost[c].cpu_ns_px + 0.25f * ns / px : ns / px;
+	cost[c].n += cost[c].n == 0;
 }
 
 static uint64_t
@@ -564,9 +629,10 @@ dp_hook(void *v, uint32_t n, const void *rs)
 {
 	struct vjob j;
 	bool gpu = atomic_load_explicit(&g_gpu_ok, memory_order_relaxed) && plan(&j.pl, v, n, rs);
+	bool planned = gpu;
 	if (gpu && !gpu_wins(&j.pl)) {
 		gpu = false;
-		skip(12);               /* the CPU is faster for this one */
+		skip(12);               /* the CPU is faster for this one (or measuring it) */
 	}
 	int why = gpu ? 0 : g_why;
 	bool vj = gpu && !g_offload && verify_prepare(&j);
@@ -575,6 +641,9 @@ dp_hook(void *v, uint32_t n, const void *rs)
 		sweetgpu_dp_tramp(v, n, rs);
 	}
 	uint64_t dt = mach_absolute_time() - t0;
+	if (planned && !(gpu && g_offload)) {
+		cost_cpu(&j.pl, dt);    /* the CPU drew a GPU-capable draw */
+	}
 	if (vj) {
 		verify_run(&j, dt);
 	}
