@@ -63,11 +63,13 @@ static bool dump_shaders;       /* SWEETGL_TRACE=1: every shader source, no limi
 
 /*
  * SWEETGL_TRACE: draws are traced in windows, every draw of one (state,
- * result and thumbnail), WIN_DRAWS draws every WIN_SECS from WIN_START.
+ * uniforms, the scissor box before and after): WIN_DRAWS draws from a draw
+ * into a WIN_TRIGGER-sized viewport (CC toggle circles, App Library pods),
+ * then none for WIN_SECS.
  */
-#define WIN_START 60
-#define WIN_SECS 20
+#define WIN_SECS 30
 #define WIN_DRAWS 500
+#define WIN_TRIGGER(w, h) (((w) == 108 && (h) == 109) || ((w) == 296 && (h) == 296))
 static int win_left;
 static time_t win_next;
 #define WTRACE(...) do { if (win_left > 0) TRACE(__VA_ARGS__); } while (0)
@@ -516,22 +518,24 @@ static bool
 window_draw(void)
 {
 	struct timespec t;
+	GLint vp[4] = {0};
 	if (trace_left <= 0) {
 		return false;
 	}
 	if (win_left > 0 && --win_left > 0) {
 		return true;
 	}
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	if (win_next == 0) {
-		win_next = t.tv_sec + WIN_START;
+	glGetIntegerv(GL_VIEWPORT, vp);
+	if (!WIN_TRIGGER(vp[2], vp[3])) {
+		return false;
 	}
+	clock_gettime(CLOCK_MONOTONIC, &t);
 	if (t.tv_sec < win_next) {
 		return false;
 	}
 	win_next = t.tv_sec + WIN_SECS;
 	win_left = WIN_DRAWS;
-	TRACE("window at %lds: next %d draws", (long)t.tv_sec, WIN_DRAWS);
+	TRACE("window at %lds (%dx%d draw): next %d draws", (long)t.tv_sec, vp[2], vp[3], WIN_DRAWS);
 	return true;
 }
 
@@ -610,7 +614,8 @@ trace_region(const char *when)
 		GLint y1 = sc[1] + sc[3] < vp[1] + vp[3] ? sc[1] + sc[3] : vp[1] + vp[3];
 		r[0] = x0, r[1] = y0, r[2] = x1 - x0, r[3] = y1 - y0;
 	}
-	if (r[2] <= 0 || r[3] <= 0) {
+	if (r[2] <= 0 || r[3] <= 0 || (size_t)r[2] * (size_t)r[3] > 250000) {
+		TRACE("  %s %d,%d %dx%d", when, r[0], r[1], r[2], r[3]);
 		return;
 	}
 	size_t w = (size_t)r[2], h = (size_t)r[3];
@@ -651,33 +656,8 @@ trace_region(const char *when)
 static void
 trace_draw_result(GLint prog)
 {
-	GLint vp[4] = {0}, fb = 0;
-	glGetIntegerv(GL_VIEWPORT, vp);
-	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
-	size_t n = (size_t)vp[2] * (size_t)vp[3];
-	uint8_t *px = n ? malloc(n * 4) : NULL;
-	if (px == NULL) {
-		return;
-	}
+	(void)prog;
 	trace_region("after");
-	glReadPixels(vp[0], vp[1], vp[2], vp[3], GL_RGBA, GL_UNSIGNED_BYTE, px);
-	GLenum e = glGetError();
-	size_t lit = 0, first = n;
-	uint8_t mx[4] = {0};
-	for (size_t i = 0; i < n; i++) {
-		if (px[i * 4 + 3] != 0) {
-			lit++;
-			first = first < n ? first : i;
-		}
-		for (int c = 0; c < 4; c++) {
-			mx[c] = px[i * 4 + c] > mx[c] ? px[i * 4 + c] : mx[c];
-		}
-	}
-	const uint8_t *f = first < n ? px + first * 4 : mx;
-	TRACE("  -> prog %d fb %d: %zu of %zu pixels with alpha, max %02x%02x%02x%02x, first lit %02x%02x%02x%02x at %zu,%zu "
-	    "(err %#x)", prog, fb, lit, n, mx[0], mx[1], mx[2], mx[3], f[0], f[1], f[2], f[3],
-	    first < n ? first % (size_t)vp[2] : 0, first < n ? first / (size_t)vp[2] : 0, e);
-	free(px);
 }
 
 /* before a draw: each unit holds what the program samples there, rect scale set */
