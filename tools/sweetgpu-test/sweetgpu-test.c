@@ -37,7 +37,9 @@ say(const char *fmt, ...)
 	va_start(ap, fmt);
 	int n = vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
+#ifndef SWEETGPU_LIB
 	fputs(buf, stdout);
+#endif
 	if (g_null >= 0 && n > 0) {
 		write(g_null, buf, (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
 	}

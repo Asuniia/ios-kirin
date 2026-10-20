@@ -10,3 +10,4 @@ xnu/out-*/
 __pycache__/
 logs/
 tools/sweetgpu-test/out/
+tools/sweetgpu-ca/out/
