@@ -292,12 +292,17 @@ selftest_thread(void *arg)
 }
 
 void sweetgl_layerdump_start(void);
+void sweetgl_vibrant_fill_install(void);
 
 __attribute__((constructor)) static void
 sweetgl_load(void)
 {
 	if (strcmp(getprogname(), "SpringBoard") == 0) {
-		sweetgl_layerdump_start();
+		sweetgl_vibrant_fill_install();
+		const char *d = getenv("SWEETGL_LAYERDUMP");
+		if (d && d[0] == '1') {
+			sweetgl_layerdump_start();
+		}
 		return;
 	}
 	sweetgl_eagl_install();

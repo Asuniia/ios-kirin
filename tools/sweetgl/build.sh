@@ -47,7 +47,7 @@ printf '_sweetgl_init\n_sweetgl_create\n_sweetgl_make_current\n_sweetgl_destroy\
 xcrun -sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=16.0 -dynamiclib -dead_strip \
 	-install_name /usr/lib/sweetgl.dylib -exported_symbols_list "$O/exports.txt" \
 	-o "$O/sweetgl.dylib" "$O/sweetgl.o" "$O/sweet_drm.o" "$O/eagl.o" "$O/layerdump.o" "$O/dispatch.o" $(for l in $LIBS; do echo "$B/$l"; done) \
-	-framework IOKit -framework CoreFoundation -framework IOSurface -framework OpenGLES -lobjc -lc++ -lz
+	-framework IOKit -framework CoreFoundation -framework IOSurface -framework OpenGLES -framework CoreGraphics -lobjc -lc++ -lz
 codesign -f -s - "$O/sweetgl.dylib"
 SIZE=$(stat -f %z "$O/sweetgl.dylib")
 [ "$SIZE" -le 67108864 ] || { echo "sweetgl.dylib is $SIZE bytes, over 64 MiB"; exit 1; }
