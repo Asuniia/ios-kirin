@@ -65,9 +65,9 @@ static bool dump_shaders;       /* SWEETGL_TRACE=1: every shader source, no limi
  * SWEETGL_TRACE: draws are traced in windows, every draw of one (state,
  * result and thumbnail), WIN_DRAWS draws every WIN_SECS from WIN_START.
  */
-#define WIN_START 40
-#define WIN_SECS 15
-#define WIN_DRAWS 250
+#define WIN_START 60
+#define WIN_SECS 20
+#define WIN_DRAWS 500
 static int win_left;
 static time_t win_next;
 #define WTRACE(...) do { if (win_left > 0) TRACE(__VA_ARGS__); } while (0)
@@ -552,8 +552,14 @@ trace_draw_state(GLint prog, GLenum mode, GLsizei count)
 	GLint vp[4] = {0}, sc[4] = {0};
 	glGetIntegerv(GL_VIEWPORT, vp);
 	glGetIntegerv(GL_SCISSOR_BOX, sc);
-	TRACE("draw prog %d tex %u %u %u mode %#x n %d fb %d vp %d,%d %dx%d blend %d %#x/%#x %#x/%#x scissor %d %d,%d %dx%d "
-	    "mask %d%d%d%d", prog, unit_held[0], unit_held[1], unit_held[2], mode, count, v[11], vp[0], vp[1], vp[2], vp[3],
+	char samp[64] = "";
+	for (int u = 0, k = 0; u < 15 && prog < PROG_MAX && k < 56; u++) {
+		if (prog_units[prog] & 1u << u) {
+			k += snprintf(samp + k, sizeof(samp) - (size_t)k, " u%d=%u", u, unit_held[u]);
+		}
+	}
+	TRACE("draw prog %d samples%s tex %u %u %u mode %#x n %d fb %d vp %d,%d %dx%d blend %d %#x/%#x %#x/%#x scissor %d %d,%d %dx%d "
+	    "mask %d%d%d%d", prog, samp, unit_held[0], unit_held[1], unit_held[2], mode, count, v[11], vp[0], vp[1], vp[2], vp[3],
 	    v[0], v[1], v[2], v[3], v[4], v[10], sc[0], sc[1], sc[2], sc[3], m[0], m[1], m[2], m[3]);
 	char line[400];
 	size_t len = 0;
@@ -667,28 +673,7 @@ trace_draw_result(GLint prog)
 			mx[c] = px[i * 4 + c] > mx[c] ? px[i * 4 + c] : mx[c];
 		}
 	}
-	/* 32x8 cells, bottom row last: ' ' no alpha, else the cell's mean luma 0-9 */
-	char thumb[8 * 33 + 1];
-	for (int cy = 0; cy < 8; cy++) {
-		for (int cx = 0; cx < 32; cx++) {
-			size_t x0 = (size_t)vp[2] * cx / 32, x1 = (size_t)vp[2] * (cx + 1) / 32;
-			size_t y0 = (size_t)vp[3] * (7 - cy) / 8, y1 = (size_t)vp[3] * (8 - cy) / 8;
-			uint64_t a = 0, l = 0, cnt = 0;
-			for (size_t y = y0; y < y1; y++) {
-				for (size_t x = x0; x < x1; x++) {
-					const uint8_t *q = px + (y * (size_t)vp[2] + x) * 4;
-					a += q[3];
-					l += (q[0] * 54u + q[1] * 183u + q[2] * 19u) >> 8;
-					cnt++;
-				}
-			}
-			thumb[cy * 33 + cx] = cnt == 0 || a == 0 ? ' ' : (char)('0' + l * 9 / (cnt * 255));
-		}
-		thumb[cy * 33 + 32] = '/';
-	}
-	thumb[8 * 33 - 1] = 0;
 	const uint8_t *f = first < n ? px + first * 4 : mx;
-	TRACE("  |%s|", thumb);
 	TRACE("  -> prog %d fb %d: %zu of %zu pixels with alpha, max %02x%02x%02x%02x, first lit %02x%02x%02x%02x at %zu,%zu "
 	    "(err %#x)", prog, fb, lit, n, mx[0], mx[1], mx[2], mx[3], f[0], f[1], f[2], f[3],
 	    first < n ? first % (size_t)vp[2] : 0, first < n ? first / (size_t)vp[2] : 0, e);
