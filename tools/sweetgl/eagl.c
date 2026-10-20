@@ -378,7 +378,49 @@ static const char cm4_func[] =
     "  return vec4(min(u.rgb, u.a), u.a);\n"
     "}\n";
 
-/* the sgl_ texture functions src calls (and color_matrix if undeclared) before main (src is freed) */
+/*
+ * 0x26/0x27 (Context::variable_masked_blur_surface, CAFilter variableBlur):
+ * CA copies the source into a surface S, renders a mip chain of S with
+ * 0x26 passes and blurs by sampling S's mips per the mask in 0x27. GLES
+ * surfaces have one level (set_surface attaches level 0), so each 0x26
+ * pass would draw a half-size copy into S itself: they draw nothing here
+ * (sgl_nop). 0x27 blurs S in one pass instead: a 24-tap golden-angle disc,
+ * Gaussian weighted, radius = mask alpha (1 - alpha if minmax_dir.y, the
+ * BlurParams 0x10 flag) times minmax_dir.x (BlurParams radius * 2.6, in
+ * pixels) / 2, tap spacing from the texcoord derivatives (S is about
+ * destination sized). ponytail: one pass, cost grows with radius only via
+ * texture cache misses; a downsampled pre-pass if large blurs get slow.
+ */
+static const char nop_func[] =
+    "lowp vec4 sgl_nop() {\n"
+    "  discard;\n"
+    "  return vec4(0.);\n"
+    "}\n";
+static const char vblur_func[] =
+    "uniform highp vec4 minmax_dir;\n"
+    "lowp vec4 sgl_vblur(lowp vec4 m) {\n"
+    "  highp vec2 tc = texcoord0_0;\n"
+    "  highp vec2 px = vec2(length(vec2(dFdx(tc.x), dFdy(tc.x))), length(vec2(dFdx(tc.y), dFdy(tc.y))));\n"
+    "  mediump float r = (minmax_dir.y > .5 ? 1. - m.a : m.a) * minmax_dir.x * .5;\n"
+    "  mediump vec4 acc = texture2D(texture0, tc);\n"
+    "  if (r < .5) {\n"
+    "    return acc;\n"
+    "  }\n"
+    "  mediump float wsum = 1.;\n"
+    "  for (int i = 1; i <= 24; i++) {\n"
+    "    mediump float f = float(i) / 24.;\n"
+    "    mediump float ang = float(i) * 2.3999632;\n"
+    "    mediump float w = exp(-2. * f);\n"
+    "    acc += w * texture2D(texture0, tc + vec2(cos(ang), sin(ang)) * (sqrt(f) * r) * px);\n"
+    "    wsum += w;\n"
+    "  }\n"
+    "  return acc / wsum;\n"
+    "}\n";
+
+/*
+ * The sgl_ texture functions src calls (and color_matrix if undeclared)
+ * before main, extension directives after the leading ones (src is freed).
+ */
 static char *
 texfn_rewrite(char *src)
 {
@@ -386,17 +428,33 @@ texfn_rewrite(char *src)
 	if (at == NULL) {
 		return src;
 	}
-	const char *parts[3] = {
-	    strstr(src, " color_matrix[5];") ? "" : "uniform lowp vec4 color_matrix[5];\n",
-	    strstr(src, "sgl_vcm(") ? vcm_func : "", strstr(src, "sgl_cm4(") ? cm4_func : ""};
-	size_t n = strlen(src), pre = (size_t)(at - src), add = 0;
-	for (int i = 0; i < 3; i++) {
+	bool cm = strstr(src, "sgl_vcm(") || strstr(src, "sgl_cm4(");
+	const char *ext = strstr(src, "sgl_vblur(") ? "#extension GL_OES_standard_derivatives : enable\n" : "";
+	const char *parts[5] = {
+	    cm && !strstr(src, " color_matrix[5];") ? "uniform lowp vec4 color_matrix[5];\n" : "",
+	    strstr(src, "sgl_vcm(") ? vcm_func : "", strstr(src, "sgl_cm4(") ? cm4_func : "",
+	    strstr(src, "sgl_nop(") ? nop_func : "", strstr(src, "sgl_vblur(") ? vblur_func : ""};
+	/* after the leading preprocessor lines */
+	size_t top = 0;
+	while (src[top] == '#' || src[top] == ' ' || src[top] == '\n') {
+		char *nl = strchr(src + top, '\n');
+		if (nl == NULL) {
+			break;
+		}
+		top = (size_t)(nl - src + 1);
+	}
+	size_t n = strlen(src), pre = (size_t)(at - src), add = strlen(ext);
+	for (int i = 0; i < 5; i++) {
 		add += strlen(parts[i]);
 	}
 	char *out = malloc(n + add + 1), *o = out;
-	memcpy(o, src, pre);
-	o += pre;
-	for (int i = 0; i < 3; i++) {
+	memcpy(o, src, top);
+	o += top;
+	memcpy(o, ext, strlen(ext));
+	o += strlen(ext);
+	memcpy(o, src + top, pre - top);
+	o += pre - top;
+	for (int i = 0; i < 5; i++) {
 		memcpy(o, parts[i], strlen(parts[i]));
 		o += strlen(parts[i]);
 	}
@@ -454,7 +512,8 @@ sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GLcharA
 		memmove(src + at + sizeof(rect_prelude) - 1, src + at, n - at + 1);
 		memcpy(src + at, rect_prelude, sizeof(rect_prelude) - 1);
 	}
-	if (strstr(src, "sgl_vcm(") != NULL || strstr(src, "sgl_cm4(") != NULL) {
+	if (strstr(src, "sgl_vcm(") != NULL || strstr(src, "sgl_cm4(") != NULL || strstr(src, "sgl_nop(") != NULL ||
+	    strstr(src, "sgl_vblur(") != NULL) {
 		src = texfn_rewrite(src);
 	}
 	if (strstr(src, "GL_EXT_shader_framebuffer_fetch") != NULL || strstr(src, "gl_LastFragData") != NULL) {
@@ -2054,16 +2113,18 @@ sgl_install_fmt_hook(void)
 }
 
 /*
- * QuartzCore (dsc-8) GL renderer fixes, see vcm_func: tex_fragment_shaders
- * (0x1d5b44a10) entries, and create_shader's per-function uniform switch
- * (byte table 0x18855a1e4, index function - 0x11) set to look up
- * color_matrix like for colorMatrix4x4Bias (0x13, case 0) instead of
+ * QuartzCore (dsc-8) GL renderer fixes, see vcm_func and nop_func:
+ * tex_fragment_shaders (0x1d5b44a10) entries, and create_shader's
+ * per-function uniform switch (byte table 0x18855a1e4, index function -
+ * 0x11) set to look up the uniform names the function uses instead of
  * nothing (case 0xde).
  */
 static const struct {
 	uint8_t fn;
 	const char *expr;
-} sgl_texfns[] = {{0x2d, "sgl_vcm(s0)"}, {0x14, "sgl_cm4(s0)"}};
+	uint8_t uniforms;       /* uniform switch case: 0 color_matrix, 0x95 minmax_dir/bgcolor/map/args, 0xde none */
+} sgl_texfns[] = {{0x2d, "sgl_vcm(s0)", 0}, {0x14, "sgl_cm4(s0)", 0}, {0x26, "sgl_nop()", 0xde},
+    {0x27, "sgl_vblur(s1)", 0x95}};
 
 static bool
 sgl_write_const(void *at, const void *val, size_t len, vm_prot_t back)
@@ -2094,14 +2155,14 @@ sgl_install_texfns(void)
 		return;
 	}
 	for (size_t i = 0; i < sizeof(sgl_texfns) / sizeof(sgl_texfns[0]); i++) {
-		uint8_t fn = sgl_texfns[i].fn, zero = 0;
+		uint8_t fn = sgl_texfns[i].fn, uniforms = sgl_texfns[i].uniforms;
 		if (table[fn] != NULL || cases[fn] != 0xde) {
 			sweet_drm_log("sweetgl: texture function %#x: unexpected (%p %#x), not installed", fn,
 			    (void *)table[fn], cases[fn]);
 			continue;
 		}
 		bool ok = sgl_write_const(&table[fn], &sgl_texfns[i].expr, sizeof(char *), VM_PROT_READ) &&
-		    sgl_write_const(&cases[fn], &zero, 1, VM_PROT_READ | VM_PROT_EXECUTE);
+		    (uniforms == 0xde || sgl_write_const(&cases[fn], &uniforms, 1, VM_PROT_READ | VM_PROT_EXECUTE));
 		sweet_drm_log("sweetgl: texture function %#x = %s: %s", fn, sgl_texfns[i].expr, ok ? "installed" : "FAILED");
 	}
 }
