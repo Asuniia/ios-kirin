@@ -1,0 +1,99 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1424,6 +1424,73 @@
+ 	return done ? 0 : ETIMEDOUT;
+ }
+ 
++/*
++ * sweetgpuclk=400: the 401.8 MHz corner. GFX rail (PMI8994 S2) first to that
++ * corner's ceiling voltage, 825 mV (downstream msm8996 gfx_cpr
++ * qcom,cpr-voltage-ceiling), read back, then gfx3d = GPLL0 / 1.5 (field
++ * 2). mem-acc is already in its high-voltage setting (0 at boot). VM lock
++ * held: no quad runs meanwhile.
++ */
++static bool
++gfx_400(void)
++{
++	uint8_t sub = 0, v = 0;
++	if (!sweet_pmic_read(GFX_S2, 0x05, &sub) || (sub != 8 && sub != 9)) {
++		return false;
++	}
++	uint8_t vset = (uint8_t)((825 - (sub == 9 ? 80 : 0)) / 5);
++	if (!sweet_pmic_write(GFX_S2, 0x41, vset)) {
++		return false;
++	}
++	delay(2000);                    /* slew 80 mV, then settle */
++	if (!sweet_pmic_read(GFX_S2, 0x41, &v) || v != vset) {
++		printf("SWEET GPU: S2 vset %u, want %u: clock stays\n", v, vset);
++		return false;
++	}
++	return gfx_clock(2);
++}
++
++/* Full-screen (750x1334, pitch 3072) source-over quads: average us of 5. */
++static uint64_t
++quad_bench(void)
++{
++	static vm_offset_t va[2];
++	static uint64_t gva[2];
++	const uint32_t pitch = 3072, h = 1334, bytes = (pitch * h + PAGE_MASK) & ~PAGE_MASK;
++	for (int b = 0; b < 2 && gva[1] == 0; b++) {
++		uint64_t pa = gpu_alloc(&va[b], bytes), pages[(3072 * 1334 + PAGE_MASK) / PAGE_SIZE];
++		if (pa == 0) {
++			return 0;
++		}
++		for (uint32_t i = 0; i < bytes / PAGE_SIZE; i++) {
++			pages[i] = pa + (uint64_t)i * PAGE_SIZE;
++		}
++		gva[b] = sweet_gpu_vm_map(pages, bytes / PAGE_SIZE, false);
++		uint32_t *p = (uint32_t *)va[b];
++		for (uint32_t i = 0; i < pitch / 4 * h; i++) {
++			p[i] = b ? 0xff000000u | (i * 0x10305u) : src_px(i % 768, i / 768);
++		}
++	}
++	if (gva[0] == 0 || gva[1] == 0) {
++		return 0;
++	}
++	struct sweet_gpu_quad q = {
++		.src_va = gva[0], .dst_va = gva[1],
++		.src_w = 750, .src_h = h, .src_pitch = pitch,
++		.dst_w = 750, .dst_h = h, .dst_pitch = pitch,
++		.w = 750, .h = h,
++		.m = {0x3f800000u, 0, 0, 0x3f800000u, 0, 0},
++		.opacity = 0x3f800000u,
++	};
++	uint64_t t0 = mach_absolute_time();
++	for (int i = 0; i < 5; i++) {
++		if (sweet_gpu_quad(&q) != 0) {
++			return 0;
++		}
++	}
++	return usecs(mach_absolute_time() - t0) / 5;
++}
++
+ /* sweet_gpu_quad once, on scattered kernel buffers (sample_test A through the API). */
+ static void
+ api_selftest(void)
+@@ -1698,6 +1765,22 @@
+ 			g_ready = true;
+ 			printf("SWEET GPU: service ready (300 MHz, GPU VA window 8-16 GB)\n");
+ 			api_selftest();
++			int mhz = 300;
++			(void)PE_parse_boot_argn("sweetgpuclk", &mhz, sizeof(mhz));
++			uint64_t us300 = quad_bench();
++			if (mhz == 400) {
++				lck_mtx_lock(&sweet_gpu_vm_lock);
++				bool ok = gfx_400();
++				lck_mtx_unlock(&sweet_gpu_vm_lock);
++				uint64_t us400 = ok ? quad_bench() : 0;
++				printf("SWEET GPU: full-screen quad %llu us at 300 MHz, %llu us at 400 MHz (%s)\n",
++				    us300, us400, ok ? "S2 825 mV, GPLL0/1.5" : "switch FAILED");
++				if (ok) {
++					api_selftest();
++				}
++			} else {
++				printf("SWEET GPU: full-screen quad %llu us at 300 MHz\n", us300);
++			}
+ 			return;
+ 		}
+ 		if (level >= 7) {
