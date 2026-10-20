@@ -23,9 +23,21 @@ struct sweet_gpu_quad {
 	uint32_t dst_w, dst_h, dst_pitch;
 	uint32_t x0, y0, w, h;
 	uint32_t m[6];
-	uint32_t opacity;
+	uint32_t reserved;
 	uint32_t flags;
+	uint32_t color[4];
+	uint32_t src_fmt;
+	uint32_t src_swiz;
+	uint32_t nedges;
+	uint32_t edge[4][3];
 };
+
+#define SWEET_GPU_FMT_RGBA8     0u
+#define SWEET_GPU_FMT_R8        1u
+#define SWEET_GPU_FMT_RG8       2u
+#define SWIZ(x, y, z, w)        ((x) | (y) << 3 | (z) << 6 | (w) << 9)
+#define SWIZ_XYZW               SWIZ(0, 1, 2, 3)
+#define ONE4                    {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u}
 
 #define SWEET_GPU_QUAD_NEAREST  1u
 #define SWEET_GPU_QUAD_ADD      2u
@@ -163,7 +175,7 @@ main(void)
 		.dst_w = 128, .dst_h = 128, .dst_pitch = 512,
 		.x0 = 16, .y0 = 16, .w = 64, .h = 64,
 		.m = {fbits(1), 0, 0, fbits(1), fbits(-16), fbits(-16)},
-		.opacity = fbits(1),
+		.color = ONE4, .src_swiz = SWIZ_XYZW,
 	};
 	kr = quad(c, &q);
 	uint32_t bad = 0;
@@ -217,7 +229,7 @@ main(void)
 		.dst_w = W, .dst_h = H, .dst_pitch = P,
 		.x0 = 0, .y0 = 0, .w = W, .h = H,
 		.m = {fbits(1), 0, 0, fbits(1), 0, 0},
-		.opacity = fbits(1),
+		.color = ONE4, .src_swiz = SWIZ_XYZW,
 	};
 	t0 = mach_absolute_time();
 	kr = quad(c, &f);

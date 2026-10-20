@@ -1,0 +1,223 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -923,17 +923,30 @@
+ 	uint32_t groups_y;              /* 0 = 1 */
+ };
+ 
+-/* A5XX_TEX_CONST for a linear RGBA8 2-D image (byte 0 = x). */
++/* A5XX_TEX_CONST for a linear 2-D image: TFMT5_* format, swizzle (4 x 3 bits, x first). */
+ static void
+-tex_rgba8(uint32_t *t, uint64_t pa, uint32_t w, uint32_t h, uint32_t pitch)
++tex_desc(uint32_t *t, uint64_t pa, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fmt, uint32_t swiz)
+ {
+ 	memset(t, 0, 12 * 4);
+-	t[0] = (0u << 4) | (1u << 7) | (2u << 10) | (3u << 13) | (0x30u << 22);  /* XYZW, TFMT5_8_8_8_8_UNORM */
++	t[0] = ((swiz & 7) << 4) | (((swiz >> 3) & 7) << 7) | (((swiz >> 6) & 7) << 10) | (((swiz >> 9) & 7) << 13) |
++	    (fmt << 22);
+ 	t[1] = w | (h << 15);
+ 	t[2] = (pitch << 7) | (1u << 29);                       /* PITCHALIGN 0, 2D */
+ 	t[3] = ((pitch * h) >> 12) & 0x3fff;                    /* ARRAY_PITCH */
+ 	t[4] = (uint32_t)pa;                                    /* 32-byte aligned */
+ 	t[5] = (uint32_t)(pa >> 32) | (1u << 17);               /* DEPTH 1 */
++}
++
++#define TFMT5_8_UNORM           0x03u
++#define TFMT5_8_8_UNORM         0x0fu
++#define TFMT5_8_8_8_8_UNORM     0x30u
++#define SWIZ_XYZW               0x688u
++
++/* A linear RGBA8 2-D image (byte 0 = x). */
++static void
++tex_rgba8(uint32_t *t, uint64_t pa, uint32_t w, uint32_t h, uint32_t pitch)
++{
++	tex_desc(t, pa, w, h, pitch, TFMT5_8_8_8_8_UNORM, SWIZ_XYZW);
+ }
+ 
+ /* A5XX_TEX_SAMP: unnormalized coords, clamp to edge, linear or nearest. */
+@@ -1354,9 +1367,17 @@
+ 	if (!g_ready) {
+ 		return ENXIO;
+ 	}
+-	if (q->src_w == 0 || q->src_h == 0 || q->src_w > 16384 || q->src_h > 16384 ||
++	static const uint32_t fmt_bpp[3] = {4, 1, 2}, fmt_code[3] = {TFMT5_8_8_8_8_UNORM, TFMT5_8_UNORM, TFMT5_8_8_UNORM};
++	uint32_t swiz = q->src_swiz;
++	bool swiz_ok = (swiz >> 12) == 0;
++	for (int c = 0; c < 4; c++) {
++		swiz_ok = swiz_ok && ((swiz >> (3 * c)) & 7) <= 5;
++	}
++	if (q->src_fmt > SWEET_GPU_FMT_RG8 || !swiz_ok || q->nedges > 4 ||
++	    q->src_w == 0 || q->src_h == 0 || q->src_w > 16384 || q->src_h > 16384 ||
+ 	    q->dst_w == 0 || q->dst_h == 0 || q->dst_w > 16384 || q->dst_h > 16384 ||
+-	    q->src_pitch % 64 || q->dst_pitch % 64 || q->src_pitch < q->src_w * 4 || q->dst_pitch < q->dst_w * 4 ||
++	    q->src_pitch % 64 || q->dst_pitch % 64 || q->src_pitch < q->src_w * fmt_bpp[q->src_fmt] ||
++	    q->dst_pitch < q->dst_w * 4 ||
+ 	    (q->src_va & 63) || (q->dst_va & 63) || q->w == 0 || q->h == 0 ||
+ 	    q->x0 >= q->dst_w || q->y0 >= q->dst_h || q->w > q->dst_w - q->x0 || q->h > q->dst_h - q->y0 ||
+ 	    (q->flags & ~7u) || (q->flags & 6u) == 6u) {
+@@ -1382,22 +1403,29 @@
+ 	vm_cache((uint32_t)df, drow, drows);
+ 	/* sample4.asm: 4 pixels per invocation from xa = x0 rounded down to 4 */
+ 	uint32_t xa = q->x0 & ~3u, groups = (q->x0 + q->w - xa + 3) / 4;
+-	uint32_t consts[32] = {
++	uint32_t consts[48] = {
+ 		q->m[0], q->m[1], q->m[2], q->m[3],
+-		q->m[4], q->m[5], q->opacity, 0x3f800000u,
++		q->m[4], q->m[5], 0, 0x3f800000u,
+ 		0x437f0000u, 0x3f000000u, groups - 1, q->dst_pitch / 4,
+ 		xa, q->y0,
+ 		q->flags & (SWEET_GPU_QUAD_ADD | SWEET_GPU_QUAD_COPY) ? 0 : 0x3f800000u,        /* k0 */
+ 		q->flags & SWEET_GPU_QUAD_COPY ? 0xbf800000u : 0,                               /* k1 - 1 */
+ 		q->x0, q->x0 + q->w, 0xbf800000u, 0,
++		q->color[0], q->color[1], q->color[2], q->color[3],
+ 	};
++	for (uint32_t e = 0; e < 4; e++) {             /* c6-c9; unused edges pass everything */
++		consts[24 + 4 * e] = e < q->nedges ? q->edge[e][0] : 0;
++		consts[25 + 4 * e] = e < q->nedges ? q->edge[e][1] : 0;
++		consts[26 + 4 * e] = e < q->nedges ? q->edge[e][2] : 0x3f800000u;
++	}
++	consts[40] = 0x49800000u;                       /* K = 2^20 */
+ 	uint32_t tex[24], samp[8];
+-	tex_rgba8(tex, q->src_va, q->src_w, q->src_h, q->src_pitch);
++	tex_desc(tex, q->src_va, q->src_w, q->src_h, q->src_pitch, fmt_code[q->src_fmt], swiz);
+ 	/* the whole pitch: groups at the right edge read (and keep) the padding */
+ 	tex_rgba8(tex + 12, q->dst_va, q->dst_pitch / 4, q->dst_h, q->dst_pitch);
+ 	samp_unnorm(samp, !(q->flags & SWEET_GPU_QUAD_NEAREST));
+ 	samp_unnorm(samp + 4, false);
+-	struct cs_extra x = {consts, 8, tex, samp, 2, q->h};
++	struct cs_extra x = {consts, 12, tex, samp, 2, q->h};
+ 	uint64_t bufs[1] = {q->dst_va};
+ 	uint32_t sizes[1] = {(uint32_t)dlen};
+ 	uint32_t seq = ++g_seq;
+@@ -1480,7 +1508,7 @@
+ 		.dst_w = 750, .dst_h = h, .dst_pitch = pitch,
+ 		.w = 750, .h = h,
+ 		.m = {0x3f800000u, 0, 0, 0x3f800000u, 0, 0},
+-		.opacity = 0x3f800000u,
++		.color = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u}, .src_swiz = SWIZ_XYZW,
+ 	};
+ 	uint64_t t0 = mach_absolute_time();
+ 	for (int i = 0; i < 5; i++) {
+@@ -1511,7 +1539,7 @@
+ 		.dst_w = 128, .dst_h = 128, .dst_pitch = 512,
+ 		.y0 = 16, .h = 64,
+ 		.m = {0x3f800000u, 0, 0, 0x3f800000u, 0, 0xc1800000u},
+-		.opacity = 0x3f800000u,
++		.color = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u}, .src_swiz = SWIZ_XYZW,
+ 	};
+ 	/* source-over at x0 16 (4-aligned), source-over and copy at x0 13, w 61 */
+ 	static const struct { uint32_t x0, w, tx, flags; } t[3] = {
+--- a/bsd/dev/sweet_gpu.h
++++ b/bsd/dev/sweet_gpu.h
+@@ -13,12 +13,14 @@
+ __BEGIN_DECLS
+ 
+ /*
+- * Textured quad: for each pixel (X, Y) of the dst rect (x0, y0, w, h),
++ * Textured quad: for each pixel (X, Y) of the dst rect (x0, y0, w, h) on
++ * the inner side of the nedges edges (a (X+.5) + b (Y+.5) + c >= 0),
+  * (u, v) = (m[0] m[2]; m[1] m[3]) (X + .5, Y + .5) + (m[4], m[5]) in src
+  * texels (unnormalized), s = bilinear (flags bit 0: nearest) sample of src,
+- * clamped to its edge, times opacity; dst = s + dst * (1 - s.a) (source-over;
+- * flags SWEET_GPU_QUAD_ADD: min(s + dst, 1), SWEET_GPU_QUAD_COPY: s). Images are
+- * 4 bytes per pixel, premultiplied, alpha in byte 3 (BGRA8 or RGBA8), at
++ * clamped to its edge, channels picked by src_swiz, times color (per
++ * channel); dst = s + dst * (1 - s.a) (source-over; flags SWEET_GPU_QUAD_ADD:
++ * min(s + dst, 1), SWEET_GPU_QUAD_COPY: s). dst is 4 bytes per pixel,
++ * premultiplied, alpha in byte 3 (BGRA8 or RGBA8); src is src_fmt. Images at
+  * GPU VAs from sweet_gpu_vm_map (64-byte aligned); pitches in bytes, multiples
+  * of 64 (the texture unit rounds a pitch up to 64: with any other pitch it
+  * reads past the image, faults and hangs, 0140a). dst must be in a writable
+@@ -30,10 +32,19 @@
+ 	uint32_t dst_w, dst_h, dst_pitch;
+ 	uint32_t x0, y0, w, h;
+ 	uint32_t m[6];          /* float bits: a, b, c, d, tx, ty */
+-	uint32_t opacity;       /* float bits */
++	uint32_t reserved;      /* 0 (was opacity: use color) */
+ 	uint32_t flags;
++	uint32_t color[4];      /* float bits, per channel in memory order */
++	uint32_t src_fmt;       /* SWEET_GPU_FMT_* */
++	uint32_t src_swiz;      /* 4 x 3 bits, channel x first: 0-3 texel x y z w, 4 = 0, 5 = 1 (0x688 = xyzw) */
++	uint32_t nedges;        /* 0-4 */
++	uint32_t edge[4][3];    /* float bits a, b, c */
+ };
+ 
++#define SWEET_GPU_FMT_RGBA8     0u      /* 4 bytes per pixel */
++#define SWEET_GPU_FMT_R8        1u      /* 1 byte */
++#define SWEET_GPU_FMT_RG8       2u      /* 2 bytes */
++
+ #define SWEET_GPU_QUAD_NEAREST  1u
+ #define SWEET_GPU_QUAD_ADD      2u
+ #define SWEET_GPU_QUAD_COPY     4u
+--- a/bsd/dev/sweet_gpu_shaders.h
++++ b/bsd/dev/sweet_gpu_shaders.h
+@@ -91,30 +91,42 @@
+ 	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 1,
+ };
+ /* k_sample4: generated by tools/ir3asm from tools/gpu-shaders/sample4.asm */
+-static const uint32_t k_sample4_bin[320] = {
++static const uint32_t k_sample4_bin[416] = {
+ 	0x00000000, 0x202cc028, 0x00000001, 0x202cc029, 0x00000002, 0x202cc02a, 0x00000003, 0x202cc02b,
+ 	0x00000004, 0x202cc02c, 0x00000005, 0x202cc02d, 0x00000006, 0x202cc02e, 0x00000007, 0x202cc02f,
+ 	0x00000008, 0x202cc030, 0x00000009, 0x202cc031, 0x0000000a, 0x202cc032, 0x0000000b, 0x202cc033,
+ 	0x0000000c, 0x202cc034, 0x0000000d, 0x202cc035, 0x0000000e, 0x202cc036, 0x0000000f, 0x202cc037,
+ 	0x00000010, 0x202cc038, 0x00000011, 0x202cc039, 0x00000012, 0x202cc03a, 0x00000013, 0x202cc03b,
+-	0x00000000, 0x204cc009, 0x200600c0, 0x46d00004, 0x00000000, 0x00000200, 0x00000004, 0x42100004,
+-	0x003500c1, 0x42100005, 0x00000000, 0x00000100, 0x00320004, 0x42d00004, 0x00000000, 0x00000200,
+-	0x20020004, 0x46d00004, 0x00000000, 0x00000200, 0x00340004, 0x42100006, 0x00000000, 0x00000200,
+-	0x00060005, 0x62198007, 0x00000006, 0x200c400c, 0x00000005, 0x200c400d, 0x00000038, 0x200c4038,
+-	0x00000039, 0x200c4039, 0x00000000, 0x00000100, 0x20020007, 0x46d00008, 0x0031000c, 0x4010000c,
+-	0x0031000d, 0x4010000d, 0x40380031, 0x40100038, 0x00310039, 0x40100039, 0x00000000, 0x00000100,
+-	0x002f000c, 0x4010000e, 0x0000000d, 0x2004400f, 0x0000000d, 0x20044011, 0x0000000d, 0x20044013,
+-	0x00000000, 0x00000100, 0x002f000e, 0x40100010, 0x00000000, 0x00000200, 0x002f0010, 0x40100012,
+-	0x002c002a, 0x6386801c, 0x002d002b, 0x6386801d, 0x00000000, 0x00000200, 0x001c0028, 0x63860014,
+-	0x001d0029, 0x63860015, 0x001c0028, 0x63870016, 0x001d0029, 0x63870017, 0x001c0028, 0x63880018,
+-	0x001d0029, 0x63880019, 0x001c0028, 0x6389001a, 0x001d0029, 0x6389001b, 0x0000000c, 0x2004403c,
+-	0x0000000e, 0x2004403d, 0x00000010, 0x2004403e, 0x00000012, 0x2004403f, 0x00000000, 0x00000200,
+-	0x00000029, 0xa0c01f40, 0x0000002d, 0xa0c01f44, 0x00000031, 0xa0c01f48, 0x00000035, 0xa0c01f4c,
+-	0x02200019, 0xa0c01f50, 0x0220001d, 0xa0c01f54, 0x02200021, 0xa0c01f58, 0x02200025, 0xa0c01f5c,
+-	0x0038003c, 0x40100b20, 0x0039003c, 0x639d0b24, 0x003b0020, 0x40500b20, 0x003b0024, 0x40500b24,
+-	0x002f0020, 0x40300b20, 0x002f0024, 0x40300b24, 0x00240020, 0x40780b20, 0x00000000, 0x00000200,
+-	0x002e0020, 0x40700b24, 0x002f0020, 0x639b8b1c, 0x00240040, 0x50700b40, 0x00250044, 0x40700b44,
+-	0x00260048, 0x40700b48, 0x0027004c, 0x40700b4c, 0x00000000, 0x00000200, 0x001c4043, 0x639b001c,
++	0x00000014, 0x202cc064, 0x00000015, 0x202cc065, 0x00000016, 0x202cc066, 0x00000017, 0x202cc067,
++	0x00000018, 0x202cc068, 0x00000019, 0x202cc069, 0x0000001a, 0x202cc06a, 0x0000001c, 0x202cc06c,
++	0x0000001d, 0x202cc06d, 0x0000001e, 0x202cc06e, 0x00000020, 0x202cc070, 0x00000021, 0x202cc071,
++	0x00000022, 0x202cc072, 0x00000024, 0x202cc074, 0x00000025, 0x202cc075, 0x00000026, 0x202cc076,
++	0x00000028, 0x202cc07c, 0x00000000, 0x204cc009, 0x200600c0, 0x46d00004, 0x00000000, 0x00000200,
++	0x00000004, 0x42100004, 0x003500c1, 0x42100005, 0x00000000, 0x00000100, 0x00320004, 0x42d00004,
++	0x00000000, 0x00000200, 0x20020004, 0x46d00004, 0x00000000, 0x00000200, 0x00340004, 0x42100006,
++	0x00000000, 0x00000200, 0x00060005, 0x62198007, 0x00000006, 0x200c400c, 0x00000005, 0x200c400d,
++	0x00000038, 0x200c4038, 0x00000039, 0x200c4039, 0x00000000, 0x00000100, 0x20020007, 0x46d00008,
++	0x0031000c, 0x4010000c, 0x0031000d, 0x4010000d, 0x40380031, 0x40100038, 0x00310039, 0x40100039,
++	0x00000000, 0x00000100, 0x002f000c, 0x4010000e, 0x0000000d, 0x2004400f, 0x0000000d, 0x20044011,
++	0x0000000d, 0x20044013, 0x00000000, 0x00000100, 0x002f000e, 0x40100010, 0x00000000, 0x00000200,
++	0x002f0010, 0x40100012, 0x006a0069, 0x63868078, 0x006e006d, 0x63868079, 0x00720071, 0x6386807a,
++	0x00760075, 0x6386807b, 0x002c002a, 0x6386801c, 0x002d002b, 0x6386801d, 0x00000000, 0x00000200,
++	0x001c0028, 0x63860014, 0x001d0029, 0x63860015, 0x001c0028, 0x63870016, 0x001d0029, 0x63870017,
++	0x001c0028, 0x63880018, 0x001d0029, 0x63880019, 0x001c0028, 0x6389001a, 0x001d0029, 0x6389001b,
++	0x0000000c, 0x2004403c, 0x0000000e, 0x2004403d, 0x00000010, 0x2004403e, 0x00000012, 0x2004403f,
++	0x00000000, 0x00000200, 0x00000029, 0xa0c01f40, 0x0000002d, 0xa0c01f44, 0x00000031, 0xa0c01f48,
++	0x00000035, 0xa0c01f4c, 0x02200019, 0xa0c01f50, 0x0220001d, 0xa0c01f54, 0x02200021, 0xa0c01f58,
++	0x02200025, 0xa0c01f5c, 0x0038003c, 0x40100b20, 0x0039003c, 0x639d0b24, 0x003b0020, 0x40500b20,
++	0x003b0024, 0x40500b24, 0x002f0020, 0x40300b20, 0x002f0024, 0x40300b24, 0x00240020, 0x40780b20,
++	0x0078003c, 0x63b40b24, 0x00000000, 0x00000200, 0x002f0024, 0x63be0b24, 0x003b0024, 0x40500b24,
++	0x002f0024, 0x40300b24, 0x00240020, 0x40780b20, 0x0079003c, 0x63b60b24, 0x00000000, 0x00000200,
++	0x002f0024, 0x63be0b24, 0x003b0024, 0x40500b24, 0x002f0024, 0x40300b24, 0x00240020, 0x40780b20,
++	0x007a003c, 0x63b80b24, 0x00000000, 0x00000200, 0x002f0024, 0x63be0b24, 0x003b0024, 0x40500b24,
++	0x002f0024, 0x40300b24, 0x00240020, 0x40780b20, 0x007b003c, 0x63ba0b24, 0x00000000, 0x00000200,
++	0x002f0024, 0x63be0b24, 0x003b0024, 0x40500b24, 0x002f0024, 0x40300b24, 0x00240020, 0x40780b20,
++	0x00000000, 0x00000200, 0x002f0020, 0x639b8b1c, 0x00640040, 0x50780b40, 0x00640044, 0x40780b44,
++	0x00640048, 0x40780b48, 0x0064004c, 0x40780b4c, 0x00200040, 0x40700b40, 0x00210044, 0x40700b44,
++	0x00220048, 0x40700b48, 0x0023004c, 0x40700b4c, 0x00000000, 0x00000200, 0x001c4043, 0x639b001c,
+ 	0x001d4047, 0x639b001d, 0x001e404b, 0x639b001e, 0x001f404f, 0x639b001f, 0x00000000, 0x00000200,
+ 	0x20400050, 0x638e0b50, 0x20440054, 0x638e8b54, 0x20480058, 0x638f0b58, 0x204c005c, 0x638f8b5c,
+ 	0x00310050, 0x63980b50, 0x00310054, 0x63980b54, 0x00310058, 0x63980b58, 0x0031005c, 0x63980b5c,
+@@ -135,7 +147,7 @@
+ };
+ static const struct sweet_kernel k_sample4 = {
+ 	.bin = k_sample4_bin, .size = sizeof(k_sample4_bin),
+-	.instrlen = 9, .constlen = 8, .max_reg = 24, .max_half_reg = -1,
++	.instrlen = 12, .constlen = 12, .max_reg = 31, .max_half_reg = -1,
+ 	.double_threadsize = 0, .branchstack = 0,
+ 	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 1,
+ };

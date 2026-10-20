@@ -1,5 +1,5 @@
 /*
- * sweetgpu-ca.dylib, v5: loaded into backboardd (kernel 0139+,
+ * sweetgpu-ca.dylib, v6: loaded into backboardd (kernel 0139+,
  * sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgpu-ca.dylib).
  *
  * 1. Runs tools/sweetgpu-test once (3 s after launch, in its own thread).
@@ -134,7 +134,7 @@ static uint64_t g_last_verify;
 struct plan {
 	int32_t X0, Y0, X1, Y1;         /* destination pixels */
 	float A, B, C, D, E, F;         /* texel (u, v) = (A x + C y + E, B x + D y + F) at pixel center (x, y) */
-	uint32_t opacity, flags, key;
+	uint32_t color[4], flags, key, fmt, swiz, nedges, edge[4][3];
 	const uint8_t *tex;
 	uint64_t texrb;
 	uint32_t texw, texh;
@@ -161,11 +161,11 @@ half(const void *p)
 	return h;
 }
 
-/* s = a x + c y + e through vertices 0, 1, 3 (stride 12 floats), checked at 2 */
+/* s = a x + c y + e through vertices 0, 1, n-1 (stride 12 floats), checked at the others */
 static bool
-plane(const float *f, int k, float *a, float *c, float *e)
+plane(const float *f, uint32_t n, int k, float *a, float *c, float *e)
 {
-	const float *p0 = f, *p1 = f + 12, *p2 = f + 36;
+	const float *p0 = f, *p1 = f + 12, *p2 = f + 12 * (n - 1);
 	float det = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p2[0] - p0[0]) * (p1[1] - p0[1]);
 	if (det == 0) {
 		return false;
@@ -173,17 +173,41 @@ plane(const float *f, int k, float *a, float *c, float *e)
 	*a = ((p1[k] - p0[k]) * (p2[1] - p0[1]) - (p2[k] - p0[k]) * (p1[1] - p0[1])) / det;
 	*c = ((p1[0] - p0[0]) * (p2[k] - p0[k]) - (p2[0] - p0[0]) * (p1[k] - p0[k])) / det;
 	*e = p0[k] - *a * p0[0] - *c * p0[1];
-	const float *p3 = f + 24;
-	float d = *a * p3[0] + *c * p3[1] + *e - p3[k];
-	return d > -1e-3f && d < 1e-3f;
+	for (uint32_t i = 2; i + 1 < n; i++) {
+		const float *p3 = f + 12 * i;
+		float d = *a * p3[0] + *c * p3[1] + *e - p3[k];
+		if (!(d > -1e-3f && d < 1e-3f)) {
+			return false;
+		}
+	}
+	return true;
 }
+
+static int g_why;                       /* last skip reason, for skip_ns */
+static uint64_t skip_ns[16], skip_px[16];      /* 13 kind, 14 small */
 
 static bool
 skip(int why)
 {
 	v_skip[why]++;
+	g_why = why;
 	return false;
 }
+
+/* Texture formats by their sampler table's first entry (unslid; 0143b log). */
+static const struct {
+	uint64_t sampler0;
+	uint32_t fmt, swiz;
+	bool tint_only;                 /* alpha masks: only with fn 3 (texture * color) */
+	const char *name;
+} formats[] = {
+	{0x18844ba44ull, SWEET_GPU_FMT_RGBA8, SWIZ(0, 1, 2, 3), false, "ARGB8_Host"},  /* bytes B G R A */
+	{0x18844cbc4ull, SWEET_GPU_FMT_RGBA8, SWIZ(0, 1, 2, 5), false, "XRGB8_Host"},  /* alpha 1 */
+	{0x188451f74ull, SWEET_GPU_FMT_RGBA8, SWIZ(2, 1, 0, 3), false, "RGBA8"},       /* bytes R G B A */
+	{0x1884547f4ull, SWEET_GPU_FMT_RGBA8, SWIZ(1, 2, 3, 0), false, "ABGR8"},       /* bytes A B G R */
+	{0x188450950ull, SWEET_GPU_FMT_R8, SWIZ(0, 0, 0, 0), true, "A8"},
+	{0x188456640ull, SWEET_GPU_FMT_RG8, SWIZ(0, 0, 0, 1), false, "LA8"},           /* L L L A */
+};
 
 static bool
 plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
@@ -193,36 +217,47 @@ plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
 	const uint8_t *tex = r + 8;
 	uint32_t fn = state[0x10];
 	uint32_t blend = state[0x1b0];
+	g_why = 0;
 	if ((*(const uint32_t *)(r + 0x124) & 7) != 1 || (blend != 1 && blend != 3 && blend != 12) ||
-	    (fn != 1 && fn != 3) || n != 4) {
-		return false;
+	    (fn != 1 && fn != 3) || n < 3 || n > 4) {
+		return skip(13);
 	}
 	const uint64_t *table = *(const uint64_t *const *)(tex + 0x30);
-	if (table == NULL || table[0] - g_slide != ARGB8_HOST_SAMPLER0) {
+	int fi = -1;
+	for (int i = 0; table != NULL && i < (int)(sizeof(formats) / sizeof(formats[0])); i++) {
+		if (table[0] - g_slide == formats[i].sampler0) {
+			fi = i;
+		}
+	}
+	if (fi < 0 || (formats[fi].tint_only && fn != 3)) {
 		/* name the other formats: the table's first sampler, once each */
 		static const uint64_t *seen[8];
 		static int nseen;
 		int i;
 		for (i = 0; i < nseen && seen[i] != table; i++) {
 		}
-		if (i == nseen && nseen < 8 && table != NULL) {
+		if (fi < 0 && i == nseen && nseen < 8 && table != NULL) {
 			seen[nseen++] = table;
 			log_line("format: sampler table %llx, first sampler %llx (unslid)\n",
 			    (uint64_t)table - g_slide, table[0] - g_slide);
 		}
 		return skip(1);
 	}
-	for (int i = 0; i < 4; i++) {
-		const float *p = f + i * 12, *q = f + ((i + 1) % 4) * 12;
-		if (p[3] != 1.0f || !(p[0] == q[0] || p[1] == q[1]) || (fn == 3 && memcmp(p + 8, f + 8, 8) != 0)) {
+	bool axis = true;
+	for (uint32_t i = 0; i < n; i++) {
+		const float *p = f + i * 12, *q = f + ((i + 1) % n) * 12;
+		if (p[3] != 1.0f || (fn == 3 && memcmp(p + 8, f + 8, 8) != 0)) {
 			return skip(2);
 		}
+		axis &= p[0] == q[0] || p[1] == q[1];
 	}
+	axis &= n == 4;
+	/* vertex color half4 (r g b a?) -> memory order of a BGRA destination */
 	float cr = half(f + 8), cg = half((const uint8_t *)(f + 8) + 2), cb = half(f + 9),
 	    ca = half((const uint8_t *)(f + 9) + 2);
 	if (fn == 1) {
-		ca = 1;                 /* fn 1 ignores the vertex color (0141a: 71% bad with it) */
-	} else if (cr != ca || cg != ca || cb != ca || ca <= 0 || ca > 1) {
+		cr = cg = cb = ca = 1;  /* fn 1 ignores the vertex color (0141a) */
+	} else if (ca <= 0 || ca > 1 || cr > ca || cg > ca || cb > ca || cr < 0 || cg < 0 || cb < 0) {
 		return skip(3);
 	}
 	uint8_t *dst = *(uint8_t *const *)(ctx + 0x710), *dst2 = *(uint8_t *const *)(ctx + 0x718);
@@ -234,7 +269,8 @@ plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
 	const uint8_t *data = *(const uint8_t *const *)tex;
 	uint64_t texrb = *(const uint64_t *)(tex + 0x10);
 	uint32_t texw = *(const uint32_t *)(tex + 0x18), texh = *(const uint32_t *)(tex + 0x1c);
-	if (data == NULL || texw == 0 || texh == 0 || texrb < texw * 4ull) {
+	static const uint32_t bpp[3] = {4, 1, 2};
+	if (data == NULL || texw == 0 || texh == 0 || texrb < (uint64_t)texw * bpp[formats[fi].fmt]) {
 		return skip(5);
 	}
 	if (((uintptr_t)data & 63) || texrb % 64) {
@@ -242,9 +278,9 @@ plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
 	}
 	int32_t dx0 = *(const int32_t *)(ctx + 0x738), dx1 = *(const int32_t *)(ctx + 0x73c);
 	int32_t dy0 = *(const int32_t *)(ctx + 0x740), dy1 = *(const int32_t *)(ctx + 0x744);
-	/* pixels whose centers are inside, clipped (rs + 0x110) and inside the destination */
+	/* bounding box pixels whose centers are inside, clipped (rs + 0x110) and inside the destination */
 	float x0 = f[0], x1 = f[0], y0 = f[1], y1 = f[1];
-	for (int i = 1; i < 4; i++) {
+	for (uint32_t i = 1; i < n; i++) {
 		x0 = fminf(x0, f[i * 12]), x1 = fmaxf(x1, f[i * 12]);
 		y0 = fminf(y0, f[i * 12 + 1]), y1 = fmaxf(y1, f[i * 12 + 1]);
 	}
@@ -256,34 +292,66 @@ plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
 	X0 = X0 > dx0 ? X0 : dx0, Y0 = Y0 > dy0 ? Y0 : dy0;
 	X1 = X1 < dx1 ? X1 : dx1, Y1 = Y1 < dy1 ? Y1 : dy1;
 	if (X1 <= X0 || Y1 <= Y0 || (int64_t)(X1 - X0) * (Y1 - Y0) < 4096) {
-		return false;
+		return skip(14);
 	}
 	/* unit 0 coordinates: s' = s * state[0x60] + state[0x68] (t: 0x64, 0x6c), texels = s' * w */
 	const float *tm = (const float *)(state + 0x60);
 	float as, cs, es, at, ct, et;
-	if (!plane(f, 4, &as, &cs, &es) || !plane(f, 5, &at, &ct, &et)) {
+	if (!plane(f, n, 4, &as, &cs, &es) || !plane(f, n, 5, &at, &ct, &et)) {
 		return skip(6);
 	}
 	pl->A = texw * tm[0] * as, pl->C = texw * tm[0] * cs, pl->E = texw * (tm[0] * es + tm[2]);
 	pl->B = texh * tm[1] * at, pl->D = texh * tm[1] * ct, pl->F = texh * (tm[1] * et + tm[3]);
-	/* sample inside the texture: what happens outside depends on the edge mode */
-	for (int k = 0; k < 4; k++) {
-		float x = (k & 1 ? X1 - 1 : X0) + 0.5f, y = (k & 2 ? Y1 - 1 : Y0) + 0.5f;
+	/* sample inside the texture (what happens outside depends on the edge mode): the
+	 * polygon's uvs are convex combinations of the vertices' */
+	for (uint32_t i = 0; i < n; i++) {
+		float x = f[i * 12], y = f[i * 12 + 1];
 		float u = pl->A * x + pl->C * y + pl->E, v = pl->B * x + pl->D * y + pl->F;
 		if (u < -0.01f || u > texw + 0.01f || v < -0.01f || v > texh + 0.01f) {
 			return skip(10);
 		}
 	}
+	/* other polygons: an edge function per side, positive inside */
+	pl->nedges = 0;
+	if (!axis) {
+		float area = 0;
+		for (uint32_t i = 0; i < n; i++) {
+			const float *p = f + i * 12, *q = f + ((i + 1) % n) * 12;
+			area += p[0] * q[1] - q[0] * p[1];
+		}
+		float sgn = area > 0 ? 1 : -1;
+		for (uint32_t i = 0; i < n; i++) {
+			const float *p = f + i * 12, *q = f + ((i + 1) % n) * 12;
+			float ea = -(q[1] - p[1]) * sgn, eb = (q[0] - p[0]) * sgn;
+			pl->edge[i][0] = fbits(ea), pl->edge[i][1] = fbits(eb), pl->edge[i][2] = fbits(-(ea * p[0] + eb * p[1]));
+		}
+		pl->nedges = n;
+	}
 	uint8_t f0 = tex[0x40], f1 = tex[0x41];
 	pl->X0 = X0, pl->Y0 = Y0, pl->X1 = X1, pl->Y1 = Y1;
-	pl->opacity = fbits(ca);
+	pl->color[0] = fbits(cb), pl->color[1] = fbits(cg), pl->color[2] = fbits(cr), pl->color[3] = fbits(ca);
+	pl->fmt = formats[fi].fmt, pl->swiz = formats[fi].swiz;
 	pl->flags = (f0 == 0 && f1 == 0 ? SWEET_GPU_QUAD_NEAREST : 0) |
 	    (blend == 12 ? SWEET_GPU_QUAD_ADD : blend == 1 ? SWEET_GPU_QUAD_COPY : 0);
 	pl->tex = data, pl->texrb = texrb, pl->texw = texw, pl->texh = texh;
 	pl->dst = dst, pl->drb = drb, pl->dx0 = dx0, pl->dy0 = dy0, pl->dx1 = dx1, pl->dy1 = dy1;
-	pl->key = fn | (uint32_t)f0 << 8 | (uint32_t)f1 << 12 | (ca < 1) << 17 |
-	    (pl->A == 1 && pl->D == 1 && pl->B == 0 && pl->C == 0) << 18 | blend << 20;
+	bool ident = pl->A == 1 && pl->D == 1 && pl->B == 0 && pl->C == 0;
+	/* key: fn 0-7, filters 8-11 / 12-15, format 16-18, ident 19, alpha < 1 20, blend 21-28, edges 29 */
+	pl->key = fn | (uint32_t)f0 << 8 | (uint32_t)f1 << 12 | (uint32_t)fi << 16 | (uint32_t)ident << 19 |
+	    (uint32_t)(ca < 1) << 20 | blend << 21 | (uint32_t)(pl->nedges != 0) << 29;
 	return true;
+}
+
+/*
+ * Offload pays only where the CPU is slow: plain identity copies / source-overs
+ * of ARGB8 or XRGB8 images take the CPU ~1.3 ms/Mpx, the GPU ~2.5 (0142a).
+ */
+static bool
+gpu_wins(const struct plan *pl)
+{
+	uint32_t fn = pl->key & 0xff, fi = (pl->key >> 16) & 7, blend = (pl->key >> 21) & 0xff;
+	bool ident = (pl->key >> 19) & 1, nearest = pl->flags & SWEET_GPU_QUAD_NEAREST;
+	return !(fn == 1 && ident && nearest && fi <= 1 && (blend == 1 || blend == 3) && pl->nedges == 0);
 }
 
 static uint64_t
@@ -324,8 +392,11 @@ gpu_draw(const struct plan *pl, uint64_t dva, int32_t ox, int32_t oy, uint32_t w
 		.x0 = pl->X0 - ox, .y0 = pl->Y0 - oy, .w = pl->X1 - pl->X0, .h = pl->Y1 - pl->Y0,
 		.m = {fbits(pl->A), fbits(pl->B), fbits(pl->C), fbits(pl->D),
 		      fbits(pl->A * ox + pl->C * oy + pl->E), fbits(pl->B * ox + pl->D * oy + pl->F)},
-		.opacity = pl->opacity, .flags = pl->flags,
+		.flags = pl->flags,
+		.color = {pl->color[0], pl->color[1], pl->color[2], pl->color[3]},
+		.src_fmt = pl->fmt, .src_swiz = pl->swiz, .nedges = pl->nedges,
 	};
+	memcpy(q.edge, pl->edge, sizeof(q.edge));
 	kern_return_t kr = quad(g_conn, &q);
 	unmap(g_conn, sva);
 	return kr;
@@ -442,9 +513,10 @@ verify_run(struct vjob *j, uint64_t cpu)
 		log_line("verify %05x: %ux%u %llu bad (%llu inner); first (%u,%u) cpu %08x gpu %08x\n", j->pl.key,
 		    j->w, j->h, bad, inner, x, y, ((const uint32_t *)(j->rect + y * j->pl.drb))[x],
 		    j->t[y * j->tpitch / 4 + x]);
-		log_line("  uv %g %g %g %g %g %g op %g tex %ux%u rb %llu flags %u at (%d,%d)\n", j->pl.A, j->pl.B,
-		    j->pl.C, j->pl.D, j->pl.E, j->pl.F, *(const float *)&j->pl.opacity, j->pl.texw, j->pl.texh,
-		    j->pl.texrb, j->pl.flags, j->pl.X0, j->pl.Y0);
+		log_line("  uv %g %g %g %g %g %g color %g %g %g %g tex %ux%u rb %llu fmt %u flags %u edges %u at (%d,%d)\n",
+		    j->pl.A, j->pl.B, j->pl.C, j->pl.D, j->pl.E, j->pl.F, *(const float *)&j->pl.color[0],
+		    *(const float *)&j->pl.color[1], *(const float *)&j->pl.color[2], *(const float *)&j->pl.color[3],
+		    j->pl.texw, j->pl.texh, j->pl.texrb, j->pl.fmt, j->pl.flags, j->pl.nedges, j->pl.X0, j->pl.Y0);
 	}
 	free(j->t);
 }
@@ -453,10 +525,11 @@ static void
 gpu_report(void)
 {
 	for (uint32_t k = 0; k < NVKEY && vst[k].n; k++) {
-		log_line("verify fn %u blend %u filt %u/%u op<1 %u ident %u: %llu draws, %llu exact, bad px %.2f%% (inner %.2f%%), "
+		log_line("verify %s fn %u blend %u filt %u/%u a<1 %u ident %u edges %u: %llu draws, %llu exact, bad px %.2f%% (inner %.2f%%), "
 		    "cpu %.2f gpu %.2f ms/draw, %.0f px/draw\n",
-		    vst[k].key & 0xff, vst[k].key >> 20, (vst[k].key >> 8) & 0xf, (vst[k].key >> 12) & 0xf,
-		    (vst[k].key >> 17) & 1, (vst[k].key >> 18) & 1, vst[k].n, vst[k].exact,
+		    formats[(vst[k].key >> 16) & 7].name, vst[k].key & 0xff, (vst[k].key >> 21) & 0xff,
+		    (vst[k].key >> 8) & 0xf, (vst[k].key >> 12) & 0xf,
+		    (vst[k].key >> 20) & 1, (vst[k].key >> 19) & 1, vst[k].key >> 29, vst[k].n, vst[k].exact,
 		    100.0 * vst[k].bad / vst[k].px, 100.0 * vst[k].inner_bad / vst[k].px,
 		    ms(vst[k].cpu) / vst[k].n, ms(vst[k].gpu) / vst[k].n, (double)vst[k].px / vst[k].n);
 	}
@@ -470,8 +543,20 @@ gpu_report(void)
 		off_n = off_px = off_ns = 0;
 	}
 	log_line("skips: fmt %llu shape %llu color %llu dst %llu tex %llu plane %llu alloc %llu quad %llu "
-	    "pitch %llu bounds %llu rows %llu\n", v_skip[1], v_skip[2], v_skip[3], v_skip[4], v_skip[5], v_skip[6],
-	    v_skip[7], v_skip[8], v_skip[9], v_skip[10], v_skip[11]);
+	    "pitch %llu bounds %llu rows %llu cpu-faster %llu\n", v_skip[1], v_skip[2], v_skip[3], v_skip[4], v_skip[5],
+	    v_skip[6], v_skip[7], v_skip[8], v_skip[9], v_skip[10], v_skip[11], v_skip[12]);
+	/* CPU time of the skipped draws by reason (2 s) */
+	static const char *why_name[15] = {"", "fmt", "shape", "color", "dst", "tex", "plane", "alloc", "quad",
+		                            "pitch", "bounds", "rows", "cpu-faster", "kind", "small"};
+	char line[256];
+	int m = snprintf(line, sizeof(line), "skipped CPU ms:");
+	for (int w = 1; w < 15; w++) {
+		if (skip_ns[w]) {
+			m += snprintf(line + m, sizeof(line) - m, " %s %.0f (%.1f Mpx)", why_name[w], ms(skip_ns[w]), skip_px[w] / 1e6);
+		}
+		skip_ns[w] = skip_px[w] = 0;
+	}
+	log_line("%s\n", line);
 }
 
 static void
@@ -479,6 +564,11 @@ dp_hook(void *v, uint32_t n, const void *rs)
 {
 	struct vjob j;
 	bool gpu = atomic_load_explicit(&g_gpu_ok, memory_order_relaxed) && plan(&j.pl, v, n, rs);
+	if (gpu && !gpu_wins(&j.pl)) {
+		gpu = false;
+		skip(12);               /* the CPU is faster for this one */
+	}
+	int why = gpu ? 0 : g_why;
 	bool vj = gpu && !g_offload && verify_prepare(&j);
 	uint64_t t0 = mach_absolute_time();
 	if (!(gpu && g_offload && offload(&j.pl))) {
@@ -507,6 +597,9 @@ dp_hook(void *v, uint32_t n, const void *rs)
 		color &= memcmp(p + 8, f + 8, 8) == 0;
 	}
 	uint64_t area = (uint64_t)(a < 0 ? -a / 2 : a / 2);
+	if (why) {
+		skip_ns[why] += dt, skip_px[why] += area;
+	}
 	uint64_t fmt = mask & 1 ? (*(const uint64_t *)(r + 0x38) - g_slide) & 0xffffff : 0;
 	uint64_t shape = (n == 4) | (axis << 1) | (affine << 2) | (color << 3);
 	uint64_t key = (uint64_t)mask << 56 | (uint64_t)state[0x10] << 48 | (uint64_t)state[0x1b0] << 40 |
