@@ -1,5 +1,5 @@
 /*
- * sweetgpu-ca.dylib, v3: loaded into backboardd (kernel 0139+,
+ * sweetgpu-ca.dylib, v4: loaded into backboardd (kernel 0139+,
  * sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgpu-ca.dylib).
  *
  * 1. Runs tools/sweetgpu-test once (3 s after launch, in its own thread).
@@ -111,15 +111,17 @@ key_str(char *buf, size_t len, uint64_t k)
 /*
  * GPU draws. plan() decides whether a polygon can go to the GPU: unit 0
  * only, ARGB8_Host texture with a pitch that is a multiple of 64 (the
- * texture unit rounds pitches up to 64), shading fn 1 or 3, blend Sover, an
- * axis-aligned affine quad with one gray (opacity) color that samples inside
- * its texture, a 32-bit destination, >= 4096 pixels.
+ * texture unit rounds pitches up to 64), shading fn 1 (texture) or 3
+ * (texture * vertex color, gray only), blend Copy, Sover or Add, an
+ * axis-aligned affine quad that samples inside its texture, a 32-bit
+ * destination, >= 4096 pixels.
  *
  * Verify mode (default): the screen still comes from the CPU; the same draw
  * also runs on the GPU into a copy of the destination rect, at most one
  * every 100 ms, and the two are compared.
- * Offload mode (SWEETGPU_CA_MODE=offload): fn 1 draws go to the GPU instead
- * of the CPU, straight into the destination; the CPU if the GPU fails.
+ * Offload mode (SWEETGPU_CA_MODE=offload): those draws (not Add yet) go to
+ * the GPU instead of the CPU, straight into the destination; the CPU if the
+ * GPU fails.
  */
 #define ARGB8_HOST_SAMPLER0     0x18844ba44ull  /* image_sampler<ARGB8_Host, u32, 0, 0, 0, 0> */
 
@@ -189,7 +191,9 @@ plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
 	const uint8_t *state = *(const uint8_t *const *)(ctx + 0x10);
 	const uint8_t *tex = r + 8;
 	uint32_t fn = state[0x10];
-	if ((*(const uint32_t *)(r + 0x124) & 7) != 1 || state[0x1b0] != 3 || (fn != 1 && fn != 3) || n != 4) {
+	uint32_t blend = state[0x1b0];
+	if ((*(const uint32_t *)(r + 0x124) & 7) != 1 || (blend != 1 && blend != 3 && blend != 12) ||
+	    (fn != 1 && fn != 3) || n != 4) {
 		return false;
 	}
 	const uint64_t *table = *(const uint64_t *const *)(tex + 0x30);
@@ -198,13 +202,15 @@ plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
 	}
 	for (int i = 0; i < 4; i++) {
 		const float *p = f + i * 12, *q = f + ((i + 1) % 4) * 12;
-		if (p[3] != 1.0f || !(p[0] == q[0] || p[1] == q[1]) || memcmp(p + 8, f + 8, 8) != 0) {
+		if (p[3] != 1.0f || !(p[0] == q[0] || p[1] == q[1]) || (fn == 3 && memcmp(p + 8, f + 8, 8) != 0)) {
 			return skip(2);
 		}
 	}
 	float cr = half(f + 8), cg = half((const uint8_t *)(f + 8) + 2), cb = half(f + 9),
 	    ca = half((const uint8_t *)(f + 9) + 2);
-	if (cr != ca || cg != ca || cb != ca || ca <= 0 || ca > 1) {
+	if (fn == 1) {
+		ca = 1;                 /* fn 1 ignores the vertex color (0141a: 71% bad with it) */
+	} else if (cr != ca || cg != ca || cb != ca || ca <= 0 || ca > 1) {
 		return skip(3);
 	}
 	uint8_t *dst = *(uint8_t *const *)(ctx + 0x710), *dst2 = *(uint8_t *const *)(ctx + 0x718);
@@ -259,11 +265,12 @@ plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
 	uint8_t f0 = tex[0x40], f1 = tex[0x41];
 	pl->X0 = X0, pl->Y0 = Y0, pl->X1 = X1, pl->Y1 = Y1;
 	pl->opacity = fbits(ca);
-	pl->flags = f0 == 0 && f1 == 0 ? SWEET_GPU_QUAD_NEAREST : 0;
+	pl->flags = (f0 == 0 && f1 == 0 ? SWEET_GPU_QUAD_NEAREST : 0) |
+	    (blend == 12 ? SWEET_GPU_QUAD_ADD : blend == 1 ? SWEET_GPU_QUAD_COPY : 0);
 	pl->tex = data, pl->texrb = texrb, pl->texw = texw, pl->texh = texh;
 	pl->dst = dst, pl->drb = drb, pl->dx0 = dx0, pl->dy0 = dy0, pl->dx1 = dx1, pl->dy1 = dy1;
 	pl->key = fn | (uint32_t)f0 << 8 | (uint32_t)f1 << 12 | (ca < 1) << 17 |
-	    (pl->A == 1 && pl->D == 1 && pl->B == 0 && pl->C == 0) << 18;
+	    (pl->A == 1 && pl->D == 1 && pl->B == 0 && pl->C == 0) << 18 | blend << 20;
 	return true;
 }
 
@@ -316,7 +323,7 @@ gpu_draw(const struct plan *pl, uint64_t dva, int32_t ox, int32_t oy, uint32_t w
 static bool
 offload(const struct plan *pl)
 {
-	if ((pl->key & 0xff) != 1) {
+	if ((pl->key >> 20) == 12) {    /* Add: not verified yet */
 		return false;
 	}
 	uint8_t *rows = pl->dst + (int64_t)(pl->Y0 - pl->dy0) * pl->drb;
@@ -437,9 +444,9 @@ static void
 gpu_report(void)
 {
 	for (uint32_t k = 0; k < NVKEY && vst[k].n; k++) {
-		log_line("verify fn %u filt %u/%u op<1 %u ident %u: %llu draws, %llu exact, bad px %.2f%% (inner %.2f%%), "
+		log_line("verify fn %u blend %u filt %u/%u op<1 %u ident %u: %llu draws, %llu exact, bad px %.2f%% (inner %.2f%%), "
 		    "cpu %.2f gpu %.2f ms/draw, %.0f px/draw\n",
-		    vst[k].key & 0xff, (vst[k].key >> 8) & 0xf, (vst[k].key >> 12) & 0xf,
+		    vst[k].key & 0xff, vst[k].key >> 20, (vst[k].key >> 8) & 0xf, (vst[k].key >> 12) & 0xf,
 		    (vst[k].key >> 17) & 1, (vst[k].key >> 18) & 1, vst[k].n, vst[k].exact,
 		    100.0 * vst[k].bad / vst[k].px, 100.0 * vst[k].inner_bad / vst[k].px,
 		    ms(vst[k].cpu) / vst[k].n, ms(vst[k].gpu) / vst[k].n, (double)vst[k].px / vst[k].n);

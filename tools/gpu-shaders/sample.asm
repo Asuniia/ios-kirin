@@ -2,11 +2,12 @@
 ; (X, Y) of the dst rect, (u, v) = (a b; c d)^T (X+.5, Y+.5) + (tx, ty) in
 ; unnormalized texel coords, s = bilinear sample of t#0 (s#0: LINEAR,
 ; clamp-to-edge) * opacity, d = t#1 at the pixel (s#1: NEAREST; t#1 is the
-; dst image itself), out = s + d * (1 - s.a), stored as RGBA8 (byte 0 = x).
+; dst image itself), out = s + d * (k1 - s.a * k0), clamped, stored as RGBA8
+; (byte 0 = x): k0, k1 = 1, 1 source-over, 0, 1 add, 0, 0 copy.
 ; Constants (uploaded per dispatch):
 ;   c0 = a, b, c, d          c1 = tx, ty, opacity, 1.0
 ;   c2 = 255.0, 0.5, w - 1 (u32), dst pitch in pixels (u32)
-;   c3 = x0 (u32), y0 (u32)
+;   c3 = x0 (u32), y0 (u32), k0, k1
 ; Grid: groups (ceil(w / 64), h); x past w - 1 is clamped (same pixel twice).
 ; cat2 may read one const, cat3 none in src2: the constants go to r10-r13.
 @localsize 64, 1, 1
@@ -28,6 +29,8 @@ mov.u32u32 r12.z, c2.z
 mov.u32u32 r12.w, c2.w
 mov.u32u32 r13.x, c3.x
 mov.u32u32 r13.y, c3.y
+mov.u32u32 r13.z, c3.z
+mov.u32u32 r13.w, c3.w
 mov.u32u32 r2.y, 0
 shl.b r1.x, r48.x, 6
 (rpt2)nop
@@ -56,7 +59,7 @@ sam (f32)(xyzw)r5.x, r4.x, s#0, t#0
 sam (f32)(xyzw)r6.x, r3.x, s#1, t#1
 (sy)(rpt3)mul.f r5.x, (r)r5.x, r11.z
 (rpt2)nop
-add.f r7.x, r11.w, (neg)r5.w
+mad.f32 r7.x, (neg)r5.w, r13.z, r13.w
 (rpt2)nop
 (rpt3)mad.f32 r8.x, (r)r6.x, r7.x, (r)r5.x
 (rpt3)mad.f32 r8.x, (r)r8.x, r12.x, r12.y

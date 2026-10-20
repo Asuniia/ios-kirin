@@ -28,6 +28,8 @@ struct sweet_gpu_quad {
 };
 
 #define SWEET_GPU_QUAD_NEAREST  1u
+#define SWEET_GPU_QUAD_ADD      2u
+#define SWEET_GPU_QUAD_COPY     4u
 
 static int g_null = -1;
 
