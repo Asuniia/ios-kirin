@@ -1,0 +1,234 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -753,6 +753,7 @@
+ static uint16_t g_chunk_first[GVA_CHUNKS];      /* first chunk of the mapping using it */
+ static uint64_t *g_map_pa[GVA_CHUNKS];          /* at the first chunk: the mapping's pages */
+ static uint32_t g_map_npages[GVA_CHUNKS];
++static bool g_map_ro[GVA_CHUNKS];
+ 
+ /* A 4 KB table from the current 16 KB pool page; *pa gets its PA. */
+ static uint64_t *
+@@ -803,7 +804,7 @@
+  * GPU VA; returns it, or 0 if out of VA or table memory.
+  */
+ uint64_t
+-sweet_gpu_vm_map(const uint64_t *pa, uint32_t npages)
++sweet_gpu_vm_map(const uint64_t *pa, uint32_t npages, bool readonly)
+ {
+ 	uint64_t bytes = (uint64_t)npages * PAGE_SIZE;
+ 	uint32_t n = (uint32_t)((bytes + (2u << 20) - 1) >> 21), first = 0, run = 0;
+@@ -843,10 +844,12 @@
+ 	g_chunk_len[first] = (uint16_t)n;
+ 	g_map_pa[first] = pages;
+ 	g_map_npages[first] = npages;
++	g_map_ro[first] = readonly;
+ 	uint32_t sub = PAGE_SIZE / 4096;
++	uint64_t attrs = PTE_ATTRS | (readonly ? 1u << 7 : 0);         /* AP[2]: read-only */
+ 	for (uint64_t i = 0; i < (uint64_t)npages * sub; i++) {
+ 		uint32_t c = first + (uint32_t)(i / 512);
+-		g_l3[c][i % 512] = (pa[i / sub] + (i % sub) * 4096) | 3u | PTE_ATTRS;
++		g_l3[c][i % 512] = (pa[i / sub] + (i % sub) * 4096) | 3u | attrs;
+ 	}
+ 	for (uint32_t c = first; c < first + n; c++) {
+ 		flush_dcache64((addr64_t)g_l3[c], 4096, FALSE);
+@@ -876,6 +879,7 @@
+ 		kfree_data(g_map_pa[first], g_map_npages[first] * sizeof(uint64_t));
+ 		g_map_pa[first] = NULL;
+ 		g_map_npages[first] = 0;
++		g_map_ro[first] = false;
+ 	}
+ 	lck_mtx_unlock(&sweet_gpu_vm_lock);
+ }
+@@ -1215,7 +1219,7 @@
+ 		pa[i] = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(*va + i * PAGE_SIZE)));
+ 		contiguous = contiguous && (i == 0 || pa[i] == pa[i - 1] + PAGE_SIZE);
+ 	}
+-	uint64_t gva = sweet_gpu_vm_map(pa, npages);
++	uint64_t gva = sweet_gpu_vm_map(pa, npages, false);
+ 	printf("SWEET GPU: vm buffer %u pages (%s) pa[0] %llx pa[1] %llx -> GPU VA %llx\n", npages,
+ 	    contiguous ? "contiguous" : "scattered", pa[0], npages > 1 ? pa[1] : 0, gva);
+ 	return gva;
+@@ -1350,7 +1354,7 @@
+ 	}
+ 	if (q->src_w == 0 || q->src_h == 0 || q->src_w > 16384 || q->src_h > 16384 ||
+ 	    q->dst_w == 0 || q->dst_h == 0 || q->dst_w > 16384 || q->dst_h > 16384 ||
+-	    q->src_pitch % 4 || q->dst_pitch % 4 || q->src_pitch < q->src_w * 4 || q->dst_pitch < q->dst_w * 4 ||
++	    q->src_pitch % 64 || q->dst_pitch % 64 || q->src_pitch < q->src_w * 4 || q->dst_pitch < q->dst_w * 4 ||
+ 	    (q->src_va & 63) || (q->dst_va & 63) || q->w == 0 || q->h == 0 ||
+ 	    q->x0 >= q->dst_w || q->y0 >= q->dst_h || q->w > q->dst_w - q->x0 || q->h > q->dst_h - q->y0) {
+ 		return EINVAL;
+@@ -1361,10 +1365,14 @@
+ 	}
+ 	lck_mtx_lock(&sweet_gpu_vm_lock);       /* keeps both mappings alive, serializes the ring */
+ 	int sf = vm_range(q->src_va, slen), df = vm_range(q->dst_va, dlen);
+-	if (sf < 0 || df < 0) {
++	if (sf < 0 || df < 0 || g_map_ro[df]) {
+ 		lck_mtx_unlock(&sweet_gpu_vm_lock);
+ 		return EFAULT;
+ 	}
++	if (!g_ready) {                 /* went off while we waited for the lock */
++		lck_mtx_unlock(&sweet_gpu_vm_lock);
++		return ENXIO;
++	}
+ 	vm_cache((uint32_t)sf, q->src_va, slen);
+ 	vm_cache((uint32_t)df, q->dst_va, dlen);
+ 	uint32_t consts[16] = {
+@@ -1384,19 +1392,25 @@
+ 	uint32_t seq = ++g_seq;
+ 	volatile uint32_t *fv = (volatile uint32_t *)(g_scratch_va + 64);
+ 	bool read = compute_run(g_gpu, &k_sample, g_ksample, bufs, sizes, (q->w + 63) / 64, g_scratch + 64, seq, &x);
++	/*
++	 * Spin on the fence: delay() sleeps on a timer, and with the CPUs busy
++	 * drawing the wakeup came ms late (64x64 quads took 7 ms, 0140a).
++	 */
+ 	bool done = false;
+-	for (unsigned us = 0; read && us < 500000 && !(done = (*fv == seq)); us += 20) {
+-		delay(20);
++	uint64_t deadline;
++	clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
++	while (read && !(done = (*fv == seq)) && mach_absolute_time() < deadline) {
+ 		flush_dcache64((addr64_t)g_scratch + 64, 4, TRUE);
+ 	}
+ 	vm_cache((uint32_t)df, q->dst_va, dlen);
+-	lck_mtx_unlock(&sweet_gpu_vm_lock);
+ 	if (!done) {
++		g_ready = false;        /* hung: no recovery yet, fail fast from now on */
+ 		cp_state(g_gpu, "quad timeout:");
+ 		smmu_faults(g_smmu, "quad timeout:");
+-		return ETIMEDOUT;
++		printf("SWEET GPU: quad timed out, GPU service off until reboot\n");
+ 	}
+-	return 0;
++	lck_mtx_unlock(&sweet_gpu_vm_lock);
++	return done ? 0 : ETIMEDOUT;
+ }
+ 
+ /* sweet_gpu_quad once, on scattered kernel buffers (sample_test A through the API). */
+--- a/bsd/dev/sweet_gpu.h
++++ b/bsd/dev/sweet_gpu.h
+@@ -19,8 +19,9 @@
+  * clamped to its edge, times opacity; dst = s + dst * (1 - s.a). Images are
+  * 4 bytes per pixel, premultiplied, alpha in byte 3 (BGRA8 or RGBA8), at
+  * GPU VAs from sweet_gpu_vm_map (64-byte aligned); pitches in bytes, multiples
+- * of 4 (whether the texture unit takes pitches that are not multiples of 64
+- * is what sweetgpu-ca's verify mode checks).
++ * of 64 (the texture unit rounds a pitch up to 64: with any other pitch it
++ * reads past the image, faults and hangs, 0140a). dst must be in a writable
++ * mapping.
+  */
+ struct sweet_gpu_quad {
+ 	uint64_t src_va, dst_va;
+@@ -37,13 +38,19 @@
+ /* True once the GPU is up (sweetgpu=8) and accepts work. */
+ bool sweet_gpu_ready(void);
+ 
+-/* Map npages kernel pages (PAGE_SIZE each) at a new GPU VA; 0 on failure. */
+-uint64_t sweet_gpu_vm_map(const uint64_t *pa, uint32_t npages);
++/*
++ * Map npages pages (PAGE_SIZE each) at a new GPU VA; 0 on failure. A
++ * read-only mapping can only be a quad source (SMMU entries read-only).
++ */
++uint64_t sweet_gpu_vm_map(const uint64_t *pa, uint32_t npages, bool readonly);
+ 
+ /* Unmap a VA returned by sweet_gpu_vm_map. */
+ void sweet_gpu_vm_unmap(uint64_t va);
+ 
+-/* Run one quad and wait for it; 0 on success, else an errno value. */
++/*
++ * Run one quad and wait for it; 0 on success, else an errno value. After a
++ * timeout (GPU hung) the service is off until reboot: ENXIO from then on.
++ */
+ int sweet_gpu_quad(const struct sweet_gpu_quad *q);
+ 
+ __END_DECLS
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -3,7 +3,8 @@
+  * in bsd/dev/sweet_gpu.h; GPU up with boot-arg sweetgpu=8).
+  *
+  * Selectors:
+- *   0 map user memory   in: address, length   out: GPU VA of address
++ *   0 map user memory   in: address, length[, flags: bit 0 read-only (quad
++ *                       source only)]   out: GPU VA of address
+  *   1 map IOSurface     in: surface id        out: GPU VA, allocation size
+  *   2 unmap             in: GPU VA returned by 0 or 1
+  *   3 quad              in: struct sweet_gpu_quad (both images inside this
+@@ -64,7 +65,7 @@
+ 	struct sweet_gpu_map fMaps[SWEET_GPU_MAX_MAPS];
+ 
+ 	IOReturn mapDescriptor(IOMemoryDescriptor *md, uint64_t offset, uint64_t len,
+-	    SweetSurface *surface, uint64_t *gvaOut);
++	    SweetSurface *surface, bool readonly, uint64_t *gvaOut);
+ 	void unmapSlot(unsigned i);
+ 	bool owns(uint64_t va, uint64_t len);
+ 
+@@ -152,7 +153,7 @@
+  */
+ IOReturn
+ SweetGPUUserClient::mapDescriptor(IOMemoryDescriptor *md, uint64_t offset, uint64_t len,
+-    SweetSurface *surface, uint64_t *gvaOut)
++    SweetSurface *surface, bool readonly, uint64_t *gvaOut)
+ {
+ 	unsigned slot = SWEET_GPU_MAX_MAPS;
+ 	for (unsigned i = 0; i < SWEET_GPU_MAX_MAPS && slot == SWEET_GPU_MAX_MAPS; i++) {
+@@ -164,7 +165,7 @@
+ 	if (slot == SWEET_GPU_MAX_MAPS || size == 0 || size > SWEET_GPU_MAX_MAP_BYTES || (size & PAGE_MASK)) {
+ 		return kIOReturnNoResources;
+ 	}
+-	if (md->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++	if (md->prepare(readonly ? kIODirectionOut : kIODirectionInOut) != kIOReturnSuccess) {
+ 		return kIOReturnVMError;
+ 	}
+ 	uint32_t npages = (uint32_t)(size / PAGE_SIZE);
+@@ -175,7 +176,7 @@
+ 		pa[p] = md->getPhysicalSegment((IOByteCount)p * PAGE_SIZE, &seg, kIOMemoryMapperNone);
+ 		ok = pa[p] != 0 && (pa[p] & PAGE_MASK) == 0 && seg >= PAGE_SIZE;
+ 	}
+-	uint64_t gva = ok ? sweet_gpu_vm_map(pa, npages) : 0;
++	uint64_t gva = ok ? sweet_gpu_vm_map(pa, npages, readonly) : 0;
+ 	if (pa != NULL) {
+ 		IOFreeData(pa, npages * sizeof(uint64_t));
+ 	}
+@@ -203,20 +204,21 @@
+ 	IOLockLock(fLock);
+ 	switch (selector) {
+ 	case 0:                 /* map user memory */
+-		if (args->scalarInputCount == 2 && args->scalarOutputCount >= 1) {
++		if ((args->scalarInputCount == 2 || args->scalarInputCount == 3) && args->scalarOutputCount >= 1) {
+ 			uint64_t addr = args->scalarInput[0], len = args->scalarInput[1];
++			bool ro = args->scalarInputCount == 3 && (args->scalarInput[2] & 1);
+ 			uint64_t base = trunc_page_64(addr), end = round_page_64(addr + len);
+ 			if (len == 0 || end <= base || end - base > SWEET_GPU_MAX_MAP_BYTES) {
+ 				break;
+ 			}
+ 			IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(base, end - base,
+-			    kIODirectionInOut, fTask);
++			    ro ? kIODirectionOut : kIODirectionInOut, fTask);
+ 			if (md == NULL) {
+ 				ret = kIOReturnNoMemory;
+ 				break;
+ 			}
+ 			uint64_t gva = 0;
+-			ret = mapDescriptor(md, addr - base, len, NULL, &gva);
++			ret = mapDescriptor(md, addr - base, len, NULL, ro, &gva);
+ 			if (ret != kIOReturnSuccess) {
+ 				md->release();
+ 				break;
+@@ -235,7 +237,7 @@
+ 			}
+ 			s->memory->retain();
+ 			uint64_t gva = 0;
+-			ret = mapDescriptor(s->memory, 0, s->memory->getLength(), s, &gva);
++			ret = mapDescriptor(s->memory, 0, s->memory->getLength(), s, false, &gva);
+ 			if (ret != kIOReturnSuccess) {
+ 				s->memory->release();
+ 				s->release();
+@@ -269,7 +271,7 @@
+ 			}
+ 			int e = sweet_gpu_quad(&q);
+ 			ret = e == 0 ? kIOReturnSuccess : e == ETIMEDOUT ? kIOReturnTimeout :
+-			    e == EFAULT ? kIOReturnNotPermitted : kIOReturnBadArgument;
++			    e == EFAULT ? kIOReturnNotPermitted : e == ENXIO ? kIOReturnNotReady : kIOReturnBadArgument;
+ 		}
+ 		break;
+ 	default:
