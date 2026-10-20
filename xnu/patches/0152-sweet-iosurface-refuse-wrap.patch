@@ -1,0 +1,23 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -12,6 +12,7 @@
+  *   sel 4   lookup by id: scalar [id], struct out = lock result
+  *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
+  *   sel 35  create mach port: scalars [id, options], scalar out [port name]
++ *   sel 6/7 wrap client image/memory: refused (kIOReturnUnsupported)
+  *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+  *           (id, options, &seed), 4/5 release (id)
+  *
+@@ -785,6 +786,12 @@
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case 6:                 /* wrap client image (CA's GLES renderer, zero-copy bitmaps) */
++	case 7:                 /* wrap client memory */
++		/* Not supported: refuse, the library returns NULL and CA uploads instead.
++		 * Faking success left clients without memory (crash in backboardd, 0151b). */
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {

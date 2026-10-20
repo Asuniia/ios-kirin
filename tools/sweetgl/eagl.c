@@ -206,6 +206,17 @@ sgl_GetIntegerIndexedv(void *rctx, GLenum pname, GLuint index, GLint *data)
 	glGetIntegeri_v(pname, index, data);
 }
 
+const GLubyte *
+sgl_GetString(void *rctx, GLenum name)
+{
+	SGL_CUR(rctx);
+	const GLubyte *s = glGetString(name);
+	if (s == NULL) {
+		sweet_drm_log("sweetgl: glGetString(%#x) = NULL (error %#x)", name, glGetError());
+	}
+	return s;
+}
+
 /* Apple's ES takes internalformat GL_RGBA with format GL_BGRA; Mesa wants GL_BGRA for both */
 void
 sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLsizei width,

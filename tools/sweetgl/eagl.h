@@ -41,5 +41,6 @@ void sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat
 void sgl_FinishObjectAPPLE(void *rctx, GLenum object, GLint name);
 GLboolean sgl_TestObjectAPPLE(void *rctx, GLenum object, GLuint name);
 void sgl_Flush(void *rctx);
+const GLubyte *sgl_GetString(void *rctx, GLenum name);
 
 #endif
