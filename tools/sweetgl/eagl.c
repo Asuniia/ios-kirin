@@ -390,6 +390,8 @@ struct copied {
 	GLenum format, type;
 };
 static struct copied copies[TEXSZ_MAX];
+/* texture swizzle of the bound texture: identity, or A,B,G,R bytes read as RGBA */
+static uint8_t tex_argb[TEXSZ_MAX];
 static bool copy_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, size_t w, size_t h,
     size_t pitch, const char *why);
 static void set_swizzle(GLenum target, bool argb);
@@ -587,6 +589,58 @@ trace_draw_state(GLint prog, GLenum mode, GLsizei count)
 	}
 }
 
+/* SWEETGL_TRACE: mean RGBA and a 24x4 luma thumbnail of the scissor box (or viewport) */
+static void
+trace_region(const char *when)
+{
+	GLint vp[4] = {0}, r[4];
+	glGetIntegerv(GL_VIEWPORT, vp);
+	memcpy(r, vp, sizeof(r));
+	if (glIsEnabled(GL_SCISSOR_TEST)) {
+		GLint sc[4] = {0};
+		glGetIntegerv(GL_SCISSOR_BOX, sc);
+		GLint x0 = sc[0] > vp[0] ? sc[0] : vp[0], y0 = sc[1] > vp[1] ? sc[1] : vp[1];
+		GLint x1 = sc[0] + sc[2] < vp[0] + vp[2] ? sc[0] + sc[2] : vp[0] + vp[2];
+		GLint y1 = sc[1] + sc[3] < vp[1] + vp[3] ? sc[1] + sc[3] : vp[1] + vp[3];
+		r[0] = x0, r[1] = y0, r[2] = x1 - x0, r[3] = y1 - y0;
+	}
+	if (r[2] <= 0 || r[3] <= 0) {
+		return;
+	}
+	size_t w = (size_t)r[2], h = (size_t)r[3];
+	uint8_t *px = malloc(w * h * 4);
+	if (px == NULL) {
+		return;
+	}
+	glReadPixels(r[0], r[1], r[2], r[3], GL_RGBA, GL_UNSIGNED_BYTE, px);
+	uint64_t sum[4] = {0};
+	for (size_t i = 0; i < w * h * 4; i++) {
+		sum[i % 4] += px[i];
+	}
+	char thumb[4 * 25 + 1];
+	for (int cy = 0; cy < 4; cy++) {
+		for (int cx = 0; cx < 24; cx++) {
+			size_t x0 = w * cx / 24, x1 = w * (cx + 1) / 24, y0 = h * (3 - cy) / 4, y1 = h * (4 - cy) / 4;
+			uint64_t a = 0, l = 0, cnt = 0;
+			for (size_t y = y0; y < y1; y++) {
+				for (size_t x = x0; x < x1; x++) {
+					const uint8_t *q = px + (y * w + x) * 4;
+					a += q[3];
+					l += (q[0] * 54u + q[1] * 183u + q[2] * 19u) >> 8;
+					cnt++;
+				}
+			}
+			thumb[cy * 25 + cx] = cnt == 0 || a == 0 ? ' ' : (char)('0' + l * 9 / (cnt * 255));
+		}
+		thumb[cy * 25 + 24] = '/';
+	}
+	thumb[4 * 25 - 1] = 0;
+	size_t n = w * h;
+	TRACE("  %s %d,%d %dx%d mean %02x%02x%02x%02x |%s|", when, r[0], r[1], r[2], r[3], (unsigned)(sum[0] / n),
+	    (unsigned)(sum[1] / n), (unsigned)(sum[2] / n), (unsigned)(sum[3] / n), thumb);
+	free(px);
+}
+
 /* after a new draw state (trace): what the viewport now holds */
 static void
 trace_draw_result(GLint prog)
@@ -599,6 +653,7 @@ trace_draw_result(GLint prog)
 	if (px == NULL) {
 		return;
 	}
+	trace_region("after");
 	glReadPixels(vp[0], vp[1], vp[2], vp[3], GL_RGBA, GL_UNSIGNED_BYTE, px);
 	GLenum e = glGetError();
 	size_t lit = 0, first = n;
@@ -695,6 +750,7 @@ draw_prep(GLenum mode, GLsizei count)
 	if (prog != 0 && window_draw()) {
 		trace_empty_samplers(prog);
 		trace_draw_state(prog, mode, count);
+		trace_region("before");
 		fresh = true;
 	}
 	return fresh;
@@ -722,6 +778,9 @@ sgl_DeleteTextures(void *rctx, GLsizei n, const GLuint *textures)
 	SGL_CUR(rctx);
 	for (GLsizei i = 0; i < n; i++) {
 		copy_forget(textures[i]);
+		if (textures[i] < TEXSZ_MAX) {
+			tex_argb[textures[i]] = 0;      /* a reused name starts unswizzled */
+		}
 		for (int u = 0; u < UNITS; u++) {
 			if (unit_2d[u] == textures[i]) {
 				unit_2d[u] = 0;
@@ -1086,8 +1145,6 @@ surf_res_put(const struct surf_res *key, struct pipe_resource *res)
 	pipe_resource_reference(&surf_res[victim].res, res);
 }
 
-/* texture swizzle of the bound texture: identity, or A,B,G,R bytes read as RGBA */
-static uint8_t tex_argb[TEXSZ_MAX];
 
 static void
 set_swizzle(GLenum target, bool argb)
