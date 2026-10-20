@@ -478,17 +478,36 @@ trace_draw_state(GLint prog, GLenum mode, GLsizei count)
 	return true;
 }
 
-/* after a new draw state (trace): the pixel now at the viewport center */
+/* after a new draw state (trace): what the viewport now holds */
 static void
 trace_draw_result(GLint prog)
 {
 	GLint vp[4] = {0}, fb = 0;
-	uint8_t px[4] = {0};
 	glGetIntegerv(GL_VIEWPORT, vp);
 	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
-	glReadPixels(vp[0] + vp[2] / 2, vp[1] + vp[3] / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	size_t n = (size_t)vp[2] * (size_t)vp[3];
+	uint8_t *px = n ? malloc(n * 4) : NULL;
+	if (px == NULL) {
+		return;
+	}
+	glReadPixels(vp[0], vp[1], vp[2], vp[3], GL_RGBA, GL_UNSIGNED_BYTE, px);
 	GLenum e = glGetError();
-	TRACE("  -> prog %d fb %d center rgba %02x%02x%02x%02x (err %#x)", prog, fb, px[0], px[1], px[2], px[3], e);
+	size_t lit = 0, first = n;
+	uint8_t mx[4] = {0};
+	for (size_t i = 0; i < n; i++) {
+		if (px[i * 4 + 3] != 0) {
+			lit++;
+			first = first < n ? first : i;
+		}
+		for (int c = 0; c < 4; c++) {
+			mx[c] = px[i * 4 + c] > mx[c] ? px[i * 4 + c] : mx[c];
+		}
+	}
+	const uint8_t *f = first < n ? px + first * 4 : mx;
+	TRACE("  -> prog %d fb %d: %zu of %zu pixels with alpha, max %02x%02x%02x%02x, first lit %02x%02x%02x%02x at %zu,%zu "
+	    "(err %#x)", prog, fb, lit, n, mx[0], mx[1], mx[2], mx[3], f[0], f[1], f[2], f[3],
+	    first < n ? first % (size_t)vp[2] : 0, first < n ? first / (size_t)vp[2] : 0, e);
+	free(px);
 }
 
 /* before a draw: each unit holds what the program samples there, rect scale set */
