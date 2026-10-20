@@ -562,8 +562,13 @@ trace_draw_state(GLint prog, GLenum mode, GLsizei count)
 			k += snprintf(samp + k, sizeof(samp) - (size_t)k, " u%d=%u", u, unit_held[u]);
 		}
 	}
-	TRACE("draw prog %d samples%s tex %u %u %u mode %#x n %d fb %d vp %d,%d %dx%d blend %d %#x/%#x %#x/%#x scissor %d %d,%d %dx%d "
-	    "mask %d%d%d%d", prog, samp, unit_held[0], unit_held[1], unit_held[2], mode, count, v[11], vp[0], vp[1], vp[2], vp[3],
+	GLint fbtex = 0;
+	if (v[11] != 0) {
+		glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &fbtex);
+	}
+	TRACE("draw prog %d samples%s into %d tex %u %u %u mode %#x n %d fb %d vp %d,%d %dx%d blend %d %#x/%#x %#x/%#x scissor %d %d,%d %dx%d "
+	    "mask %d%d%d%d", prog, samp, fbtex, unit_held[0], unit_held[1], unit_held[2], mode, count, v[11], vp[0], vp[1], vp[2], vp[3],
 	    v[0], v[1], v[2], v[3], v[4], v[10], sc[0], sc[1], sc[2], sc[3], m[0], m[1], m[2], m[3]);
 	char line[400];
 	size_t len = 0;
@@ -870,7 +875,12 @@ sgl_Clear(void *rctx, GLbitfield mask)
 	SGL_CUR(rctx);
 	GLint fb = 0;
 	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
-	WTRACE("Clear fb %d mask %#x", fb, mask);
+	GLfloat cc[4] = {0};
+	GLint sc[4] = {0};
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+	glGetIntegerv(GL_SCISSOR_BOX, sc);
+	WTRACE("Clear fb %d mask %#x color %.3g,%.3g,%.3g,%.3g scissor %d %d,%d %dx%d", fb, mask, cc[0], cc[1], cc[2], cc[3],
+	    glIsEnabled(GL_SCISSOR_TEST), sc[0], sc[1], sc[2], sc[3]);
 	glClear(mask);
 	SGL_POST(10);
 }
