@@ -1,0 +1,20 @@
+diff --git a/src/freedreno/meson.build b/src/freedreno/meson.build
+index e8f01b8..9a19223 100644
+--- a/src/freedreno/meson.build
++++ b/src/freedreno/meson.build
+@@ -22,13 +22,13 @@ subdir('ir2')
+ subdir('ir3')
+ subdir('fdl')
+ 
+-if system_has_kms_drm
++if system_has_kms_drm or host_machine.system() == 'darwin'
+   subdir('drm')
+ endif
+ 
+ subdir('perfcntrs')
+ 
+-if system_has_kms_drm
++if system_has_kms_drm or host_machine.system() == 'darwin'
+   subdir('computerator')
+ endif
+ 
