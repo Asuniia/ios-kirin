@@ -98,7 +98,13 @@ sweetgl_init(void)
 			 * covers whole 32-row blocks past the end of IOSurfaces that were
 			 * not padded for it (GPU fault on the display surface, boot 0154a).
 			 */
-			setenv("FD_MESA_DEBUG", "sysmem", 0);
+			setenv("FD_MESA_DEBUG", "sysmem,nofp16", 0);
+			/*
+			 * nofp16: CA's shaders count on Apple's mediump/lowp being enough for
+			 * texture coordinates and corner shapes; fp16 is not (App
+			 * Library pod corners/backdrops, the wallpaper "+").
+			 */
+			setenv("IR3_SHADER_DEBUG", "nofp16", 0);
 			/* fd_screen_create fills opts from opt_info (no xmlconfig: defaults) */
 			driParseOptionInfo(&opt_info, sweetgl_driconf, ARRAY_SIZE(sweetgl_driconf));
 			struct pipe_screen_config cfg = {.options = &opts, .options_info = &opt_info};
