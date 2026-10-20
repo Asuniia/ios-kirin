@@ -47,6 +47,7 @@ void sgl_CompileShaderARB(void *rctx, GLhandleARB shader);
 void sgl_LinkProgramARB(void *rctx, GLhandleARB program);
 void sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GLcharARB **string,
     const GLint *length);
+void sgl_BindTexture(void *rctx, GLenum target, GLuint texture);
 void sgl_PixelStorei(void *rctx, GLenum pname, GLint param);
 void sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count);
 void sgl_DrawElements(void *rctx, GLenum mode, GLsizei count, GLenum type, const void *indices);

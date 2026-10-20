@@ -28,7 +28,7 @@ special = {n: 'sgl_' + n[2:] for n in (
     'glGetHandleARB', 'glDiscardFramebufferEXT', 'glGetShaderPrecisionFormatOES',
     'glReleaseShaderCompilerOES', 'glShaderBinaryOES', 'glGetIntegerIndexedv', 'glTexImage2D',
     'glFinishObjectAPPLE', 'glTestObjectAPPLE', 'glFlush', 'glGetString', 'glCompileShaderARB', 'glLinkProgramARB', 'glShaderSourceARB',
-    'glDrawArrays', 'glDrawElements', 'glPixelStorei')}
+    'glDrawArrays', 'glDrawElements', 'glPixelStorei', 'glBindTexture')}
 
 
 def split(param):

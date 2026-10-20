@@ -362,10 +362,25 @@ rect_fixup(void)
 }
 
 void
+sgl_BindTexture(void *rctx, GLenum target, GLuint texture)
+{
+	SGL_CUR(rctx);
+	if (trace_left > 0) {
+		GLint active = 0;
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+		if (target != GL_TEXTURE_2D || active != GL_TEXTURE0) {
+			TRACE("BindTexture %#x %u on unit %d", target, texture, active - GL_TEXTURE0);
+		}
+	}
+	glBindTexture(SGL_TGT(target), texture);
+	SGL_POST(5);
+}
+
+void
 sgl_PixelStorei(void *rctx, GLenum pname, GLint param)
 {
 	SGL_CUR(rctx);
-	TRACE("PixelStorei %#x %d", pname, param);
+	(void)0;
 	glPixelStorei(pname, param);
 	SGL_POST(195);
 }
