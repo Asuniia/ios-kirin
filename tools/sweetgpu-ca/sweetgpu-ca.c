@@ -106,6 +106,20 @@ dp_hook(void *v, uint32_t n, const void *rs)
 		dump_words("rs", rs, 0x130);
 		dump_words("rs0", *(const void *const *)r, 0x40);
 		dump_words("state", state, 0x1c0);
+		/* what the RenderState points at (Textures, surfaces): read safely */
+		for (size_t i = 0; i < 0x130 / 8; i++) {
+			uint64_t ptr = ((const uint64_t *)rs)[i];
+			uint32_t buf[0x60 / 4];
+			vm_size_t got = 0;
+			if (ptr < 0x100000000ull || ptr >= 0x1000000000ull || (ptr & 7) ||
+			    vm_read_overwrite(mach_task_self(), (vm_address_t)ptr, sizeof(buf),
+			    (vm_address_t)buf, &got) != KERN_SUCCESS) {
+				continue;
+			}
+			char what[16];
+			snprintf(what, sizeof(what), "rs%03zx>", i * 8);
+			dump_words(what, buf, sizeof(buf));
+		}
 	}
 }
 
