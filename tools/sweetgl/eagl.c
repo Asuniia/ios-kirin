@@ -360,6 +360,46 @@ sgl_tgt(GLenum target)
 }
 
 /*
+ * Textures holding a copy of a surface (copy_surface): copied again before
+ * a draw when the surface's seed moved (its writer unlocked it since).
+ * ponytail: one copy per texture name below TEXSZ_MAX.
+ */
+struct copied {
+	IOSurfaceRef surface;
+	uint32_t seed;
+	GLenum format, type;
+};
+static struct copied copies[TEXSZ_MAX];
+static bool copy_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, size_t w, size_t h,
+    size_t pitch, const char *why);
+
+static void
+copy_forget(GLuint tex)
+{
+	if (tex < TEXSZ_MAX && copies[tex].surface != NULL) {
+		CFRelease(copies[tex].surface);
+		copies[tex].surface = NULL;
+	}
+}
+
+static void
+copy_refresh(int u, int *active)
+{
+	GLuint tex = unit_held[u];
+	struct copied *c = tex < TEXSZ_MAX ? &copies[tex] : NULL;
+	if (c == NULL || c->surface == NULL || IOSurfaceGetSeed(c->surface) == c->seed) {
+		return;
+	}
+	if (*active < 0) {
+		*active = active_unit();
+	}
+	glActiveTexture(GL_TEXTURE0 + u);
+	IOSurfaceRef s = c->surface;
+	copy_surface(s, GL_TEXTURE_2D, c->format, c->type, IOSurfaceGetWidth(s), IOSurfaceGetHeight(s),
+	    IOSurfaceGetBytesPerRow(s), "refresh");
+}
+
+/*
  * SWEETGL_TRACE: samplers of the current program whose texture has no level
  * 0 (unbound or never filled), once per program/unit/texture.
  */
@@ -423,6 +463,9 @@ draw_prep(void)
 			glBindTexture(GL_TEXTURE_2D, want);
 			unit_held[u] = want;
 		}
+		if (want != 0) {
+			copy_refresh(u, &active);
+		}
 	}
 	if (unit >= 0 && unit < UNITS && scale >= 0) {
 		GLuint tex = unit_rect[unit];
@@ -466,6 +509,7 @@ sgl_DeleteTextures(void *rctx, GLsizei n, const GLuint *textures)
 {
 	SGL_CUR(rctx);
 	for (GLsizei i = 0; i < n; i++) {
+		copy_forget(textures[i]);
 		for (int u = 0; u < UNITS; u++) {
 			if (unit_2d[u] == textures[i]) {
 				unit_2d[u] = 0;
@@ -575,6 +619,7 @@ sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLs
 	target = SGL_TGT(target);
 	TRACE("TexImage2D target %#x unit %d tex %u level %d ifmt %#x %dx%d fmt %#x type %#x row %d", asked,
 	    active_unit(), unit_held[active_unit()], level, internalformat, width, height, format, type, unpack_row());
+	copy_forget(unit_held[active_unit()]);
 	if (format == GL_BGRA_EXT && (internalformat == GL_RGBA || internalformat == GL_RGBA8)) {
 		internalformat = GL_BGRA_EXT;
 	}
@@ -748,6 +793,7 @@ copy_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, size_t w
 		return false;
 	}
 	GLint row = 0, align = 4, skip_rows = 0, skip_pixels = 0;
+	uint32_t seed = IOSurfaceGetSeed(s);
 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row);
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
 	glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
@@ -765,8 +811,24 @@ copy_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, size_t w
 	glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
 	glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
 	tex_size_bound(target, 0, (GLsizei)w, (GLsizei)h);
-	TRACE("%s surf %u %zux%zu pitch %zu fmt %#x/%#x copied, err %#x", why, IOSurfaceGetID(s), w, h, pitch,
-	    format, type, e);
+	GLuint tex = unit_held[active_unit()];
+	if (tex < TEXSZ_MAX) {
+		struct copied *c = &copies[tex];
+		if (c->surface != s) {
+			CFRetain(s);
+			copy_forget(tex);
+			c->surface = s;
+		}
+		c->seed = seed;
+		c->format = format;
+		c->type = type;
+	}
+	size_t lit = 0;
+	for (size_t i = bpe - 1; trace_left > 0 && i < pitch * h; i += bpe) {
+		lit += ((const uint8_t *)base)[i] != 0;
+	}
+	TRACE("%s surf %u %zux%zu pitch %zu fmt %#x/%#x copied (seed %u, %zu of %zu last bytes set), err %#x",
+	    why, IOSurfaceGetID(s), w, h, pitch, format, type, seed, lit, pitch * h / bpe, e);
 	if (e != GL_NO_ERROR) {
 		sweet_drm_log("sweetgl: %s: surface %u %zux%zu pitch %zu fmt %#x/%#x: copy error %#x", why,
 		    IOSurfaceGetID(s), w, h, pitch, format, type, e);
@@ -832,6 +894,7 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 		}
 		return false;
 	}
+	copy_forget(unit_held[active_unit()]);
 	_mesa_EGLImageTargetTexture2DOES(target, (GLeglImageOES)&img);
 	GLenum e = glGetError();
 	tex_size_bound(target, 0, (GLsizei)w, (GLsizei)h);
