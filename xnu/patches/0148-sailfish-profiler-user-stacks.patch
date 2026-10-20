@@ -1,0 +1,88 @@
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1851,9 +1851,36 @@
+ /*
+  * sweet profiler (bsd/dev/sweet_sample.c sets sweet_prof_pid): every
+  * interrupt taken while a thread of that process runs records its user pc
+- * (or counts a kernel-mode sample).
++ * (or counts a kernel-mode sample), then the callers: kernel frames tagged
++ * with their depth 1-3 in the low 2 bits, user frames (up to 32) tagged 1.
+  */
+-#define SWEET_PROF_MAX 65536
++#define SWEET_PROF_USER_FRAMES 32
++extern pmap_paddr_t mmu_uvtop(vm_offset_t va);
++extern boolean_t pmap_valid_address(pmap_paddr_t addr);
++extern vm_map_address_t phystokv(pmap_paddr_t pa);
++
++/*
++ * 16-byte user frame record {fp, lr} at va, read without faulting: AT
++ * S1E0R through the interrupted task's tables (mmu_uvtop), then the kernel's
++ * physical window, RAM only. Only called for samples taken in user mode,
++ * so no interrupted kernel code has an AT/PAR_EL1 sequence in flight.
++ */
++static inline bool
++sweet_prof_user_frame(uint64_t va, uint64_t rec[2])
++{
++	if ((va & 15) || va == 0 || va >= MACH_VM_MAX_ADDRESS) {
++		return false;
++	}
++	pmap_paddr_t pa = mmu_uvtop((vm_offset_t)va);
++	if (pa == 0 || !pmap_valid_address(pa)) {
++		return false;
++	}
++	const uint64_t *p = (const uint64_t *)phystokv(pa);
++	rec[0] = p[0];
++	rec[1] = p[1];
++	return true;
++}
++#define SWEET_PROF_MAX 262144
+ int sweet_prof_pid;
+ uint64_t sweet_prof_pc[SWEET_PROF_MAX];
+ uint32_t sweet_prof_n, sweet_prof_kernel, sweet_prof_all;
+@@ -1881,6 +1908,21 @@
+ 		sweet_prof_pc[i] = pc;
+ 	}
+ 	if (PSR64_IS_USER(get_saved_state_cpsr(state))) {
++		/* user callers: frame-pointer return addresses, tag 1 */
++		uint64_t fp = get_saved_state_fp(state), rec[2];
++		for (int d = 0; d < SWEET_PROF_USER_FRAMES && sweet_prof_user_frame(fp, rec); d++) {
++			if (rec[1] == 0) {
++				break;
++			}
++			i = os_atomic_inc_orig(&sweet_prof_n, relaxed);
++			if (i < SWEET_PROF_MAX) {
++				sweet_prof_pc[i] = (rec[1] & ~3ULL) | 1;
++			}
++			if (rec[0] <= fp) {
++				break;          /* stacks grow down: callers' frames are higher */
++			}
++			fp = rec[0];
++		}
+ 		return;
+ 	}
+ 	/*
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -84,10 +84,11 @@
+  * osfmk/arm64/sleh.c records the user pc of NAME at every interrupt that
+  * lands on one of its threads; every 20 s this prints the sample counts
+  * ("PROF ... samples N kernel K of all A", A = interrupts on any non-idle
+- * thread) and the 160 most frequent pcs, 8 per line ("PROF pc:count ...").
++ * thread) and the 640 most frequent pcs, 8 per line ("PROF pc:count ...");
++ * entries with low bits set are callers (sleh.c sweet_prof_irq).
+  * Symbolicate with the slide from an SMP/UBT/CRASH line of the same boot.
+  */
+-#define SWEET_PROF_MAX 65536
++#define SWEET_PROF_MAX 262144
+ extern int sweet_prof_pid;
+ extern uint64_t sweet_prof_pc[SWEET_PROF_MAX];
+ extern uint32_t sweet_prof_n, sweet_prof_kernel, sweet_prof_all;
+@@ -117,7 +118,7 @@
+ {
+ 	static int chan;
+ 	static uint64_t pcs[SWEET_PROF_MAX];
+-	enum { TOP = 240 };
++	enum { TOP = 640 };
+ 	static uint64_t top_pc[TOP];
+ 	static uint32_t top_n[TOP];
+ 
