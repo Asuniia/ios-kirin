@@ -56,6 +56,7 @@ struct sgl_image {
 __thread void *sgl_current;
 int sgl_check_errors;
 static int trace_left;          /* SWEETGL_TRACE=1: this many trace lines */
+static bool dump_shaders;       /* SWEETGL_TRACE=1: every shader source, no limit */
 
 #define TRACE(...) do { if (trace_left > 0) { trace_left--; sweet_drm_log("sweetgl: trace " __VA_ARGS__); } } while (0)
 
@@ -303,7 +304,7 @@ sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GLcharA
 		memmove(src + at + sizeof(rect_prelude) - 1, src + at, n - at + 1);
 		memcpy(src + at, rect_prelude, sizeof(rect_prelude) - 1);
 	}
-	if (trace_left > 0) {
+	if (dump_shaders) {
 		/* whole source, in 400-byte pieces (log lines are 512 bytes) */
 		sweet_drm_log("sweetgl: shader %u source (%zu bytes):", H(shader), strlen(src));
 		for (size_t i = 0, l = strlen(src); i < l; i += 400) {
@@ -810,6 +811,7 @@ sweetgl_eagl_install(void)
 	sgl_check_errors = e && e[0] == '1';
 	const char *t = getenv("SWEETGL_TRACE");
 	trace_left = t && t[0] == '1' ? 600 : 0;
+	dump_shaders = trace_left > 0;
 	Class cls = objc_getClass("EAGLContext");
 	if (cls == Nil) {
 		sweet_drm_log("sweetgl: no EAGLContext class");
