@@ -241,6 +241,19 @@ sgl_GetString(void *rctx, GLenum name)
 {
 	SGL_CUR(rctx);
 	const GLubyte *s = glGetString(name);
+	/*
+	 * Without framebuffer fetch CA's GL renderer drops every layer with a
+	 * blend-mode compositing filter (plusD/plusL, colorDodge, multiply,
+	 * overlay...: CC toggle circles, App Library plates, Reduce
+	 * Transparency backgrounds). Emulated below (fbfetch_*).
+	 */
+	if (name == GL_EXTENSIONS && s != NULL) {
+		static char *ext;
+		if (ext == NULL && asprintf(&ext, "%s GL_EXT_shader_framebuffer_fetch", s) < 0) {
+			ext = NULL;
+		}
+		return ext != NULL ? (const GLubyte *)ext : s;
+	}
 	if (s == NULL) {
 		sweet_drm_log("sweetgl: glGetString(%#x) = NULL (error %#x)", name, glGetError());
 	}
@@ -275,6 +288,63 @@ tex_size_bound(GLenum target, GLint level, GLsizei w, GLsizei h)
 		tex_w[tex] = (uint16_t)w;
 		tex_h[tex] = (uint16_t)h;
 	}
+}
+
+/*
+ * GL_EXT_shader_framebuffer_fetch on a GPU without it: gl_LastFragData[0]
+ * becomes a read of the framebuffer's own texture at the fragment, bound
+ * to FBFETCH_UNIT before each draw after a flush (texture barrier). Reads
+ * see the framebuffer as it was before the draw, not earlier primitives of
+ * the same draw. ponytail: CA's draws are quads that do not overlap themselves.
+ */
+#define FBFETCH_UNIT 15
+#define FBFETCH_MAX 512
+static GLuint fbfetch_shaders[FBFETCH_MAX];
+static int n_fbfetch_shaders;
+static const char fbfetch_decl[] =
+    "uniform lowp sampler2D sgl_fb;\n"
+    "uniform highp vec2 sgl_fb_scale;\n";
+static const char fbfetch_read[] = "texture2D(sgl_fb, gl_FragCoord.xy * sgl_fb_scale)";
+
+/* src without the extension, sgl_fb declared after the directives, reads replaced (src is freed) */
+static char *
+fbfetch_rewrite(char *src)
+{
+	char *ext = strstr(src, "#extension GL_EXT_shader_framebuffer_fetch");
+	for (char *e = ext; e != NULL && *e != '\n' && *e != 0; e++) {
+		*e = ' ';
+	}
+	/* after the leading preprocessor lines */
+	size_t at = 0;
+	while (src[at] == '#' || src[at] == ' ' || src[at] == '\n') {
+		char *nl = strchr(src + at, '\n');
+		if (nl == NULL) {
+			break;
+		}
+		at = (size_t)(nl - src + 1);
+	}
+	size_t reads = 0;
+	for (char *r = strstr(src, "gl_LastFragData[0]"); r != NULL; r = strstr(r + 1, "gl_LastFragData[0]")) {
+		reads++;
+	}
+	size_t n = strlen(src);
+	char *out = malloc(n + sizeof(fbfetch_decl) + reads * sizeof(fbfetch_read) + 1), *o = out;
+	memcpy(o, src, at);
+	o += at;
+	memcpy(o, fbfetch_decl, sizeof(fbfetch_decl) - 1);
+	o += sizeof(fbfetch_decl) - 1;
+	for (const char *p = src + at; *p != 0;) {
+		if (strncmp(p, "gl_LastFragData[0]", 18) == 0) {
+			memcpy(o, fbfetch_read, sizeof(fbfetch_read) - 1);
+			o += sizeof(fbfetch_read) - 1;
+			p += 18;
+		} else {
+			*o++ = *p++;
+		}
+	}
+	*o = 0;
+	free(src);
+	return out;
 }
 
 static const char rect_prelude[] =
@@ -325,6 +395,12 @@ sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GLcharA
 		size_t at = strncmp(src, "#version", 8) == 0 && strchr(src, '\n') ? (size_t)(strchr(src, '\n') - src + 1) : 0;
 		memmove(src + at + sizeof(rect_prelude) - 1, src + at, n - at + 1);
 		memcpy(src + at, rect_prelude, sizeof(rect_prelude) - 1);
+	}
+	if (strstr(src, "GL_EXT_shader_framebuffer_fetch") != NULL) {
+		src = fbfetch_rewrite(src);
+		if (n_fbfetch_shaders < FBFETCH_MAX) {
+			fbfetch_shaders[n_fbfetch_shaders++] = H(shader);
+		}
 	}
 	if (dump_shaders) {
 		/* whole source, in 400-byte pieces (log lines are 512 bytes) */
@@ -731,6 +807,81 @@ trace_vertex_color(GLint prog, GLenum itype, const void *indices, GLint first)
 	}
 }
 
+static void trace_region(const char *when);
+static void trace_draw_state(GLint prog, GLenum mode, GLsizei count);
+
+/* sampler and scale locations + 1 of programs with an fbfetch shader (0: none) */
+static GLint fbfetch_sampler[PROG_MAX], fbfetch_scale[PROG_MAX];
+static bool fbfetch_pending;    /* trace the region after this draw */
+
+static void
+fbfetch_link(GLuint program)
+{
+	GLuint attached[8];
+	GLsizei na = 0;
+	if (program >= PROG_MAX) {
+		return;
+	}
+	fbfetch_sampler[program] = fbfetch_scale[program] = 0;
+	glGetAttachedShaders(program, 8, &na, attached);
+	for (GLsizei a = 0; a < na; a++) {
+		for (int i = 0; i < n_fbfetch_shaders; i++) {
+			if (fbfetch_shaders[i] == attached[a]) {
+				fbfetch_sampler[program] = glGetUniformLocation(program, "sgl_fb") + 1;
+				fbfetch_scale[program] = glGetUniformLocation(program, "sgl_fb_scale") + 1;
+				return;
+			}
+		}
+	}
+}
+
+/* before a draw of an fbfetch program: the framebuffer's texture on FBFETCH_UNIT, flushed */
+static void
+fbfetch_bind(GLint prog)
+{
+	GLint fb = 0, type = 0, att = 0, w = 0, h = 0, active = GL_TEXTURE0;
+	if (prog <= 0 || prog >= PROG_MAX || fbfetch_sampler[prog] == 0) {
+		return;
+	}
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+	if (fb == 0) {
+		return;
+	}
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &att);
+	if (type != GL_TEXTURE || att <= 0) {
+		return;
+	}
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+	glActiveTexture(GL_TEXTURE0 + FBFETCH_UNIT);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)att);
+	unit_held[FBFETCH_UNIT] = (GLuint)att;
+	if (att < TEXSZ_MAX && tex_w[att] > 0) {
+		w = tex_w[att];
+		h = tex_h[att];
+	} else {
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+	}
+	glActiveTexture((GLenum)active);
+	glUniform1i(fbfetch_sampler[prog] - 1, FBFETCH_UNIT);
+	if (fbfetch_scale[prog] > 0) {
+		glUniform2f(fbfetch_scale[prog] - 1, w > 0 ? 1.0f / (GLfloat)w : 1.0f, h > 0 ? 1.0f / (GLfloat)h : 1.0f);
+	}
+	_mesa_TextureBarrierNV();
+	/* SWEETGL_TRACE: the first draws of each fbfetch program, wherever they happen */
+	static uint8_t traced[PROG_MAX];
+	if (trace_left > 0 && win_left == 0 && traced[prog] < 12) {
+		traced[prog]++;
+		TRACE("fbfetch draw %d of prog %d: fb %d texture %d %dx%d", traced[prog], prog, fb, att, w, h);
+		trace_draw_state(prog, 0, 0);
+		trace_region("before");
+		fbfetch_pending = true;
+	}
+}
+
 /* before a draw: each unit holds what the program samples there, rect scale set */
 static bool
 draw_prep(GLenum mode, GLsizei count)
@@ -782,6 +933,7 @@ draw_prep(GLenum mode, GLsizei count)
 	if (active >= 0) {
 		glActiveTexture(GL_TEXTURE0 + active);
 	}
+	fbfetch_bind(prog);
 	feedback_barrier(prog);
 	if (prog != 0 && window_draw()) {
 		trace_empty_samplers(prog);
@@ -853,6 +1005,10 @@ sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count)
 		trace_vertex_color(prog, 0, NULL, first);
 	}
 	glDrawArrays(mode, first, count);
+	if (fbfetch_pending) {
+		fbfetch_pending = false;
+		trace_region("after");
+	}
 	if (fresh) {
 		GLint prog = 0;
 		glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
@@ -873,6 +1029,10 @@ sgl_DrawElements(void *rctx, GLenum mode, GLsizei count, GLenum type, const void
 		trace_vertex_color(prog, type, ebuf == 0 ? indices : NULL, 0);
 	}
 	glDrawElements(mode, count, type, indices);
+	if (fbfetch_pending) {
+		fbfetch_pending = false;
+		trace_region("after");
+	}
 	if (fresh) {
 		GLint prog = 0;
 		glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
@@ -909,6 +1069,7 @@ sgl_LinkProgramARB(void *rctx, GLhandleARB program)
 	glGetProgramiv(H(program), GL_LINK_STATUS, &ok);
 	if (ok) {
 		rect_link(H(program));
+		fbfetch_link(H(program));
 	}
 	if (dump_shaders) {
 		GLuint sh[4] = {0};
