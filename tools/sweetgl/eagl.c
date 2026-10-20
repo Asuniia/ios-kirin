@@ -402,6 +402,7 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	}
 	uint32_t handle = 0;
 	uint64_t size = 0;
+	const char *step = img.format == PIPE_FORMAT_NONE ? "format" : "kernel import";
 	if (img.format != PIPE_FORMAT_NONE &&
 	    sweet_drm_import_iosurface(IOSurfaceGetID(s), (uint64_t)(uintptr_t)IOSurfaceGetBaseAddress(s),
 	    &handle, &size) == 0) {
@@ -423,13 +424,14 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 			.modifier = DRM_FORMAT_MOD_LINEAR,
 		};
 		/* takes over the handle: closed with the resource, or now on failure */
+		step = "mesa layout";
 		img.res = screen->resource_from_handle(screen, &templ, &wh, PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
 	}
 	if (img.res == NULL) {
 		if (logged++ < 50) {
-			sweet_drm_log("sweetgl: %s: surface %u %c%c%c%c %zux%zu pitch %zu plane %u: import failed",
+			sweet_drm_log("sweetgl: %s: surface %u %c%c%c%c %zux%zu pitch %zu plane %u: %s failed",
 			    why, IOSurfaceGetID(s), fourcc >> 24, (fourcc >> 16) & 0xff, (fourcc >> 8) & 0xff,
-			    fourcc & 0xff, w, h, pitch, plane);
+			    fourcc & 0xff, w, h, pitch, plane, step);
 		}
 		return false;
 	}

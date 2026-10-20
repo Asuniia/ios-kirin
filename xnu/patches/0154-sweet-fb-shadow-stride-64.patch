@@ -1,0 +1,30 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -239,6 +239,9 @@
+ }
+ 
+ /* Pixel 1: keep the panel aside, give the rest of the driver a 750x1334 BGRA surface. */
++/* rows padded to 64 bytes: the GPU renders into it (Adreno 5xx pitch) */
++#define SWEET_FB_P1_STRIDE      ((SWEET_FB_P1_W * 4 + 63) & ~63)
++
+ bool
+ AppleCLCD::startScaled(void)
+ {
+@@ -248,7 +251,7 @@
+ 	fPanel = ml_io_map_wcomb((vm_offset_t)fPhys, (vm_size_t)fRowBytes * fHeight);
+ 	fShadow = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+-	    round_page(SWEET_FB_P1_W * 4 * SWEET_FB_P1_H), 0xFFFFFFFFFULL & ~(uint64_t)PAGE_MASK);
++	    round_page(SWEET_FB_P1_STRIDE * SWEET_FB_P1_H), 0xFFFFFFFFFULL & ~(uint64_t)PAGE_MASK);
+ 	fRow = (uint8_t *)IOMallocData(SWEET_FB_P1_W * 4);
+ 	fOut = (uint8_t *)IOMallocData(fPanelW * 3);
+ 	fXmap = (uint32_t *)IOMallocData(fPanelW * sizeof(uint32_t));
+@@ -259,7 +262,7 @@
+ 	fPhys = fShadow->getPhysicalAddress();
+ 	fWidth = SWEET_FB_P1_W;
+ 	fHeight = SWEET_FB_P1_H;
+-	fRowBytes = SWEET_FB_P1_W * 4;
++	fRowBytes = SWEET_FB_P1_STRIDE;
+ 	fScaled = true;
+ 	return true;
+ }

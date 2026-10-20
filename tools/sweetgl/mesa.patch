@@ -30,23 +30,19 @@ index e8f01b8..a6c37f9 100644
  endif
  
 diff --git a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gallium/drivers/freedreno/freedreno_resource.c
-index 29134ba..e6423e3 100644
+index 29134ba..0c3fdbb 100644
 --- a/src/gallium/drivers/freedreno/freedreno_resource.c
 +++ b/src/gallium/drivers/freedreno/freedreno_resource.c
-@@ -1601,6 +1601,16 @@ fd_resource_from_handle(struct pipe_screen *pscreen,
-       goto fail;
-    }
+@@ -1745,6 +1745,12 @@ fd_layout_resource_for_handle(struct fd_resource *rsc, struct winsys_handle *han
+    else
+       rsc->layout.pitchalign = MAX2(rsc->layout.pitchalign, 5);
  
 +#ifdef __APPLE__
-+   if (rsc->layout.pitch0 != handle->stride && !rsc->layout.tile_mode &&
-+       !rsc->layout.ubwc && tmpl->last_level == 0 && handle->stride % 64 == 0 &&
-+       handle->stride >= tmpl->width0 * rsc->layout.cpp) {
++   if (is_a5xx(screen) && handle->modifier == DRM_FORMAT_MOD_LINEAR &&
++       handle->stride % 64 == 0)
 +      rsc->layout.pitchalign = 6;
-+      rsc->layout.pitch0 = handle->stride;
-+      rsc->layout.slices[0].size0 = handle->stride * tmpl->height0;
-+      rsc->layout.layer_size = rsc->layout.slices[0].size0;
-+   }
 +#endif
-    if (rsc->layout.pitch0 != handle->stride) {
-       if (FD_DBG(LAYOUT))
-          mesa_loge("invalid pitch (%u vs %u) for: %" PRSC_FMT, rsc->layout.pitch0,
++
+    if (rsc->layout.pitch0 < (prsc->width0 * rsc->layout.cpp) ||
+        fd_resource_pitch(rsc, 0) != rsc->layout.pitch0)
+       return false;
