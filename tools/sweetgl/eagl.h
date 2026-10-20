@@ -55,6 +55,8 @@ void sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GL
 void sgl_BindTexture(void *rctx, GLenum target, GLuint texture);
 void sgl_TexSubImage2D(void *rctx, GLenum target, GLint level, GLint x, GLint y, GLsizei width,
     GLsizei height, GLenum format, GLenum type, const void *pixels);
+void sgl_FramebufferTexture2DEXT(void *rctx, GLenum target, GLenum attachment, GLenum textarget, GLuint texture,
+    GLint level);
 void sgl_DeleteTextures(void *rctx, GLsizei n, const GLuint *textures);
 void sgl_PixelStorei(void *rctx, GLenum pname, GLint param);
 void sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count);

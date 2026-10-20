@@ -589,6 +589,17 @@ sgl_LinkProgramARB(void *rctx, GLhandleARB program)
 	}
 }
 
+void
+sgl_FramebufferTexture2DEXT(void *rctx, GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level)
+{
+	SGL_CUR(rctx);
+	GLint fb = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+	TRACE("FramebufferTexture2D fb %d attachment %#x tex %u", fb, attachment, texture);
+	glFramebufferTexture2D(target, attachment, textarget == 0x84F5 ? GL_TEXTURE_2D : textarget, texture, level);
+	SGL_POST(677);
+}
+
 static GLint
 unpack_row(void)
 {
@@ -823,12 +834,17 @@ copy_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, size_t w
 		c->format = format;
 		c->type = type;
 	}
-	size_t lit = 0;
-	for (size_t i = bpe - 1; trace_left > 0 && i < pitch * h; i += bpe) {
-		lit += ((const uint8_t *)base)[i] != 0;
+	size_t lit = 0, any = 0;
+	const uint8_t *b8 = base, *mid = b8 + (h / 2) * pitch;
+	for (size_t i = 0; trace_left > 0 && i < pitch * h; i++) {
+		lit += i % bpe == bpe - 1 && b8[i] != 0;
+		any += b8[i] != 0;
 	}
-	TRACE("%s surf %u %zux%zu pitch %zu fmt %#x/%#x copied (seed %u, %zu of %zu last bytes set), err %#x",
-	    why, IOSurfaceGetID(s), w, h, pitch, format, type, seed, lit, pitch * h / bpe, e);
+	TRACE("%s surf %u tex %u %zux%zu pitch %zu fmt %#x/%#x copied (seed %u, %zu of %zu last bytes set, %zu bytes set, "
+	    "mid row %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x), err %#x",
+	    why, IOSurfaceGetID(s), tex, w, h, pitch, format, type, seed, lit, pitch * h / bpe, any,
+	    mid[0], mid[1], mid[2], mid[3], mid[4], mid[5], mid[6], mid[7], mid[8], mid[9], mid[10], mid[11],
+	    mid[12], mid[13], mid[14], mid[15], e);
 	if (e != GL_NO_ERROR) {
 		sweet_drm_log("sweetgl: %s: surface %u %zux%zu pitch %zu fmt %#x/%#x: copy error %#x", why,
 		    IOSurfaceGetID(s), w, h, pitch, format, type, e);
