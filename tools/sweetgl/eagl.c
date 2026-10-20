@@ -188,6 +188,9 @@ void
 sgl_DiscardFramebufferEXT(void *rctx, GLenum target, GLsizei n, const GLenum *attachments)
 {
 	SGL_CUR(rctx);
+	GLint fb = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+	TRACE("DiscardFramebuffer fb %d n %d first %#x", fb, n, n > 0 ? attachments[0] : 0);
 	glInvalidateFramebuffer(target, n, attachments);
 }
 
@@ -439,6 +442,61 @@ trace_empty_samplers(GLint prog)
 	}
 }
 
+extern void _mesa_TextureBarrierNV(void);
+
+/*
+ * CA reads the destination by sampling the texture it is rendering into
+ * (Apple's GPUs return what memory held when the pass began). A flush
+ * first makes the earlier draws visible to the sampler; without it the
+ * read came back empty (App Library pods, CC tiles, vibrant glyphs).
+ * ponytail: sampler units per program read once (CA sets them at link).
+ */
+#define PROG_MAX 4096
+static uint16_t prog_units[PROG_MAX];   /* bit u: a sampler reads unit u; bit 15: known */
+
+static void
+feedback_barrier(GLint prog)
+{
+	GLint fb = 0, att = 0, type = 0;
+	if (prog <= 0 || prog >= PROG_MAX) {
+		return;
+	}
+	if (!(prog_units[prog] & 0x8000)) {
+		uint16_t m = 0x8000;
+		GLint n = 0;
+		glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &n);
+		for (GLint i = 0; i < n; i++) {
+			char name[64];
+			GLint size = 0, unit = 0;
+			GLenum t = 0;
+			glGetActiveUniform(prog, i, sizeof(name), NULL, &size, &t, name);
+			if (t == GL_SAMPLER_2D) {
+				glGetUniformiv(prog, glGetUniformLocation(prog, name), &unit);
+				m |= unit >= 0 && unit < 15 ? 1u << unit : 0;
+			}
+		}
+		prog_units[prog] = m;
+	}
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+	if (fb == 0) {
+		return;
+	}
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+	if (type != GL_TEXTURE) {
+		return;
+	}
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &att);
+	for (int u = 0; u < 15; u++) {
+		if ((prog_units[prog] & 1u << u) && unit_held[u] == (GLuint)att) {
+			TRACE("feedback: prog %d samples fb %d's texture %d on unit %d: barrier", prog, fb, att, u);
+			_mesa_TextureBarrierNV();
+			return;
+		}
+	}
+}
+
 /* SWEETGL_TRACE: each distinct draw state once (program, blend, stencil, depth, target) */
 static bool
 trace_draw_state(GLint prog, GLenum mode, GLsizei count)
@@ -561,6 +619,7 @@ draw_prep(GLenum mode, GLsizei count)
 	if (active >= 0) {
 		glActiveTexture(GL_TEXTURE0 + active);
 	}
+	feedback_barrier(prog);
 	if (trace_left > 0 && prog != 0) {
 		trace_empty_samplers(prog);
 		fresh = trace_draw_state(prog, mode, count);
@@ -706,6 +765,26 @@ sgl_TexParameteri(void *rctx, GLenum target, GLenum pname, GLint param)
 	}
 	glTexParameteri(target, pname, param);
 	SGL_POST(304);
+}
+
+void
+sgl_Clear(void *rctx, GLbitfield mask)
+{
+	SGL_CUR(rctx);
+	GLint fb = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+	TRACE("Clear fb %d mask %#x", fb, mask);
+	glClear(mask);
+	SGL_POST(10);
+}
+
+void
+sgl_BindFramebufferEXT(void *rctx, GLenum target, GLuint framebuffer)
+{
+	SGL_CUR(rctx);
+	TRACE("BindFramebuffer %u", framebuffer);
+	glBindFramebuffer(target, framebuffer);
+	SGL_POST(672);
 }
 
 static GLint
