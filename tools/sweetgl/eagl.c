@@ -236,6 +236,24 @@ static struct { GLuint shader; char sampler[32]; } rect_shaders[RECT_MAX];
 static struct { GLuint program; GLint scale, sampler; } rect_programs[RECT_MAX];
 static int n_rect_shaders, n_rect_programs;
 
+/* level-0 sizes of 2D textures as created through us (rect scales without GL queries) */
+#define TEXSZ_MAX 8192
+static uint16_t tex_w[TEXSZ_MAX], tex_h[TEXSZ_MAX];
+
+static void
+tex_size_bound(GLenum target, GLint level, GLsizei w, GLsizei h)
+{
+	GLint tex = 0;
+	if (level != 0 || SGL_TGT(target) != GL_TEXTURE_2D) {
+		return;
+	}
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+	if (tex > 0 && tex < TEXSZ_MAX) {
+		tex_w[tex] = (uint16_t)w;
+		tex_h[tex] = (uint16_t)h;
+	}
+}
+
 static const char rect_prelude[] =
     "#define sampler2DRect sampler2D\n"
     "#define texture2DRect(s, c) texture2D(s, (c) * sgl_rect_scale)\n"
@@ -325,13 +343,20 @@ rect_fixup(void)
 		if (rect_programs[i].sampler >= 0) {
 			glGetUniformiv(prog, rect_programs[i].sampler, &unit);
 		}
+		GLint tex = 0;
 		glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
 		glActiveTexture(GL_TEXTURE0 + unit);
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+		GLenum qe = glGetError();
 		glActiveTexture(active);
+		if ((w <= 0 || h <= 0) && tex > 0 && tex < TEXSZ_MAX) {
+			w = tex_w[tex];
+			h = tex_h[tex];
+		}
 		glUniform2f(rect_programs[i].scale, w > 0 ? 1.0f / w : 1.0f, h > 0 ? 1.0f / h : 1.0f);
-		TRACE("rect program %d unit %d texture %dx%d", prog, unit, w, h);
+		TRACE("rect program %d unit %d tex %d %dx%d (query error %#x)", prog, unit, tex, w, h, qe);
 		return;
 	}
 }
@@ -413,6 +438,7 @@ sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLs
 	}
 	glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
 	SGL_POST(301);
+	tex_size_bound(target, level, width, height);
 }
 
 /*
@@ -594,6 +620,7 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 	}
 	_mesa_EGLImageTargetTexture2DOES(target, (GLeglImageOES)&img);
 	GLenum e = glGetError();
+	tex_size_bound(target, 0, (GLsizei)w, (GLsizei)h);
 	pipe_resource_reference(&img.res, NULL);
 	if (trace_left > 0) {
 		const uint8_t *base = IOSurfaceGetBaseAddress(s);
