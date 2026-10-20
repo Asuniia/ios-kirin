@@ -1,0 +1,22 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2113,9 +2113,16 @@
+ 	/* 1. Read-only state. */
+ 	uint8_t s2[7] = {0};
+ 	static const uint8_t s2regs[7] = {0x04, 0x05, 0x08, 0x40, 0x41, 0x45, 0x46};
+-	bool s2ok = true;
+-	for (int i = 0; i < 7; i++) {
+-		s2ok = s2ok && sweet_pmic_read(GFX_S2, s2regs[i], &s2[i]);
++	bool s2ok = false;
++	/* the first answers can be partial (0160d: type 00): read again a few times */
++	for (int attempt = 0; attempt < 10 && !(s2ok && s2[0] == 0x1c); attempt++) {
++		if (attempt > 0) {
++			gpu_sleep(1);
++		}
++		s2ok = true;
++		for (int i = 0; i < 7; i++) {
++			s2ok = s2ok && sweet_pmic_read(GFX_S2, s2regs[i], &s2[i]);
++		}
+ 	}
+ 	printf("SWEET GPU: S2 %s type %02x subtype %02x status %02x range %02x vset %02x (%u) mode %02x en %02x; mem-acc %08x\n",
+ 	    s2ok ? "ok" : "UNREADABLE", s2[0], s2[1], s2[2], s2[3], s2[4], s2[4], s2[5], s2[6],
