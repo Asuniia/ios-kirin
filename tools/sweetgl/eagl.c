@@ -349,13 +349,18 @@ fbfetch_rewrite(char *src)
 }
 
 /*
- * CA's GL renderer has no tex_fragment_shaders entry for its vibrant color
- * matrix (texture function 0x2d, render_vibrant_color_matrix): those layers
- * (Control Center off circles, App Library plates) were never composited.
- * sgl_install_vcm() points the entry at "sgl_vcm(s0)"; this adds the
- * function: the SW renderer's tex_vibrant_color_matrix, i.e. the destination
- * through the colour matrix (color_matrix[0..3] columns, [4] bias, on
- * unpremultiplied colour) mixed in by the source's alpha.
+ * Texture functions CA's GL renderer has no tex_fragment_shaders entry for
+ * (create_shader fails, the draw is dropped); sgl_install_texfns() points
+ * the entries at these calls and the functions are added here. Both use
+ * color_matrix[0..3] (input r, g, b, a columns) + [4] (bias).
+ * 0x2d (render_vibrant_color_matrix: Control Center off circles, App
+ * Library plates): the SW renderer's tex_vibrant_color_matrix, i.e. the
+ * destination through the matrix (unpremultiplied) mixed in by the
+ * source's alpha.
+ * 0x14 (color_matrix_function for a matrix filter without its premultiply
+ * flag, next to 0x13 colorMatrix4x4Bias): the matrix on the premultiplied
+ * colour as is (CA asks for the full rect then: the bias lights up
+ * transparent pixels). SW has neither (no-op there).
  */
 static const char vcm_func[] =
     "lowp vec4 sgl_vcm(lowp vec4 s) {\n"
@@ -366,23 +371,36 @@ static const char vcm_func[] =
     "  u.rgb *= u.a;\n"
     "  return mix(d, d.a > 0. ? u : vec4(0.), s.a);\n"
     "}\n";
+static const char cm4_func[] =
+    "lowp vec4 sgl_cm4(lowp vec4 s) {\n"
+    "  lowp vec4 u = clamp(s.r * color_matrix[0] + s.g * color_matrix[1] + s.b * color_matrix[2]\n"
+    "    + s.a * color_matrix[3] + color_matrix[4], 0., 1.);\n"
+    "  return vec4(min(u.rgb, u.a), u.a);\n"
+    "}\n";
 
-/* vcm_func (and color_matrix if undeclared) before main (src is freed) */
+/* the sgl_ texture functions src calls (and color_matrix if undeclared) before main (src is freed) */
 static char *
-vcm_rewrite(char *src)
+texfn_rewrite(char *src)
 {
-	const char *decl = strstr(src, " color_matrix[5];") ? "" : "uniform lowp vec4 color_matrix[5];\n";
 	char *at = strstr(src, "void main");
 	if (at == NULL) {
 		return src;
 	}
-	size_t n = strlen(src), dl = strlen(decl);
-	char *out = malloc(n + dl + sizeof(vcm_func));
-	size_t pre = (size_t)(at - src);
-	memcpy(out, src, pre);
-	memcpy(out + pre, decl, dl);
-	memcpy(out + pre + dl, vcm_func, sizeof(vcm_func) - 1);
-	memcpy(out + pre + dl + sizeof(vcm_func) - 1, at, n - pre + 1);
+	const char *parts[3] = {
+	    strstr(src, " color_matrix[5];") ? "" : "uniform lowp vec4 color_matrix[5];\n",
+	    strstr(src, "sgl_vcm(") ? vcm_func : "", strstr(src, "sgl_cm4(") ? cm4_func : ""};
+	size_t n = strlen(src), pre = (size_t)(at - src), add = 0;
+	for (int i = 0; i < 3; i++) {
+		add += strlen(parts[i]);
+	}
+	char *out = malloc(n + add + 1), *o = out;
+	memcpy(o, src, pre);
+	o += pre;
+	for (int i = 0; i < 3; i++) {
+		memcpy(o, parts[i], strlen(parts[i]));
+		o += strlen(parts[i]);
+	}
+	memcpy(o, at, n - pre + 1);
 	free(src);
 	return out;
 }
@@ -436,8 +454,8 @@ sgl_ShaderSourceARB(void *rctx, GLhandleARB shader, GLsizei count, const GLcharA
 		memmove(src + at + sizeof(rect_prelude) - 1, src + at, n - at + 1);
 		memcpy(src + at, rect_prelude, sizeof(rect_prelude) - 1);
 	}
-	if (strstr(src, "sgl_vcm(") != NULL) {
-		src = vcm_rewrite(src);
+	if (strstr(src, "sgl_vcm(") != NULL || strstr(src, "sgl_cm4(") != NULL) {
+		src = texfn_rewrite(src);
 	}
 	if (strstr(src, "GL_EXT_shader_framebuffer_fetch") != NULL || strstr(src, "gl_LastFragData") != NULL) {
 		src = fbfetch_rewrite(src);
@@ -2036,12 +2054,16 @@ sgl_install_fmt_hook(void)
 }
 
 /*
- * QuartzCore (dsc-8) GL renderer fix, see vcm_func: tex_fragment_shaders[0x2d]
- * = "sgl_vcm(s0)", and create_shader's per-function uniform switch (byte
- * table, index function - 0x11) looks up color_matrix for 0x2d like for
- * colorMatrix4x4Bias (0x13, case 0) instead of nothing (case 0xde).
+ * QuartzCore (dsc-8) GL renderer fixes, see vcm_func: tex_fragment_shaders
+ * (0x1d5b44a10) entries, and create_shader's per-function uniform switch
+ * (byte table 0x18855a1e4, index function - 0x11) set to look up
+ * color_matrix like for colorMatrix4x4Bias (0x13, case 0) instead of
+ * nothing (case 0xde).
  */
-static const char vcm_expr[] = "sgl_vcm(s0)";
+static const struct {
+	uint8_t fn;
+	const char *expr;
+} sgl_texfns[] = {{0x2d, "sgl_vcm(s0)"}, {0x14, "sgl_cm4(s0)"}};
 
 static bool
 sgl_write_const(void *at, const void *val, size_t len, vm_prot_t back)
@@ -2057,7 +2079,7 @@ sgl_write_const(void *at, const void *val, size_t len, vm_prot_t back)
 }
 
 static void
-sgl_install_vcm(void)
+sgl_install_texfns(void)
 {
 	size_t len = 0;
 	const uint8_t *cache = _dyld_get_shared_cache_range(&len);
@@ -2065,20 +2087,23 @@ sgl_install_vcm(void)
 		return;
 	}
 	uint64_t slide = (uint64_t)(uintptr_t)cache - 0x180000000ull;
-	const char **entry = (const char **)(uintptr_t)(0x1d5b44a10ull + 0x2d * 8 + slide);
-	uint8_t *cases = (uint8_t *)(uintptr_t)(0x18855a1e4ull + (0x2d - 0x11) + slide);
-	const char *e13 = *(const char **)(uintptr_t)(0x1d5b44a10ull + 0x13 * 8 + slide);
-	if (*entry != NULL || *cases != 0xde || cases[0x13 - 0x2d] != 0 || e13 == NULL ||
-	    strcmp(e13, "colorMatrix4x4Bias(s0)") != 0) {
-		sweet_drm_log("sweetgl: vcm fix: unexpected QuartzCore (%p %#x), not installed", (void *)*entry, *cases);
+	const char **table = (const char **)(uintptr_t)(0x1d5b44a10ull + slide);
+	uint8_t *cases = (uint8_t *)(uintptr_t)(0x18855a1e4ull - 0x11 + slide);
+	if (table[0x13] == NULL || strcmp(table[0x13], "colorMatrix4x4Bias(s0)") != 0 || cases[0x13] != 0) {
+		sweet_drm_log("sweetgl: texture function fixes: unexpected QuartzCore, not installed");
 		return;
 	}
-	const char *expr = vcm_expr;
-	uint8_t zero = 0;
-	bool ok = sgl_write_const(entry, &expr, sizeof(expr), VM_PROT_READ) &&
-	    sgl_write_const(cases, &zero, 1, VM_PROT_READ | VM_PROT_EXECUTE);
-	sys_icache_invalidate(cases, 1);
-	sweet_drm_log("sweetgl: vcm fix %s", ok ? "installed" : "FAILED");
+	for (size_t i = 0; i < sizeof(sgl_texfns) / sizeof(sgl_texfns[0]); i++) {
+		uint8_t fn = sgl_texfns[i].fn, zero = 0;
+		if (table[fn] != NULL || cases[fn] != 0xde) {
+			sweet_drm_log("sweetgl: texture function %#x: unexpected (%p %#x), not installed", fn,
+			    (void *)table[fn], cases[fn]);
+			continue;
+		}
+		bool ok = sgl_write_const(&table[fn], &sgl_texfns[i].expr, sizeof(char *), VM_PROT_READ) &&
+		    sgl_write_const(&cases[fn], &zero, 1, VM_PROT_READ | VM_PROT_EXECUTE);
+		sweet_drm_log("sweetgl: texture function %#x = %s: %s", fn, sgl_texfns[i].expr, ok ? "installed" : "FAILED");
+	}
 }
 
 /* Called at load. CA picks its GLES renderer by itself once initWithAPI:3 succeeds. */
@@ -2090,7 +2115,7 @@ sweetgl_eagl_install(void)
 	const char *t = getenv("SWEETGL_TRACE");
 	trace_left = t && t[0] == '1' ? 20000 : 0;
 	dump_shaders = trace_left > 0;
-	sgl_install_vcm();
+	sgl_install_texfns();
 	if (trace_left > 0) {
 		sgl_install_fmt_hook();
 	}
