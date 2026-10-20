@@ -1,0 +1,177 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1339,7 +1339,7 @@
+ /* Service mode (sweetgpu=8). */
+ static bool g_ready;
+ static vm_offset_t g_gpu, g_scratch_va;
+-static uint64_t g_scratch, g_ksample;
++static uint64_t g_scratch, g_ksample4;
+ static uint32_t g_seq = 0x10000;
+ 
+ bool
+@@ -1380,25 +1380,29 @@
+ 	uint64_t drow = q->dst_va + (uint64_t)q->y0 * q->dst_pitch, drows = (uint64_t)q->h * q->dst_pitch;
+ 	vm_cache((uint32_t)sf, q->src_va, slen);
+ 	vm_cache((uint32_t)df, drow, drows);
+-	uint32_t consts[16] = {
++	/* sample4.asm: 4 pixels per invocation from xa = x0 rounded down to 4 */
++	uint32_t xa = q->x0 & ~3u, groups = (q->x0 + q->w - xa + 3) / 4;
++	uint32_t consts[32] = {
+ 		q->m[0], q->m[1], q->m[2], q->m[3],
+ 		q->m[4], q->m[5], q->opacity, 0x3f800000u,
+-		0x437f0000u, 0x3f000000u, q->w - 1, q->dst_pitch / 4,
+-		q->x0, q->y0,
++		0x437f0000u, 0x3f000000u, groups - 1, q->dst_pitch / 4,
++		xa, q->y0,
+ 		q->flags & (SWEET_GPU_QUAD_ADD | SWEET_GPU_QUAD_COPY) ? 0 : 0x3f800000u,        /* k0 */
+-		q->flags & SWEET_GPU_QUAD_COPY ? 0 : 0x3f800000u,                               /* k1 */
++		q->flags & SWEET_GPU_QUAD_COPY ? 0xbf800000u : 0,                               /* k1 - 1 */
++		q->x0, q->x0 + q->w, 0xbf800000u, 0,
+ 	};
+ 	uint32_t tex[24], samp[8];
+ 	tex_rgba8(tex, q->src_va, q->src_w, q->src_h, q->src_pitch);
+-	tex_rgba8(tex + 12, q->dst_va, q->dst_w, q->dst_h, q->dst_pitch);
++	/* the whole pitch: groups at the right edge read (and keep) the padding */
++	tex_rgba8(tex + 12, q->dst_va, q->dst_pitch / 4, q->dst_h, q->dst_pitch);
+ 	samp_unnorm(samp, !(q->flags & SWEET_GPU_QUAD_NEAREST));
+ 	samp_unnorm(samp + 4, false);
+-	struct cs_extra x = {consts, 4, tex, samp, 2, q->h};
++	struct cs_extra x = {consts, 8, tex, samp, 2, q->h};
+ 	uint64_t bufs[1] = {q->dst_va};
+ 	uint32_t sizes[1] = {(uint32_t)dlen};
+ 	uint32_t seq = ++g_seq;
+ 	volatile uint32_t *fv = (volatile uint32_t *)(g_scratch_va + 64);
+-	bool read = compute_run(g_gpu, &k_sample, g_ksample, bufs, sizes, (q->w + 63) / 64, g_scratch + 64, seq, &x);
++	bool read = compute_run(g_gpu, &k_sample4, g_ksample4, bufs, sizes, (groups + 63) / 64, g_scratch + 64, seq, &x);
+ 	/*
+ 	 * Spin on the fence: delay() sleeps on a timer, and with the CPUs busy
+ 	 * drawing the wakeup came ms late (64x64 quads took 7 ms, 0140a).
+@@ -1434,31 +1438,44 @@
+ 	for (uint32_t i = 0; i < 64 * 64; i++) {
+ 		s[i] = src_px(i % 64, i / 64);
+ 	}
+-	for (uint32_t i = 0; i < 128 * 128; i++) {
+-		d[i] = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
+-	}
+ 	struct sweet_gpu_quad q = {
+ 		.src_va = src, .dst_va = dst,
+ 		.src_w = 64, .src_h = 64, .src_pitch = 256,
+ 		.dst_w = 128, .dst_h = 128, .dst_pitch = 512,
+-		.x0 = 16, .y0 = 16, .w = 64, .h = 64,
+-		.m = {0x3f800000u, 0, 0, 0x3f800000u, 0xc1800000u, 0xc1800000u},
++		.y0 = 16, .h = 64,
++		.m = {0x3f800000u, 0, 0, 0x3f800000u, 0, 0xc1800000u},
+ 		.opacity = 0x3f800000u,
+ 	};
+-	uint64_t t0 = mach_absolute_time();
+-	int r = sweet_gpu_quad(&q);
+-	uint64_t t1 = mach_absolute_time();
++	/* source-over at x0 16 (4-aligned), source-over and copy at x0 13, w 61 */
++	static const struct { uint32_t x0, w, tx, flags; } t[3] = {
++		{16, 64, 0xc1800000u, 0}, {13, 61, 0xc1500000u, 0}, {13, 61, 0xc1500000u, SWEET_GPU_QUAD_COPY},
++	};
++	int r = 0;
+ 	uint32_t bad = 0;
+-	for (uint32_t i = 0; i < 128 * 128; i++) {
+-		uint32_t px = i % 128, py = i / 128;
+-		uint32_t dd = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
+-		bool in = px >= 16 && px < 80 && py >= 16 && py < 80;
+-		uint32_t want = in ? blend_ref(src_px(px - 16, py - 16), dd) : dd;
+-		for (int c = 0; c < 32; c += 8) {
+-			int df = (int)((d[i] >> c) & 0xff) - (int)((want >> c) & 0xff);
+-			if (df > 1 || df < -1) {
+-				bad++;
+-				break;
++	uint64_t t0 = 0, t1 = 0;
++	for (int k = 0; k < 3; k++) {
++		for (uint32_t i = 0; i < 128 * 128; i++) {
++			d[i] = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++		}
++		q.x0 = t[k].x0, q.w = t[k].w, q.m[4] = t[k].tx, q.flags = t[k].flags;
++		uint64_t a0 = mach_absolute_time();
++		int rk = sweet_gpu_quad(&q);
++		if (k == 0) {
++			t0 = a0, t1 = mach_absolute_time();
++		}
++		r = r ? r : rk;
++		for (uint32_t i = 0; i < 128 * 128; i++) {
++			uint32_t px = i % 128, py = i / 128;
++			uint32_t dd = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++			bool in = px >= t[k].x0 && px < t[k].x0 + t[k].w && py >= 16 && py < 80;
++			uint32_t sp = in ? src_px(px - t[k].x0, py - 16) : 0;
++			uint32_t want = !in ? dd : t[k].flags ? sp : blend_ref(sp, dd);
++			for (int c = 0; c < 32; c += 8) {
++				int df = (int)((d[i] >> c) & 0xff) - (int)((want >> c) & 0xff);
++				if (df > 1 || df < -1) {
++					bad++;
++					break;
++				}
+ 			}
+ 		}
+ 	}
+@@ -1670,8 +1687,8 @@
+ 		gpu_wait(2);
+ 		if (level >= 8) {
+ 			(void)gfx_clock(3);     /* 300 MHz */
+-			g_ksample = kernel_page(&k_sample);
+-			if (g_ksample == 0 || !vm_init(smmu)) {
++			g_ksample4 = kernel_page(&k_sample4);
++			if (g_ksample4 == 0 || !vm_init(smmu)) {
+ 				printf("SWEET GPU: service bring-up FAILED\n");
+ 				return;
+ 			}
+--- a/bsd/dev/sweet_gpu_shaders.h
++++ b/bsd/dev/sweet_gpu_shaders.h
+@@ -90,3 +90,52 @@
+ 	.double_threadsize = 0, .branchstack = 0,
+ 	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 1,
+ };
++/* k_sample4: generated by tools/ir3asm from tools/gpu-shaders/sample4.asm */
++static const uint32_t k_sample4_bin[320] = {
++	0x00000000, 0x202cc028, 0x00000001, 0x202cc029, 0x00000002, 0x202cc02a, 0x00000003, 0x202cc02b,
++	0x00000004, 0x202cc02c, 0x00000005, 0x202cc02d, 0x00000006, 0x202cc02e, 0x00000007, 0x202cc02f,
++	0x00000008, 0x202cc030, 0x00000009, 0x202cc031, 0x0000000a, 0x202cc032, 0x0000000b, 0x202cc033,
++	0x0000000c, 0x202cc034, 0x0000000d, 0x202cc035, 0x0000000e, 0x202cc036, 0x0000000f, 0x202cc037,
++	0x00000010, 0x202cc038, 0x00000011, 0x202cc039, 0x00000012, 0x202cc03a, 0x00000013, 0x202cc03b,
++	0x00000000, 0x204cc009, 0x200600c0, 0x46d00004, 0x00000000, 0x00000200, 0x00000004, 0x42100004,
++	0x003500c1, 0x42100005, 0x00000000, 0x00000100, 0x00320004, 0x42d00004, 0x00000000, 0x00000200,
++	0x20020004, 0x46d00004, 0x00000000, 0x00000200, 0x00340004, 0x42100006, 0x00000000, 0x00000200,
++	0x00060005, 0x62198007, 0x00000006, 0x200c400c, 0x00000005, 0x200c400d, 0x00000038, 0x200c4038,
++	0x00000039, 0x200c4039, 0x00000000, 0x00000100, 0x20020007, 0x46d00008, 0x0031000c, 0x4010000c,
++	0x0031000d, 0x4010000d, 0x40380031, 0x40100038, 0x00310039, 0x40100039, 0x00000000, 0x00000100,
++	0x002f000c, 0x4010000e, 0x0000000d, 0x2004400f, 0x0000000d, 0x20044011, 0x0000000d, 0x20044013,
++	0x00000000, 0x00000100, 0x002f000e, 0x40100010, 0x00000000, 0x00000200, 0x002f0010, 0x40100012,
++	0x002c002a, 0x6386801c, 0x002d002b, 0x6386801d, 0x00000000, 0x00000200, 0x001c0028, 0x63860014,
++	0x001d0029, 0x63860015, 0x001c0028, 0x63870016, 0x001d0029, 0x63870017, 0x001c0028, 0x63880018,
++	0x001d0029, 0x63880019, 0x001c0028, 0x6389001a, 0x001d0029, 0x6389001b, 0x0000000c, 0x2004403c,
++	0x0000000e, 0x2004403d, 0x00000010, 0x2004403e, 0x00000012, 0x2004403f, 0x00000000, 0x00000200,
++	0x00000029, 0xa0c01f40, 0x0000002d, 0xa0c01f44, 0x00000031, 0xa0c01f48, 0x00000035, 0xa0c01f4c,
++	0x02200019, 0xa0c01f50, 0x0220001d, 0xa0c01f54, 0x02200021, 0xa0c01f58, 0x02200025, 0xa0c01f5c,
++	0x0038003c, 0x40100b20, 0x0039003c, 0x639d0b24, 0x003b0020, 0x40500b20, 0x003b0024, 0x40500b24,
++	0x002f0020, 0x40300b20, 0x002f0024, 0x40300b24, 0x00240020, 0x40780b20, 0x00000000, 0x00000200,
++	0x002e0020, 0x40700b24, 0x002f0020, 0x639b8b1c, 0x00240040, 0x50700b40, 0x00250044, 0x40700b44,
++	0x00260048, 0x40700b48, 0x0027004c, 0x40700b4c, 0x00000000, 0x00000200, 0x001c4043, 0x639b001c,
++	0x001d4047, 0x639b001d, 0x001e404b, 0x639b001e, 0x001f404f, 0x639b001f, 0x00000000, 0x00000200,
++	0x20400050, 0x638e0b50, 0x20440054, 0x638e8b54, 0x20480058, 0x638f0b58, 0x204c005c, 0x638f8b5c,
++	0x00310050, 0x63980b50, 0x00310054, 0x63980b54, 0x00310058, 0x63980b58, 0x0031005c, 0x63980b5c,
++	0x00300050, 0x40300b50, 0x00300054, 0x40300b54, 0x00300058, 0x40300b58, 0x0030005c, 0x40300b5c,
++	0x00000050, 0x2004cb50, 0x00000054, 0x2004cb54, 0x00000058, 0x2004cb58, 0x0000005c, 0x2004cb5c,
++	0x00000000, 0x00000200, 0x20080051, 0x46d00051, 0x20080055, 0x46d00055, 0x20080059, 0x46d00059,
++	0x2008005d, 0x46d0005d, 0x20100052, 0x46d00052, 0x20100056, 0x46d00056, 0x2010005a, 0x46d0005a,
++	0x2010005e, 0x46d0005e, 0x20180053, 0x46d00053, 0x20180057, 0x46d00057, 0x2018005b, 0x46d0005b,
++	0x2018005f, 0x46d0005f, 0x00510050, 0x43b00050, 0x00550054, 0x43b00054, 0x00590058, 0x43b00058,
++	0x005d005c, 0x43b0005c, 0x00530052, 0x43b00052, 0x00570056, 0x43b00056, 0x005b005a, 0x43b0005a,
++	0x005f005e, 0x43b0005e, 0x00000000, 0x00000200, 0x00520050, 0x43b00060, 0x00560054, 0x43b00061,
++	0x005a0058, 0x43b00062, 0x005e005c, 0x43b00063, 0x00000000, 0x00000500, 0x070036c1, 0xc7260008,
++	0x00000000, 0x03000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++static const struct sweet_kernel k_sample4 = {
++	.bin = k_sample4_bin, .size = sizeof(k_sample4_bin),
++	.instrlen = 9, .constlen = 8, .max_reg = 24, .max_half_reg = -1,
++	.double_threadsize = 0, .branchstack = 0,
++	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 1,
++};

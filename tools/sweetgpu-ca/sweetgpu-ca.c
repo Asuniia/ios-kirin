@@ -1,5 +1,5 @@
 /*
- * sweetgpu-ca.dylib, v4: loaded into backboardd (kernel 0139+,
+ * sweetgpu-ca.dylib, v5: loaded into backboardd (kernel 0139+,
  * sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgpu-ca.dylib).
  *
  * 1. Runs tools/sweetgpu-test once (3 s after launch, in its own thread).
@@ -119,7 +119,7 @@ key_str(char *buf, size_t len, uint64_t k)
  * Verify mode (default): the screen still comes from the CPU; the same draw
  * also runs on the GPU into a copy of the destination rect, at most one
  * every 100 ms, and the two are compared.
- * Offload mode (SWEETGPU_CA_MODE=offload): those draws (not Add yet) go to
+ * Offload mode (SWEETGPU_CA_MODE=offload): those draws go to
  * the GPU instead of the CPU, straight into the destination; the CPU if the
  * GPU fails.
  */
@@ -151,6 +151,7 @@ static struct {
 static int v_logged;
 static uint64_t v_skip[16];
 static uint64_t off_n, off_px, off_ns, off_fail;
+static uint64_t el_n, el_px, el_ns;     /* eligible draws the CPU did */
 
 static float
 half(const void *p)
@@ -198,6 +199,17 @@ plan(struct plan *pl, const float *f, uint32_t n, const uint8_t *r)
 	}
 	const uint64_t *table = *(const uint64_t *const *)(tex + 0x30);
 	if (table == NULL || table[0] - g_slide != ARGB8_HOST_SAMPLER0) {
+		/* name the other formats: the table's first sampler, once each */
+		static const uint64_t *seen[8];
+		static int nseen;
+		int i;
+		for (i = 0; i < nseen && seen[i] != table; i++) {
+		}
+		if (i == nseen && nseen < 8 && table != NULL) {
+			seen[nseen++] = table;
+			log_line("format: sampler table %llx, first sampler %llx (unslid)\n",
+			    (uint64_t)table - g_slide, table[0] - g_slide);
+		}
 		return skip(1);
 	}
 	for (int i = 0; i < 4; i++) {
@@ -323,9 +335,6 @@ gpu_draw(const struct plan *pl, uint64_t dva, int32_t ox, int32_t oy, uint32_t w
 static bool
 offload(const struct plan *pl)
 {
-	if ((pl->key >> 20) == 12) {    /* Add: not verified yet */
-		return false;
-	}
 	uint8_t *rows = pl->dst + (int64_t)(pl->Y0 - pl->dy0) * pl->drb;
 	uint32_t h = pl->Y1 - pl->Y0, w = pl->dx1 - pl->dx0;
 	if (((uintptr_t)rows & 63) || pl->drb % 64) {
@@ -451,6 +460,10 @@ gpu_report(void)
 		    100.0 * vst[k].bad / vst[k].px, 100.0 * vst[k].inner_bad / vst[k].px,
 		    ms(vst[k].cpu) / vst[k].n, ms(vst[k].gpu) / vst[k].n, (double)vst[k].px / vst[k].n);
 	}
+	if (el_n) {
+		log_line("eligible (CPU drew): %llu draws, %.1f Mpx, %.1f ms\n", el_n, el_px / 1e6, ms(el_ns));
+		el_n = el_px = el_ns = 0;
+	}
 	if (off_n || off_fail) {
 		log_line("offload: %llu draws, %.1f Mpx, %.1f ms on the GPU path (%.2f ms/draw), %llu failed\n",
 		    off_n, off_px / 1e6, ms(off_ns), off_n ? ms(off_ns) / off_n : 0.0, off_fail);
@@ -474,6 +487,9 @@ dp_hook(void *v, uint32_t n, const void *rs)
 	uint64_t dt = mach_absolute_time() - t0;
 	if (vj) {
 		verify_run(&j, dt);
+	}
+	if (gpu && !g_offload) {
+		el_n++, el_px += (uint64_t)(j.pl.X1 - j.pl.X0) * (j.pl.Y1 - j.pl.Y0), el_ns += dt;
 	}
 
 	const uint8_t *r = rs, *ctx = *(const uint8_t *const *)r;
