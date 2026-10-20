@@ -1,5 +1,5 @@
 /*
- * sweetgpu-ca.dylib, v6: loaded into backboardd (kernel 0139+,
+ * sweetgpu-ca.dylib, v8: loaded into backboardd (kernel 0139+,
  * sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgpu-ca.dylib).
  *
  * 1. Runs tools/sweetgpu-test once (3 s after launch, in its own thread).
@@ -184,7 +184,7 @@ plane(const float *f, uint32_t n, int k, float *a, float *c, float *e)
 }
 
 static int g_why;                       /* last skip reason, for skip_ns */
-static uint64_t skip_ns[16], skip_px[16];      /* 13 kind, 14 small */
+static uint64_t skip_ns[16], skip_px[16];      /* 13 kind, 14 small, 15 colorprog */
 
 static bool
 skip(int why)
@@ -249,6 +249,14 @@ plan(struct plan *pl, const float *fin, uint32_t n, const uint8_t *r)
 	if ((*(const uint32_t *)(r + 0x124) & 7) != 1 || (blend != 1 && blend != 3 && blend != 12) ||
 	    (fn != 1 && fn != 3) || n < 3 || n > 4) {
 		return skip(13);
+	}
+	/*
+	 * a color program (state + 0x168, e.g. the dock material's color matrix)
+	 * or the special unit mode (state[0x11] == 0x11) changes the sampled
+	 * colors (sample_texture): not modelled (0149b: dock gone, black strips)
+	 */
+	if (*(const uint64_t *)(state + 0x168) != 0 || state[0x11] == 0x11) {
+		return skip(15);
 	}
 	hull_order(fin, n, f);
 	const uint64_t *table = *(const uint64_t *const *)(tex + 0x30);
@@ -381,6 +389,7 @@ plan(struct plan *pl, const float *fin, uint32_t n, const uint8_t *r)
 static struct {
 	uint32_t key, n;
 	float cpu_ns_px;                /* EMA */
+	uint32_t ok, bad, vn;           /* verifications: matched, mismatched; offload counter */
 } cost[NCOST];
 
 static uint32_t
@@ -400,11 +409,38 @@ static bool
 gpu_wins(const struct plan *pl)
 {
 	uint32_t c = cost_slot(pl->key);
-	if (c == NCOST || cost[c].n == 0 || ++cost[c].n % 64 == 0) {
+	if (c == NCOST || cost[c].n == 0 || cost[c].bad || ++cost[c].n % 64 == 0) {
 		return false;
 	}
 	float px = (float)(pl->X1 - pl->X0) * (pl->Y1 - pl->Y0);
 	return cost[c].cpu_ns_px * px > 1.1f * (600000.0f + 4.3f * px);
+}
+
+/*
+ * Offload mode only draws kinds the GPU has matched the CPU on (3 verified
+ * draws, none bad); one in 32 of their draws is still drawn by the CPU and
+ * verified. A mismatch bans the kind for good.
+ */
+static bool
+trusted(const struct plan *pl)
+{
+	uint32_t c = cost_slot(pl->key);
+	return c < NCOST && cost[c].ok >= 3 && cost[c].bad == 0 && ++cost[c].vn % 32 != 0;
+}
+
+static void
+cost_verified(const struct plan *pl, bool good)
+{
+	uint32_t c = cost_slot(pl->key);
+	if (c == NCOST) {
+		return;
+	}
+	if (good) {
+		cost[c].ok++;
+	} else if (cost[c].bad++ == 0) {
+		log_line("kind %08x banned (fmt %s fn %u blend %u)\n", pl->key, formats[(pl->key >> 16) & 7].name,
+		    pl->key & 0xff, (pl->key >> 21) & 0xff);
+	}
 }
 
 static void
@@ -508,7 +544,7 @@ static bool
 verify_prepare(struct vjob *j)
 {
 	uint64_t now = mach_absolute_time();
-	if (ms(now - g_last_verify) < 100) {
+	if (ms(now - g_last_verify) < (g_offload ? 20 : 100)) {
 		return false;
 	}
 	g_last_verify = now;
@@ -565,6 +601,7 @@ verify_run(struct vjob *j, uint64_t cpu)
 			}
 		}
 	}
+	cost_verified(&j->pl, bad * 200 <= (uint64_t)j->w * j->h);     /* <= 0.5% off */
 	uint32_t k;
 	for (k = 0; k < NVKEY && vst[k].n && vst[k].key != j->pl.key; k++) {
 	}
@@ -611,11 +648,11 @@ gpu_report(void)
 	    "pitch %llu bounds %llu rows %llu cpu-faster %llu\n", v_skip[1], v_skip[2], v_skip[3], v_skip[4], v_skip[5],
 	    v_skip[6], v_skip[7], v_skip[8], v_skip[9], v_skip[10], v_skip[11], v_skip[12]);
 	/* CPU time of the skipped draws by reason (2 s) */
-	static const char *why_name[15] = {"", "fmt", "shape", "color", "dst", "tex", "plane", "alloc", "quad",
-		                            "pitch", "bounds", "rows", "cpu-faster", "kind", "small"};
+	static const char *why_name[16] = {"", "fmt", "shape", "color", "dst", "tex", "plane", "alloc", "quad",
+		                            "pitch", "bounds", "rows", "cpu-faster", "kind", "small", "colorprog"};
 	char line[256];
 	int m = snprintf(line, sizeof(line), "skipped CPU ms:");
-	for (int w = 1; w < 15; w++) {
+	for (int w = 1; w < 16; w++) {
 		if (skip_ns[w]) {
 			m += snprintf(line + m, sizeof(line) - m, " %s %.0f (%.1f Mpx)", why_name[w], ms(skip_ns[w]), skip_px[w] / 1e6);
 		}
@@ -635,13 +672,15 @@ dp_hook(void *v, uint32_t n, const void *rs)
 		skip(12);               /* the CPU is faster for this one (or measuring it) */
 	}
 	int why = gpu ? 0 : g_why;
-	bool vj = gpu && !g_offload && verify_prepare(&j);
+	bool off = gpu && g_offload && trusted(&j.pl);
+	bool vj = gpu && !off && verify_prepare(&j);
 	uint64_t t0 = mach_absolute_time();
-	if (!(gpu && g_offload && offload(&j.pl))) {
+	if (!(off && offload(&j.pl))) {
+		off = false;
 		sweetgpu_dp_tramp(v, n, rs);
 	}
 	uint64_t dt = mach_absolute_time() - t0;
-	if (planned && !(gpu && g_offload)) {
+	if (planned && !off) {
 		cost_cpu(&j.pl, dt);    /* the CPU drew a GPU-capable draw */
 	}
 	if (vj) {
