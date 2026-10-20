@@ -442,22 +442,112 @@ trace_empty_samplers(GLint prog)
 	}
 }
 
-extern void _mesa_TextureBarrierNV(void);
-
 /*
- * CA reads the destination by sampling the texture it is rendering into
- * (Apple's GPUs return what memory held when the pass began). A flush
- * first makes the earlier draws visible to the sampler; without it the
- * read came back empty (App Library pods, CC tiles, vibrant glyphs).
- * ponytail: sampler units per program read once (CA sets them at link).
+ * CA reads the destination by sampling the texture it renders into, often
+ * right after clearing it: on Apple's tile GPUs the clear stays on chip
+ * and texture reads see memory as it was when the pass began. Here the
+ * clear goes straight to memory. So a texture once seen sampled while
+ * attached gets a snapshot (blit) whenever its framebuffer is bound, and
+ * draws sampling it read the snapshot instead (App Library pods, CC tiles,
+ * vibrant glyphs: their material passes read cleared memory).
+ * ponytail: the first time a texture is caught the snapshot is taken at
+ * that draw (one wrong frame); sampler units per program read once.
  */
 #define PROG_MAX 4096
 static uint16_t prog_units[PROG_MAX];   /* bit u: a sampler reads unit u; bit 15: known */
+static uint8_t tex_feedback[TEXSZ_MAX]; /* sampled while attached at least once */
+static struct {
+	GLuint tex, fb, w, h;               /* shadow texture, its framebuffer, size */
+} shadows[TEXSZ_MAX];
+static GLuint pass_tex;                 /* attachment of the bound framebuffer with a snapshot */
+static bool pass_snapshot;
+static int feedback_unit = -1;          /* unit rebound to the snapshot for this draw */
+
+static GLuint
+fb_color_texture(void)
+{
+	GLint fb = 0, type = 0, att = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+	if (fb == 0) {
+		return 0;
+	}
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+	if (type != GL_TEXTURE) {
+		return 0;
+	}
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &att);
+	return att > 0 && att < TEXSZ_MAX ? (GLuint)att : 0;
+}
+
+/* copy the bound framebuffer's color into tex's shadow */
+static void
+snapshot(GLuint tex)
+{
+	GLint fb = 0, active = GL_TEXTURE0, w = tex_w[tex], h = tex_h[tex];
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+	if (w <= 0 || h <= 0) {
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+		glBindTexture(GL_TEXTURE_2D, tex);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+		glBindTexture(GL_TEXTURE_2D, unit_held[(active - GL_TEXTURE0) & (UNITS - 1)]);
+	}
+	if (w <= 0 || h <= 0) {
+		return;
+	}
+	if (shadows[tex].tex == 0) {
+		glGenTextures(1, &shadows[tex].tex);
+		glGenFramebuffers(1, &shadows[tex].fb);
+	}
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+	if (shadows[tex].w != (GLuint)w || shadows[tex].h != (GLuint)h) {
+		glBindTexture(GL_TEXTURE_2D, shadows[tex].tex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glBindTexture(GL_TEXTURE_2D, unit_held[(active - GL_TEXTURE0) & (UNITS - 1)]);
+		glBindFramebuffer(GL_FRAMEBUFFER, shadows[tex].fb);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, shadows[tex].tex, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, fb);
+		shadows[tex].w = w;
+		shadows[tex].h = h;
+	}
+	GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+	GLboolean mask[4];
+	glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+	glDisable(GL_SCISSOR_TEST);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, shadows[tex].fb);
+	glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBindFramebuffer(GL_FRAMEBUFFER, fb);
+	if (scissor) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glColorMask(mask[0], mask[1], mask[2], mask[3]);
+	pass_tex = tex;
+	pass_snapshot = true;
+}
+
+/* a new pass on the bound framebuffer: snapshot attachments known to be read back */
+static void
+pass_begin(void)
+{
+	GLuint tex = fb_color_texture();
+	pass_snapshot = false;
+	pass_tex = tex;
+	if (tex != 0 && tex_feedback[tex]) {
+		snapshot(tex);
+	}
+}
 
 static void
-feedback_barrier(GLint prog)
+feedback_bind(GLint prog)
 {
-	GLint fb = 0, att = 0, type = 0;
+	feedback_unit = -1;
 	if (prog <= 0 || prog >= PROG_MAX) {
 		return;
 	}
@@ -477,23 +567,44 @@ feedback_barrier(GLint prog)
 		}
 		prog_units[prog] = m;
 	}
-	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
-	if (fb == 0) {
+	GLuint att = pass_tex;
+	if (att == 0) {
 		return;
 	}
-	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
-	if (type != GL_TEXTURE) {
-		return;
-	}
-	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &att);
 	for (int u = 0; u < 15; u++) {
-		if ((prog_units[prog] & 1u << u) && unit_held[u] == (GLuint)att) {
-			TRACE("feedback: prog %d samples fb %d's texture %d on unit %d: barrier", prog, fb, att, u);
-			_mesa_TextureBarrierNV();
+		if ((prog_units[prog] & 1u << u) && unit_held[u] == att) {
+			if (!tex_feedback[att]) {
+				TRACE("feedback: prog %d samples its framebuffer's texture %u on unit %d", prog, att, u);
+				tex_feedback[att] = 1;
+			}
+			if (!pass_snapshot) {
+				snapshot(att);
+			}
+			if (shadows[att].tex == 0) {
+				return;
+			}
+			GLint active = GL_TEXTURE0;
+			glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+			glActiveTexture(GL_TEXTURE0 + u);
+			glBindTexture(GL_TEXTURE_2D, shadows[att].tex);
+			glActiveTexture(active);
+			feedback_unit = u;
 			return;
 		}
+	}
+}
+
+/* after the draw: the unit holds CA's texture again */
+static void
+feedback_unbind(void)
+{
+	if (feedback_unit >= 0) {
+		GLint active = GL_TEXTURE0;
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+		glActiveTexture(GL_TEXTURE0 + feedback_unit);
+		glBindTexture(GL_TEXTURE_2D, unit_held[feedback_unit]);
+		glActiveTexture(active);
+		feedback_unit = -1;
 	}
 }
 
@@ -619,7 +730,7 @@ draw_prep(GLenum mode, GLsizei count)
 	if (active >= 0) {
 		glActiveTexture(GL_TEXTURE0 + active);
 	}
-	feedback_barrier(prog);
+	feedback_bind(prog);
 	if (trace_left > 0 && prog != 0) {
 		trace_empty_samplers(prog);
 		fresh = trace_draw_state(prog, mode, count);
@@ -649,6 +760,9 @@ sgl_DeleteTextures(void *rctx, GLsizei n, const GLuint *textures)
 	SGL_CUR(rctx);
 	for (GLsizei i = 0; i < n; i++) {
 		copy_forget(textures[i]);
+		if (textures[i] < TEXSZ_MAX) {
+			tex_feedback[textures[i]] = 0;
+		}
 		for (int u = 0; u < UNITS; u++) {
 			if (unit_2d[u] == textures[i]) {
 				unit_2d[u] = 0;
@@ -680,6 +794,7 @@ sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count)
 	SGL_CUR(rctx);
 	bool fresh = draw_prep(mode, count);
 	glDrawArrays(mode, first, count);
+	feedback_unbind();
 	if (fresh) {
 		GLint prog = 0;
 		glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
@@ -694,6 +809,7 @@ sgl_DrawElements(void *rctx, GLenum mode, GLsizei count, GLenum type, const void
 	SGL_CUR(rctx);
 	bool fresh = draw_prep(mode, count);
 	glDrawElements(mode, count, type, indices);
+	feedback_unbind();
 	if (fresh) {
 		GLint prog = 0;
 		glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
@@ -753,6 +869,7 @@ sgl_FramebufferTexture2DEXT(void *rctx, GLenum target, GLenum attachment, GLenum
 	TRACE("FramebufferTexture2D fb %d attachment %#x tex %u", fb, attachment, texture);
 	glFramebufferTexture2D(target, attachment, textarget == 0x84F5 ? GL_TEXTURE_2D : textarget, texture, level);
 	SGL_POST(677);
+	pass_begin();
 }
 
 void
@@ -782,9 +899,9 @@ void
 sgl_BindFramebufferEXT(void *rctx, GLenum target, GLuint framebuffer)
 {
 	SGL_CUR(rctx);
-	TRACE("BindFramebuffer %u", framebuffer);
 	glBindFramebuffer(target, framebuffer);
 	SGL_POST(672);
+	pass_begin();
 }
 
 static GLint
