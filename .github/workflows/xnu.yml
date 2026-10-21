@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      board:
+        description: SWEET board variant (kirin = Xperia 10, 4K pages; sailfish = Pixel 1, 16K pages)
+        default: kirin
   push:
     branches: [main]
     paths:
@@ -31,6 +34,8 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  # read by makedefs/MakeInc.def (patch 0169)
+  SWEET_BOARD: ${{ inputs.board || 'kirin' }}
 
 jobs:
   build:
@@ -92,7 +97,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-buildtree
+          name: xnu-buildtree-${{ env.SWEET_BOARD }}
           path: buildtree.tgz
           retention-days: 7
 
@@ -119,6 +124,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel
+          name: xnu-kernel-${{ env.SWEET_BOARD }}
           path: out/
           if-no-files-found: warn
