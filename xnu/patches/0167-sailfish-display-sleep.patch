@@ -1,0 +1,177 @@
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -737,6 +737,7 @@
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ void sweet_fbcon_kick(bool force);
+ void sweet_fbcon_flip(uint64_t pa, uint32_t stride);
++void sweet_fbcon_blank(bool blank);
+ 
+ static void
+ fbcon_clear_row(uint32_t row)
+@@ -774,6 +775,7 @@
+ static volatile uint32_t *fbcon_vig0;   /* MDP VIG0 pipe (the panel's source) */
+ static uint64_t fbcon_src_next;
+ static uint32_t fbcon_src_stride;
++static uint32_t fbcon_layer_next;       /* CTL0 LAYER(LM0) for the next START, 0 = keep */
+ uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
+ 
+ static bool
+@@ -800,13 +802,22 @@
+ 			fbcon_intr[1] = FBCON_PP0_DONE;
+ 		}
+ 		uint64_t src = os_atomic_xchg(&fbcon_src_next, 0ull, relaxed);
++		uint32_t layer = os_atomic_xchg(&fbcon_layer_next, 0u, relaxed);
++		uint32_t flush = 0;
+ 		if (src != 0 && fbcon_vig0 != NULL) {
+ 			fbcon_vig0[0x14 / 4] = (uint32_t)src;           /* SRC0_ADDR */
+ 			fbcon_vig0[0x24 / 4] = fbcon_src_stride;        /* SRC_YSTRIDE0 */
+ 			fbcon_vig0[0x30 / 4] = 0x000236ffu;             /* SRC_FORMAT: XRGB8888, 4 bpp */
+ 			fbcon_vig0[0x34 / 4] = 0x03020001u;             /* UNPACK: bytes B, G, R, X */
++			flush |= 1u;                                    /* VIG0 */
++		}
++		if (layer != 0) {
++			fbcon_kickoff[-7] = layer;                      /* CTL0 LAYER(LM0) */
++			flush |= 1u << 6;                               /* LM0 */
++		}
++		if (flush != 0) {
+ 			__builtin_arm_dsb(DSB_SY);
+-			fbcon_kickoff[-1] = 1u;                         /* CTL0_FLUSH: VIG0 */
++			fbcon_kickoff[-1] = flush;                      /* CTL0_FLUSH */
+ 		}
+ 		__builtin_arm_dsb(DSB_SY);
+ 		*fbcon_kickoff = 1;
+@@ -832,6 +843,35 @@
+ 	}
+ 	fbcon_src_stride = stride;
+ 	os_atomic_store(&fbcon_src_next, pa, release);
++	sweet_fbcon_kick(true);
++}
++
++/*
++ * Display sleep (AppleCLCD power off): layer mixer 0 drops VIG0 and sends
++ * only its border colour, black, which on the AMOLED panel is all pixels
++ * off; the panel itself stays powered (no DSI DCS display off/sleep in).
++ * Unblank puts back the LAYER(LM0) value it replaced.
++ */
++#define FBCON_LAYER_BORDER      (1u << 24)      /* BORDER_COLOR, no pipes */
++
++void
++sweet_fbcon_blank(bool blank)
++{
++	static uint32_t shown;
++
++	if (fbcon_kickoff == NULL) {
++		return;
++	}
++	if (blank) {
++		uint32_t cur = fbcon_kickoff[-7];
++		if (cur == FBCON_LAYER_BORDER) {
++			return;
++		}
++		shown = cur;
++	} else if (shown == 0) {
++		return;
++	}
++	os_atomic_store(&fbcon_layer_next, blank ? FBCON_LAYER_BORDER : shown, release);
+ 	sweet_fbcon_kick(true);
+ }
+ 
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -15,7 +15,8 @@
+  *   5  SwapEnd, struct 0x46c: +0x50 swap id, +0x54 IOSurface id per layer
+  *      (4 layers), +0x64 rect a / +0xc4 rect b per layer (int x,y,w,h),
+  *      +0x104 enabled layer mask
+- *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h], 18 IsMainDisplay,
++ *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h], 12 RequestPowerChange
++ *      [on] (display sleep/wake, CA IOMFBDisplay::set_power_state), 18 IsMainDisplay,
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+  *
+@@ -59,6 +60,7 @@
+ 	kSweetFBSwapWait                = 6,
+ 	kSweetFBGetID                   = 7,
+ 	kSweetFBGetDisplaySize          = 8,
++	kSweetFBRequestPowerChange      = 12,
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
+@@ -87,6 +89,7 @@
+ 
+ extern "C" void sweet_fbcon_kick(bool force);           /* pexpert/arm/pe_serial.c */
+ extern "C" void sweet_fbcon_flip(uint64_t pa, uint32_t stride);
++extern "C" void sweet_fbcon_blank(bool blank);
+ #include "../../../bsd/dev/sweet_gpu.h"
+ extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ /* Read by bsd/dev/sweet_perf.c. */
+@@ -127,6 +130,7 @@
+ 	IOLock       *fPresentLock;     /* swaps and panel copies, in order */
+ 	uint64_t      fMinAbs;          /* least time between panel copy starts, minus slack */
+ 	uint64_t      fLastPresent;
++	bool          fBlanked;         /* display asleep: swaps are kept, not shown */
+ 	/* Pixel 1: fPhys..fRowBytes describe the 750x1334 RAM surface, these the panel */
+ 	bool          fScaled;
+ 	uintptr_t     fPanel;
+@@ -153,6 +157,7 @@
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ 	void presentPending(void);
++	void setPower(bool on);
+ 	bool startScaled(void);
+ 	bool gpuStart(void);
+ 	uint64_t gpuMap(SweetSurface *s);
+@@ -527,7 +532,7 @@
+ 	IOLockUnlock(fb->fLock);
+ 	/* The last frame of a burst, held back by the rate limit in swap(). */
+ 	IOLockLock(fb->fPresentLock);
+-	if (fb->fDirty && now - fb->fLastPresent >= fb->fMinAbs) {
++	if (fb->fDirty && !fb->fBlanked && now - fb->fLastPresent >= fb->fMinAbs) {
+ 		fb->presentPending();
+ 	}
+ 	IOLockUnlock(fb->fPresentLock);
+@@ -584,7 +589,7 @@
+ 	fDirty = true;
+ 	sweet_fb_stat_swaps++;
+ 	IOLockUnlock(fLock);
+-	if (mach_absolute_time() - fLastPresent >= fMinAbs) {
++	if (!fBlanked && mach_absolute_time() - fLastPresent >= fMinAbs) {
+ 		presentPending();
+ 	}
+ 	IOLockUnlock(fPresentLock);
+@@ -607,6 +612,24 @@
+ 	fLastPresent = t0;
+ 	sweet_fb_stat_present_abs += mach_absolute_time() - t0;
+ 	sweet_fb_stat_presents++;
++}
++
++/* Display sleep/wake (lock button): black panel, frames held back meanwhile. */
++void
++AppleCLCD::setPower(bool on)
++{
++	IOLockLock(fPresentLock);
++	if (fBlanked == !on) {
++		IOLockUnlock(fPresentLock);
++		return;
++	}
++	fBlanked = !on;
++	sweet_fbcon_blank(!on);
++	if (on && fDirty) {
++		presentPending();
++	}
++	IOLockUnlock(fPresentLock);
++	IOLog("SWEET FB: display %s\n", on ? "on" : "off");
+ }
+ 
+ void
+@@ -861,6 +884,11 @@
+ 		out[1] = fFB->fLogicalH;
+ 		outCount = 2;
+ 		break;
++	case kSweetFBRequestPowerChange:
++		if (args->scalarInputCount >= 1) {
++			fFB->setPower(args->scalarInput[0] != 0);
++		}
++		break;
+ 	case kSweetFBIsMainDisplay:
+ 		out[0] = 1;
+ 		outCount = 1;
