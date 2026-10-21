@@ -98,6 +98,22 @@ void con_skip(void)
 	row++;
 }
 
+int con_row(int r)
+{
+	int old = row;
+	if (r >= 0)
+		row = r;
+	return old;
+}
+
+void con_box(int x, int y, int size, uint32_t c)
+{
+	for (int dy = 0; dy < size; dy++)
+		for (int dx = 0; dx < size; dx++)
+			if (x + dx < FB_W && y + dy < FB_H)
+				put_px(x + dx, y + dy, c);
+}
+
 void con_str(const char *label, const char *s)
 {
 	put_str(0, label, YELLOW);

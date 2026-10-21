@@ -10,6 +10,7 @@
 #include "emmc.h"
 #include "fdt.h"
 #include "loader.h"
+#include "touch.h"
 
 #define PSCI_SYSTEM_OFF		0x84000008UL
 #define APSS_WDT		0x17817000UL	/* qcom,wdt@17817000, 32768 Hz ticks */
@@ -104,6 +105,11 @@ void shim_main(uint64_t dtb)
 	con_skip();
 	emmc_probe();
 	fail("EMMC", "probe done, nothing written");
+#endif
+#ifdef KIRIN_TOUCH_PROBE
+	con_skip();
+	touch_probe();
+	fail("TOUCH", "probe done");
 #endif
 
 	uint64_t size = payload_size((uintptr_t)_end);

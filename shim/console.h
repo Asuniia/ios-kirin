@@ -32,6 +32,8 @@ extern volatile uint32_t *con_fb;
 void con_clear(uint32_t bg);
 void con_flush(void);	/* show what was drawn (command-mode panels) */
 void con_skip(void);
+int con_row(int r);	/* set the text row (r >= 0), returns the previous one */
+void con_box(int x, int y, int size, uint32_t c);	/* filled square, top left at x, y */
 void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */
