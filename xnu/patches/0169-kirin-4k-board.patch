@@ -1,3 +1,404 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index b8c6bc7..1e331e5 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -17,6 +17,9 @@
+  * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
+  * against the partition bounds again right before it is issued, so nothing
+  * outside the named partition can be written.
++ *
++ * SWEET_KIRIN (Xperia 10): the same disk on the SDM630 eMMC instead, see the
++ * eMMC transport below; the device keeps the name ufsroot0 (rd=ufsroot0).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -71,7 +74,11 @@ extern void sweet_usb_probe(void);
+ #define HCS_UTRLRDY     (1u << 1)
+ #define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
+ 
++#if defined(SWEET_KIRIN)
++#define UFS_BLOCK       512u                    /* eMMC sector */
++#else
+ #define UFS_BLOCK       4096u
++#endif
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+@@ -111,6 +118,8 @@ static struct {
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
++	uint32_t rca;                           /* kirin: eMMC relative card address */
++	bool emmc_cache;                        /* kirin: EXT_CSD CACHE_CTRL on */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -143,6 +152,7 @@ dma_clean(uint32_t off, uint32_t len)
+ 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+ }
+ 
++#if !defined(SWEET_KIRIN)
+ /*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+@@ -301,6 +311,265 @@ ufs_sync_cache(void)
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
++#else /* SWEET_KIRIN */
++/*
++ * eMMC transport (SDM630 SDHC1, qcom,sdhci-msm-v5, standard SDHCI 3.0
++ * registers). xboot leaves the host clocked (8-bit HS200) and the card
++ * selected in transfer state, as ABL leaves the Pixel's UFS link up; the
++ * shim's read-only probe (shim/emmc.c) checked that on the phone. PIO reads
++ * repeat words on this host, so every transfer is ADMA2 (64-bit, 12-byte
++ * descriptors) from the bounce buffer, polled, one command at a time.
++ * 32-bit register accesses only.
++ */
++#define SD_BLKSZ_CNT    0x04
++#define SD_ARG          0x08
++#define SD_XFER_CMD     0x0c                    /* transfer mode | command << 16 */
++#define SD_RESP0        0x10
++#define SD_PRESENT      0x24
++#define SD_CLK_CTL      0x2c                    /* clock, timeout, software reset << 24 */
++#define SD_INT_STAT     0x30
++#define SD_INT_EN       0x34
++#define SD_SIG_EN       0x38
++#define SD_CAPS         0x40
++#define SD_ADMA_ERR     0x54
++#define SD_ADMA_ADDR    0x58
++#define SD_ADMA_ADDR_HI 0x5c
++
++#define INT_CMD_DONE    (1u << 0)
++#define INT_XFER_DONE   (1u << 1)
++#define INT_ERR         (1u << 15)
++#define CMD_RESP48      0x02
++#define CMD_RESP48_BUSY 0x03
++#define CMD_CRC         0x08
++#define CMD_INDEX       0x10
++#define CMD_DATA        0x20
++#define XFER_DMA        (1u << 0)
++#define XFER_BLKCNT     (1u << 1)
++#define XFER_ACMD12     (1u << 2)
++#define XFER_READ       (1u << 4)
++#define XFER_MULTI      (1u << 5)
++#define CAPS_64BIT      (1u << 28)
++
++#define R1_STATE(r)     (((r) >> 9) & 0xf)
++#define R1_TRAN         4
++#define R1_READY        (1u << 8)
++#define R1_ERRORS       0xfdf80080u             /* error bits 31-19 and SWITCH_ERROR */
++
++#define DMA_ADMA        0x0000                  /* descriptor table, 8 byte aligned */
++#define ADMA_CHUNK      (32u << 10)             /* bytes per descriptor (16-bit length) */
++#define ADMA_DESCS      (BOUNCE_SIZE / ADMA_CHUNK)
++
++static inline uint32_t
++sd_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(su.regs + off);
++}
++
++static inline void
++sd_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(su.regs + off) = v;
++}
++
++static uint64_t
++sd_deadline(uint64_t ns)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(ns, &t);
++	return mach_absolute_time() + t;
++}
++
++/* After an error the CMD (1) / DAT (2) circuits stay stuck until reset. */
++static void
++emmc_reset_lines(uint32_t mask)
++{
++	sd_wr(SD_CLK_CTL, sd_rd(SD_CLK_CTL) | (mask << 25));
++	uint64_t deadline = sd_deadline(10 * NSEC_PER_MSEC);
++	while ((sd_rd(SD_CLK_CTL) >> 25) & mask) {
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET EMMC: line reset 0x%x stuck\n", mask);
++			return;
++		}
++		delay(1);
++	}
++}
++
++/* Wait for any of bits (or an error) in INT_STAT. */
++static int
++emmc_wait(uint32_t bits, uint64_t ns, uint32_t *st)
++{
++	uint64_t deadline = sd_deadline(ns);
++	for (;;) {
++		uint32_t s = sd_rd(SD_INT_STAT);
++		if (s & (bits | INT_ERR)) {
++			*st = s;
++			return (s & INT_ERR) ? EIO : 0;
++		}
++		if (mach_absolute_time() > deadline) {
++			*st = 0;
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++/* One command; data (if any) is set up by the caller. *r1 gets RESP0. */
++static int
++emmc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t xfer, uint32_t *r1)
++{
++	uint32_t inhibit = (flags & CMD_DATA) || (flags & 0x3) == CMD_RESP48_BUSY ? 3 : 1;
++	uint64_t deadline = sd_deadline(CMD_TIMEOUT_NS);
++	while (sd_rd(SD_PRESENT) & inhibit) {
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET EMMC: CMD%u: host busy, present 0x%x\n", idx, sd_rd(SD_PRESENT));
++			return EBUSY;
++		}
++		delay(1);
++	}
++	sd_wr(SD_INT_STAT, 0xffffffff);
++	sd_wr(SD_ARG, arg);
++	sd_wr(SD_XFER_CMD, (idx << 24) | (flags << 16) | xfer);
++	uint32_t st;
++	int error = emmc_wait(INT_CMD_DONE, 100 * NSEC_PER_MSEC, &st);
++	if (error) {
++		printf("SWEET EMMC: CMD%u arg 0x%x failed: int 0x%x\n", idx, arg, st);
++		emmc_reset_lines(inhibit);
++		return error;
++	}
++	sd_wr(SD_INT_STAT, INT_CMD_DONE);
++	*r1 = sd_rd(SD_RESP0);
++	if ((flags & 0x3) && (*r1 & R1_ERRORS)) {
++		printf("SWEET EMMC: CMD%u arg 0x%x: card status 0x%x\n", idx, arg, *r1);
++		return EIO;
++	}
++	return 0;
++}
++
++/* CMD13 until the card is back in transfer state (writes keep it programming). */
++static int
++emmc_wait_tran(void)
++{
++	uint64_t deadline = sd_deadline(CMD_TIMEOUT_NS);
++	for (;;) {
++		uint32_t r1;
++		int error = emmc_cmd(13, su.rca << 16, CMD_INDEX | CMD_CRC | CMD_RESP48, 0, &r1);
++		if (error) {
++			return error;
++		}
++		if (R1_STATE(r1) == R1_TRAN && (r1 & R1_READY)) {
++			return 0;
++		}
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET EMMC: card stuck, status 0x%x\n", r1);
++			return ETIMEDOUT;
++		}
++		delay(10);
++	}
++}
++
++/*
++ * count blocks of 512 bytes between the card and the bounce buffer with
++ * command idx (17/18 read, 24/25 write, 8 EXT_CSD). Auto CMD12 ends
++ * multi-block transfers.
++ */
++static int
++emmc_xfer(uint32_t idx, uint32_t arg, uint32_t count, bool write)
++{
++	uint32_t len = count * UFS_BLOCK;
++	assert(count && len <= BOUNCE_SIZE);
++	uint32_t *desc = (uint32_t *)(su.dma + DMA_ADMA);
++	uint64_t pa = su.dma_pa + DMA_BOUNCE;
++	uint32_t n = 0;
++	for (uint32_t done = 0; done < len; done += ADMA_CHUNK, n++) {
++		uint32_t chunk = MIN(ADMA_CHUNK, len - done);
++		desc[3 * n] = chunk << 16 | 0x21;       /* length, ACT=tran | VALID */
++		desc[3 * n + 1] = (uint32_t)(pa + done);
++		desc[3 * n + 2] = (uint32_t)((pa + done) >> 32);
++	}
++	desc[3 * (n - 1)] |= 0x2;                       /* END */
++	dma_sync(DMA_ADMA, n * 12);
++	dma_sync(DMA_BOUNCE, len);
++	__builtin_arm_dsb(0xf);
++
++	uint64_t desc_pa = su.dma_pa + DMA_ADMA;
++	sd_wr(SD_ADMA_ADDR, (uint32_t)desc_pa);
++	sd_wr(SD_ADMA_ADDR_HI, (uint32_t)(desc_pa >> 32));
++	sd_wr(SD_BLKSZ_CNT, (count << 16) | UFS_BLOCK);
++	uint32_t xfer = XFER_DMA | (write ? 0 : XFER_READ);
++	if (count > 1) {
++		xfer |= XFER_BLKCNT | XFER_MULTI | XFER_ACMD12;
++	}
++	uint32_t r1, st;
++	int error = emmc_cmd(idx, arg, CMD_DATA | CMD_INDEX | CMD_CRC | CMD_RESP48, xfer, &r1);
++	if (!error) {
++		error = emmc_wait(INT_XFER_DONE, CMD_TIMEOUT_NS, &st);
++		if (error) {
++			printf("SWEET EMMC: CMD%u arg 0x%x x%u: int 0x%x adma 0x%x\n",
++			    idx, arg, count, st, sd_rd(SD_ADMA_ERR));
++			emmc_reset_lines(3);
++		} else {
++			sd_wr(SD_INT_STAT, INT_XFER_DONE);
++		}
++	}
++	__builtin_arm_dsb(0xf);
++	if (!write) {
++		dma_sync(DMA_BOUNCE, len);
++	}
++	if (write && !error) {
++		error = emmc_wait_tran();
++	}
++	return error;
++}
++
++/* Read count device blocks at lba into the bounce buffer. */
++static int
++ufs_read_blocks(uint64_t lba, uint32_t count)
++{
++	if (lba > UINT32_MAX || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	return emmc_xfer(count > 1 ? 18 : 17, (uint32_t)lba, count, false);
++}
++
++/*
++ * Write count device blocks from the bounce buffer to lba. The range must
++ * lie inside the partition: this is the only place data goes out.
++ */
++static int
++ufs_write_blocks(uint64_t lba, uint32_t count)
++{
++	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
++	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
++		printf("SWEET EMMC: refusing write of %u blocks at 0x%llx\n", count, lba);
++		return EPERM;
++	}
++	return emmc_xfer(count > 1 ? 25 : 24, (uint32_t)lba, count, true);
++}
++
++/* CMD6 SWITCH FLUSH_CACHE (EXT_CSD 32) when the card's volatile cache is on. */
++static int
++ufs_sync_cache(void)
++{
++	if (!su.emmc_cache) {
++		return 0;
++	}
++	uint32_t r1, st;
++	int error = emmc_cmd(6, (3u << 24) | (32u << 16) | (1u << 8),
++	    CMD_INDEX | CMD_CRC | CMD_RESP48_BUSY, 0, &r1);
++	if (!error) {
++		error = emmc_wait(INT_XFER_DONE, CMD_TIMEOUT_NS, &st);  /* end of busy */
++		if (error) {
++			printf("SWEET EMMC: cache flush: int 0x%x\n", st);
++			emmc_reset_lines(3);
++		} else {
++			sd_wr(SD_INT_STAT, INT_XFER_DONE);
++		}
++	}
++	return error ? error : emmc_wait_tran();
++}
++#endif /* SWEET_KIRIN */
++
+ static int
+ ufs_find_partition(const char *want)
+ {
+@@ -355,6 +624,7 @@ ufs_find_partition(const char *want)
+ 	return ENOENT;
+ }
+ 
++#if !defined(SWEET_KIRIN)
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -388,6 +658,50 @@ ufs_take_over_host(void)
+ 	}
+ 	return 0;
+ }
++#else /* SWEET_KIRIN */
++static int
++ufs_take_over_host(void)
++{
++	uint32_t clk = sd_rd(SD_CLK_CTL);
++	if ((clk & 0x7) != 0x7) {                       /* internal clock on and stable, SD clock on */
++		printf("SWEET EMMC: host clock off (0x%x)\n", clk);
++		return ENXIO;
++	}
++	if (((su.dma_pa + DMA_SIZE - 1) >> 32) && !(sd_rd(SD_CAPS) & CAPS_64BIT)) {
++		printf("SWEET EMMC: DMA memory at 0x%llx but the host has no 64-bit addressing\n",
++		    su.dma_pa);
++		return ENXIO;
++	}
++	sd_wr(SD_SIG_EN, 0);                            /* polled operation */
++	sd_wr(SD_INT_EN, 0x07ff003f);                   /* latch completions and errors */
++	sd_wr(SD_INT_STAT, 0xffffffff);
++
++	/* The RCA xboot assigned (2 on the phone); only the right one answers CMD13. */
++	uint32_t r1 = 0;
++	for (su.rca = 1; su.rca <= 3; su.rca++) {
++		if (emmc_cmd(13, su.rca << 16, CMD_INDEX | CMD_CRC | CMD_RESP48, 0, &r1) == 0) {
++			break;
++		}
++	}
++	if (su.rca > 3 || R1_STATE(r1) != R1_TRAN) {
++		printf("SWEET EMMC: no card in transfer state (status 0x%x)\n", r1);
++		return ENXIO;
++	}
++
++	/* EXT_CSD: volatile cache on (CACHE_CTRL, byte 33), user area size (SEC_COUNT, 212). */
++	int error = emmc_xfer(8, 0, 1, false);
++	if (error) {
++		return error;
++	}
++	const uint8_t *ext = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint32_t sectors;
++	memcpy(&sectors, ext + 212, 4);
++	su.emmc_cache = ext[33] & 1;
++	printf("SWEET EMMC: RCA %u, %u MiB, cache %s\n", su.rca, sectors >> 11,
++	    su.emmc_cache ? "on" : "off");
++	return 0;
++}
++#endif /* SWEET_KIRIN */
+ 
+ static int
+ sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
+@@ -594,10 +908,15 @@ sweet_ufs_init(void)
+ 	char want[64] = "userdata";
+ 	int error;
+ 
+-	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
++#if defined(SWEET_KIRIN)
++	const char *node_path = "/sweet-emmc";
++#else
++	const char *node_path = "/sweet-ufs";
++#endif
++	if (SecureDTLookupEntry(NULL, node_path, &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+-		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
++		printf("SWEET UFS: no %s node in the device tree\n", node_path);
+ 		return ENXIO;
+ 	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+@@ -625,12 +944,14 @@ sweet_ufs_init(void)
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
++#if !defined(SWEET_KIRIN)
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		}
+ 	}
++#endif
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
 index a8809d1..ea4c75a 100644
 --- a/makedefs/MakeInc.def

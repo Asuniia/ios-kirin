@@ -60,6 +60,7 @@ KIRIN = dict(
     gicd=0x17a00000, gicr=0x17b00000,
     vtimer=19,  # Qualcomm PPI numbering like sweet: CNTV is PPI 3
     fb=0x9d400000, fb_size=0x2300000, fb_w=1080, fb_h=2520, fb_bpp=32,  # B, G, R, X
+    emmc=0x0c0c4000, emmc_size=0x1000,  # SDHC1 hc_mem (qcom,sdhci-msm-v5)
     # MPIDR, cluster, max clock: two clusters of four Cortex-A53; xboot boots
     # on 0x100, the 2.2 GHz cluster (Linux cpu0-3)
     cpus=[(0x0, 0, 1843200000), (0x1, 0, 1843200000), (0x2, 0, 1843200000), (0x3, 0, 1843200000),
@@ -311,6 +312,13 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, kirin=False, boot_
         ('reg', u64(PIXEL1['ufs'], PIXEL1['ufs_size']) if pixel1 else u64(UFS, UFS_SIZE)),
     ])
 
+    # bsd/dev/sweet_ufs.c (SWEET_KIRIN): the eMMC host xboot leaves running.
+    emmc = node('sweet-emmc', [
+        ph(),
+        ('compatible', cstr('qcom,sdhci-msm-v5')),
+        ('reg', u64(KIRIN['emmc'], KIRIN['emmc_size'])),
+    ])
+
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
@@ -354,7 +362,8 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, kirin=False, boot_
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu or kirin else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product +
+       ([emmc] if kirin else [] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
