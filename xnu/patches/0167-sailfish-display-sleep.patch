@@ -31,7 +31,7 @@
 +		}
 +		if (layer != 0) {
 +			fbcon_kickoff[-7] = layer;                      /* CTL0 LAYER(LM0) */
-+			flush |= 1u << 6;                               /* LM0 */
++			flush |= 1u << 6 | 1u << 17;                    /* LM0, CTL (as Linux mdp5_ctl) */
 +		}
 +		if (flush != 0) {
  			__builtin_arm_dsb(DSB_SY);
