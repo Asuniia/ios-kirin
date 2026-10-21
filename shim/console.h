@@ -6,6 +6,11 @@
 #define FB_W		1080
 #define FB_H		1920
 #define FB_BPP		3		/* RGB888, YSTRIDE 0xca8 */
+#elif defined(KIRIN)
+#define FB_BASE		0x9d400000UL	/* splash_region = SRC0_ADDR of the pipe on LM0 */
+#define FB_W		1080
+#define FB_H		2520
+#define FB_BPP		4		/* YSTRIDE 4320, bytes B, G, R, X */
 #else
 #define FB_BASE		0x9c000000UL	/* reserved-memory cont_splash_region */
 #define FB_W		1080
@@ -14,11 +19,13 @@
 #endif
 #define FB_STRIDE	(FB_W * FB_BPP)
 
-#define RED	0xffff0000U
-#define BLUE	0xff0000a0U
-#define WHITE	0xffffffffU
-#define YELLOW	0xffffff00U
-#define GREEN	0xff00ff00U
+#define FB_RGB(r, g, b)	(0xff000000U | (uint32_t)(r) << 16 | (uint32_t)(g) << 8 | (uint32_t)(b))
+
+#define RED	FB_RGB(0xff, 0x00, 0x00)
+#define BLUE	FB_RGB(0x00, 0x00, 0xa0)
+#define WHITE	FB_RGB(0xff, 0xff, 0xff)
+#define YELLOW	FB_RGB(0xff, 0xff, 0x00)
+#define GREEN	FB_RGB(0x00, 0xff, 0x00)
 
 extern volatile uint32_t *con_fb;
 

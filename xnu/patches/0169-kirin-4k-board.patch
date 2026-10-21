@@ -103,7 +103,7 @@ index 5ea69e3..27677d0 100644
  
  	/* Ensure TTEs are visible */
 diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
-index a784618..fb371d5 100644
+index a784618..6d4ec61 100644
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
 @@ -16,17 +16,75 @@
@@ -127,7 +127,7 @@ index a784618..fb371d5 100644
 +#define FB_CELL         (8 * FB_SCALE)
 +#define FB_COLS         (SWEET_EARLY_FB_WIDTH / FB_CELL)
 +#define FB_ROWS         ((0x200000 / SWEET_EARLY_FB_STRIDE) / FB_CELL)
-+#define FB_FG           0xffffffffu     /* R, G, B, X bytes: white */
++#define FB_FG           0xffffffffu     /* white */
 +#define FB_BG           0x00000000u
 +
 +static unsigned int fb_col, fb_row;
@@ -343,7 +343,7 @@ index c013288..294b4f5 100644
  #else
  #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
-index 5d2856f..a8f8acc 100644
+index 5d2856f..cdf69c0 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
 +++ b/pexpert/pexpert/arm64/SWEET.h
 @@ -34,6 +34,22 @@
@@ -359,7 +359,7 @@ index 5d2856f..a8f8acc 100644
 + * Early boot log (osfmk/arm64/sweet_early.c): text drawn into the
 + * bootloader splash buffer, which the MDP keeps scanning out after
 + * fastboot boot (CTL0 -> LM0 -> INTF @0xc96b800): 1080x2520, stride 4320,
-+ * bytes R, G, B, X. start.s / arm_vm_init map one 2MB L2 block of it, the
++ * bytes B, G, R, X. start.s / arm_vm_init map one 2MB L2 block of it, the
 + * top 485 rows; the ADT keeps the splash region out of XNU's RAM.
 + */
 +#define SWEET_EARLY_LOG_BLOCK     0x9d400000
