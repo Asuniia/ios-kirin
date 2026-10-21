@@ -58,7 +58,12 @@ There is no serial console. The kernel log goes to a persistent 4 MiB ring at th
 You need a Google Pixel 1 (`sailfish`) with an **unlocked bootloader**, a Mac with Xcode 15.4 and the KDK 13.5 (for the kernel build), and [TWRP for sailfish](https://dl.twrp.me/sailfish/) (booted temporarily, never flashed). **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist are never touched. Keep your partition backups and any device dumps out of git (`.gitignore` covers `backup/`, `research/`, `logs/`).
 
 1. **Kernel:** `tools/xnu-build-local.sh xnu/out-local-NNNN` builds XNU with all patches in `xnu/patches/` (blacktop/darwin-xnu-build, Xcode 15.4 and KDK 13.5 unpacked in `research/`).
-2. **iOS root:** download the iPhone 8 IPSW `iPhone_4.7_P3_16.7.16_20H392`, then `sudo tools/mkiosroot-mac.sh OS.dmg SYSTEMOS.dmg APPOS.dmg ios16-root.img`, convert it with `tools/img2simg.py` and flash it with `fastboot flash userdata`. The fixes made on the phone after the first flash (the GL library `/usr/lib/sweetgl.dylib` from `tools/sweetgl/build.sh`, the stock apps installed into `/Applications`, `tools/wallpaper-heic2png.sh`, a PosterBoard snapshot-format patch) are described step by step in `NOTES.md` (deltas 6–13); they are not all folded into the build script yet.
+2. **iOS root:** download the iPhone 8 IPSW `iPhone_4.7_P3_16.7.16_20H392` and build the image with `sudo tools/mkiosroot-mac.sh OS.dmg SYSTEMOS.dmg APPOS.dmg ios16-root.img`. Before flashing, attach it read-write on the Mac (`hdiutil attach -imagekey diskimage-class=CRawDiskImage ios16-root.img`) and add what the build script does not do yet:
+   - the GL library: build it with `tools/sweetgl/build.sh` and copy `tools/sweetgl/out/sweetgl.dylib` to `/usr/lib/sweetgl.dylib` (mode 755);
+   - the stock apps: move every app from `/private/var/staged_system_apps` into `/Applications` (iOS's own first-boot install of them fails on code signing here);
+   - the stock wallpapers: `tools/wallpaper-heic2png.sh MOUNTED_ROOT`.
+
+   Then detach it, convert it with `tools/img2simg.py` and flash it with `fastboot flash userdata`. The first boot takes a few minutes longer while iOS builds its caches.
 3. **GPU firmware:** the Adreno 530 microcode (`a530_pm4.fw`, `a530_pfp.fw`, without their 4-byte headers) and the zap shader (`a530_zap.mdt` + `.b02`) come from the phone's own vendor firmware. They are not in this repository.
 4. **Boot image:** `tools/mkadt.py ADT --pixel1` (needs the iPhone 8 device tree `d20ap` from the IPSW), then
 
@@ -91,7 +96,6 @@ You need a Google Pixel 1 (`sailfish`) with an **unlocked bootloader**, a Mac wi
 | `tools/sweetgl/` | `sweetgl.dylib`: Mesa freedreno + libdrm/msm emulation over the kernel GPU driver + the EAGL shim for CoreAnimation (Mesa itself is fetched and built by `mesa-setup.sh`) |
 | `tools/gpu-shaders/`, `tools/ir3asm/` | Hand-written Adreno compute shaders used by the kernel (frame scaling, self-tests) and their assembler |
 | `tools/mkiosroot*.sh`, `tools/sweet-root-tweaks.py` | iOS root image builder and the userland changes it needs |
-| `NOTES.md` | The complete engineering log: every boot, measurement, dead end and fix |
 
 ## Notable kernel pieces
 
