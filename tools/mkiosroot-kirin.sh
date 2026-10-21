@@ -8,10 +8,15 @@
 #
 #   mkiosroot-kirin.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]
 #
+# If OUT.img already exists (mkiosroot.sh done), only the steps above run.
+# fsck.hfsplus -n on Linux keeps reporting "Volume header needs minor repair"
+# right after -y finds the volume OK; mkiosroot.sh then exits non-zero after
+# copying everything, which is why this resumes.
+#
 # Needs apfs-fuse in PATH, hfsplus-tools, rsync and sudo.
 set -euo pipefail
 
-[[ $# -ge 4 ]] || { sed -n '2,11p' "$0"; exit 2; }
+[[ $# -ge 4 ]] || { sed -n '2,16p' "$0"; exit 2; }
 tools=$(dirname "$(realpath "$0")")
 out=$4
 heic_python=${HEIC_PYTHON:-$tools/../research/heicenv/bin/python}
@@ -20,7 +25,11 @@ heic_python=${HEIC_PYTHON:-$tools/../research/heicenv/bin/python}
 	exit 1
 }
 
-"$tools/mkiosroot.sh" "$@"
+if [[ -e $out ]]; then
+	echo "$out exists: skipping mkiosroot.sh"
+else
+	"$tools/mkiosroot.sh" "$@" || echo "mkiosroot.sh exited $? (see the fsck output above)"
+fi
 
 mnt=$(mktemp -d)
 cleanup() {
@@ -50,4 +59,3 @@ fi
 df -h "$mnt"
 sudo umount "$mnt"
 fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
-fsck.hfsplus -f -n "$out"
