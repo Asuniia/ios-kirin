@@ -1,3 +1,176 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index a9ad4f2..0b0f2a5 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -18,6 +18,20 @@
+  *            synaptics_dsx_core.c synaptics_rmi4_f12_init
+  * Coordinates are panel pixels (F12 max 1079 x 1919). Writes to the IC: the
+  * page select, the F01 interrupt enable.
++ *
++ * SWEET_KIRIN (Xperia 10): Novatek NT36672A (TDDI, powered with the panel)
++ * at I2C 0x01 (firmware address; DT reg 0x62 is the hardware one) on BLSP1
++ * QUP1 (0xc175000), same QUP code, polled every 10 ms; the shim's touch
++ * probe (shim/touch.c) checked it on the phone.
++ *   clocks   GCC BLSP1 AHB vote (0x152004 bit 17) + QUP1 I2C branch
++ *            (0x119008), source XO (Linux gcc-sdm660.c)
++ *   pins     TLMM south tile 2/3 SDA/SCL function 3 (blsp_i2c1), 2 mA, no
++ *            pull; 45 attention (unused, polled anyway)
++ *   power    none: the TDDI runs as long as the panel does
++ *   Novatek  page = event buffer (FF 02 1C: 0x21C00), then register 0: 10 x
++ *            6 bytes, id << 3 | status (1 down, 2 move), x[11:4], y[11:4],
++ *            x[3:0] << 4 | y[3:0], width, pressure (nvt_nt36672a nt36xxx.c)
++ * Coordinates are panel pixels (1080 x 2520). The only write: the page.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -37,6 +51,18 @@ extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+ extern bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
+ void sweet_touch_init(void);
+ 
++#if defined(SWEET_KIRIN)
++#define TOUCH_GCC_VOTE_PA 0x00152000u   /* +4: APCS_CLOCK_BRANCH_ENA_VOTE */
++#define TOUCH_GCC_QUP_PA  0x00119000u   /* +8: QUP1 I2C CBCR, +0x20: RCGR */
++#define TOUCH_QUP_PA      0x0c175000u
++#define TOUCH_TLMM_PA     0x03100000u   /* south tile, one 4 KiB tile per GPIO */
++#define TOUCH_SDA         2u
++#define TOUCH_SCL         3u
++#define TOUCH_ATTN        45u
++#define TOUCH_ADDR        0x01u
++#define NVT_EVENT_BUF     0x21c00u
++#define NVT_POINT_LEN     65u           /* bytes after the register byte */
++#else
+ #define TOUCH_GCC_VOTE_PA 0x00352000u   /* +4: APCS_CLOCK_BRANCH_ENA_VOTE */
+ #define TOUCH_GCC_QUP_PA  0x0031d000u   /* +8: QUP3 I2C CBCR, +0x20: RCGR */
+ #define TOUCH_QUP_PA      0x07577000u
+@@ -47,6 +73,7 @@ void sweet_touch_init(void);
+ #define TOUCH_ATTN        125u
+ #define TOUCH_SWITCH      80u
+ #define TOUCH_ADDR        0x20u
++#endif
+ #define TOUCH_MAX         10u
+ 
+ /* QUP registers (mainline i2c-qup.c) */
+@@ -153,7 +180,7 @@ touch_clocks(void)
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET TOUCH: QUP3 I2C clock stays off (cbcr=%#x)\n", touch_rd(st.gccqup, 8));
++	printf("SWEET TOUCH: QUP I2C clock stays off (cbcr=%#x)\n", touch_rd(st.gccqup, 8));
+ 	return false;
+ }
+ 
+@@ -439,6 +466,103 @@ touch_poll(void)
+ 	return 0;
+ }
+ 
++#if defined(SWEET_KIRIN)
++/* Register reg of the current Novatek page, n bytes, in FIFO-sized reads. */
++static int
++nvt_read(uint8_t reg, uint8_t *buf, unsigned n)
++{
++	for (unsigned done = 0; done < n;) {
++		unsigned chunk = MIN(n - done, st.rx_max);
++		uint8_t r = (uint8_t)(reg + done);
++		int err = qup_msg(false, &r, 1);
++		if (!err) {
++			err = qup_msg(true, buf + done, chunk);
++		}
++		if (err) {
++			return err;
++		}
++		done += chunk;
++	}
++	return 0;
++}
++
++static int
++nvt_poll(void)
++{
++	uint8_t p[NVT_POINT_LEN];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	int err = nvt_read(0, p, sizeof(p));
++	if (err) {
++		return err;
++	}
++	uint32_t mask = 0;
++	for (unsigned i = 0; i < TOUCH_MAX; i++) {
++		const uint8_t *e = p + 6 * i;
++		unsigned id = e[0] >> 3, status = e[0] & 7u;
++		if (id == 0 || id > TOUCH_MAX || (status != 1 && status != 2)) {
++			continue;
++		}
++		mask |= 1u << (id - 1);
++		x[id - 1] = e[1] << 4 | e[3] >> 4;
++		y[id - 1] = e[2] << 4 | (e[3] & 0xf);
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++static void
++touch_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	st.vote = ml_io_map(TOUCH_GCC_VOTE_PA, 0x1000);
++	st.gccqup = ml_io_map(TOUCH_GCC_QUP_PA, 0x1000);
++	st.qup = ml_io_map(TOUCH_QUP_PA, 0x1000);
++	st.gpio[0] = ml_io_map(TOUCH_TLMM_PA + 0x1000u * TOUCH_SDA, 0x1000);
++	st.gpio[1] = ml_io_map(TOUCH_TLMM_PA + 0x1000u * TOUCH_SCL, 0x1000);
++	if (!st.vote || !st.gccqup || !st.qup || !st.gpio[0] || !st.gpio[1]) {
++		printf("SWEET TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	if (!touch_clocks()) {
++		goto out;
++	}
++	touch_gpio(0, 3, 0, 2, false, false);   /* blsp_i2c1, no pull, 2 mA (DT i2c_1_active) */
++	touch_gpio(1, 3, 0, 2, false, false);
++	if (!qup_init()) {
++		goto out;
++	}
++	uint8_t page[3] = {0xff, (NVT_EVENT_BUF >> 16) & 0xff, (NVT_EVENT_BUF >> 8) & 0xff};
++	int err = qup_msg(false, page, sizeof(page));
++	if (err) {
++		printf("SWEET TOUCH: Novatek page select failed err=%d status=%#x\n", err, st.last_status);
++		goto out;
++	}
++	printf("SWEET TOUCH: Novatek NT36672A running, polled every 10 ms\n");
++	unsigned errors = 0;
++	for (;;) {
++		err = nvt_poll();
++		if (err) {
++			if ((errors++ % 100u) == 0) {
++				printf("SWEET TOUCH: read err=%d status=%#x flags=%#x\n",
++				    err, st.last_status, st.last_err);
++			}
++			if (errors == 10) {
++				touch_report(0, st.x, st.y);   /* release after persistent bad reads */
++			}
++			if (!qup_init() || qup_msg(false, page, sizeof(page))) {
++				touch_wait(100);
++			}
++		} else {
++			errors = 0;
++		}
++		touch_wait(10);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++#else /* !SWEET_KIRIN */
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -531,6 +655,7 @@ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
++#endif /* SWEET_KIRIN */
+ 
+ void
+ sweet_touch_init(void)
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index b8c6bc7..1e331e5 100644
 --- a/bsd/dev/sweet_ufs.c
