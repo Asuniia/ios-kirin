@@ -324,6 +324,24 @@ index 0000000..a5efcf0
 +};
 +
 +#endif /* _ARM64_SWEET_FONT8X8_H_ */
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+index c013288..294b4f5 100644
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -133,7 +133,12 @@ extern int PAGE_SHIFT_CONST;
+ 
+ /* system-wide values */
+ #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+-#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
++/*
++ * SWEET_KIRIN builds a MacOSX-platform kernel with 4K pages: TTBR0 has
++ * 39 bits and the commpage must sit above user VA, so use the iOS limit
++ * (the userland is iOS anyway).
++ */
++#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && !defined(SWEET_KIRIN)
+ #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+ #else
+ #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 index 5d2856f..a8f8acc 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
