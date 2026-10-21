@@ -1,0 +1,90 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -189,7 +189,17 @@
+ 	}
+ 
+ #if !NO_KEXTD
++	/*
++	 * SWEET: iOS has no IOKit daemon (kernelmanagerd) to report its launch, so
++	 * this hold kept the registry root busy for good: IOKit never quiesced
++	 * (IOKitWaitQuiet callers, configd's InterfaceNamer). Idea from the
++	 * ios-topaz fork (0128).
++	 */
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	if (OSKext::iokitDaemonAvailable()) {
++#else
++	if (false) {
++#endif
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+ 		 * messages the kernel after the in-kernel linker has been
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1200,7 +1200,9 @@
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if !defined(ARM64_BOARD_CONFIG_SWEET)                  /* no hold taken (IOStartIOKit.cpp) */
+ 	getServiceRoot()->adjustBusy(-1);
++#endif
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+ }
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -162,6 +162,20 @@
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
++
++/*
++ * The GPU's service class as QuartzCore looks for it: CAMetalContextCreate
++ * polls IOServiceMatching("IOAcceleratorES") 300 times, 100 ms apart, in
++ * every process that sets up CA rendering (302 lookups by backboardd at each
++ * boot, logs/pixel-0165a.txt = 30 s). This one has no MetalPluginName, so
++ * Metal passes over it and CA still picks GLES (sweetgl). Boot-arg
++ * sweetaccel=0 leaves it out. Idea from the ios-topaz fork (0138).
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+@@ -249,6 +263,13 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	int accel = 1;
++	PE_parse_boot_argn("sweetaccel", &accel, sizeof(accel));
++	IOAcceleratorES *es = accel ? OSTypeAlloc(IOAcceleratorES) : NULL;
++	if (es != NULL && es->init() && es->attach(this)) {
++		es->registerService();
++	}
++	OSSafeReleaseNULL(es);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+ 	    fScaled ? ", scaled to the 24 bpp panel" : "");
+@@ -477,11 +498,7 @@
+ 		c.w = fPanelW;
+ 		c.h = fPanelH;
+ 		memset(c.color, 0, sizeof(c.color));
+-		IOLog("SWEET FB: GPU clear of panel buffer %u (gva 0x%llx, src gva 0x%llx)\n", fGpuBack, c.dst_va, c.src_va);
+-		IOSleep(100);           /* the line reaches pstore before a hard hang */
+-		int rc = sweet_gpu_quad(&c);
+-		IOLog("SWEET FB: GPU clear -> %d\n", rc);
+-		if (rc != 0) {
++		if (sweet_gpu_quad(&c) != 0) {
+ 			return false;
+ 		}
+ 		fGpuClean[fGpuBack] = true;
+@@ -725,7 +742,6 @@
+ 		static uint32_t flips;
+ 		if (flips++ < 3) {
+ 			IOLog("SWEET FB: flip %u to 0x%llx\n", flips, fGpuPa[fGpuBack]);
+-			IOSleep(100);
+ 		}
+ 		sweet_fbcon_flip(fGpuPa[fGpuBack], fGpuStride);
+ 		fGpuBack ^= 1;
