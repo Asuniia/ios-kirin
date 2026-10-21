@@ -80,6 +80,7 @@ void shim_main(uint64_t dtb)
 	con_str("SHIM", "kirin (xperia 10) loader");
 	con_skip();
 	con_hex2("WDT", "en=", wdt_en, "bite=", wdt_bite);
+	con_hex("MPIDR", rsr("mpidr_el1") & 0xffffff);	/* mkadt.py --boot-mpidr */
 	con_hex("HEAD", (uintptr_t)_head);
 	con_hex("PAYLOAD", (uintptr_t)_end);
 	con_hex("DTB", dtb);

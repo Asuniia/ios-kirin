@@ -3,7 +3,10 @@
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--pixel1]
+                                   [--kirin [--boot-mpidr=0x100]]
 --pixel1: Google Pixel 1 (sailfish, MSM8996) presented as an iPhone 8 instead.
+--kirin: Sony Xperia 10 (kirin, SDM630) presented as an iPhone X, like sweet;
+--boot-mpidr: MPIDR of the core xboot starts us on (the kirin shim shows it; 0x100).
 """
 import hashlib, os, struct, sys
 
@@ -47,6 +50,22 @@ PIXEL1 = dict(
           (0x100, 1, 2150400000), (0x101, 1, 2150400000)],
 )
 
+# Sony Xperia 10 (kirin, SDM630), from its live FDT and shim probes (NOTES.md).
+# Presented as an iPhone X like sweet; 4K-page kernel (SWEET_BOARD=kirin).
+KIRIN = dict(
+    # Largest RAM range Linux sees is 0x94b00000-0xffafffff; start above the
+    # splash buffer (0x9d400000 + 0x2300000) and stop below debug_region/ramoops.
+    # 2MB aligned (L2 block with 4K pages), same 1GB as the splash (start.s).
+    phys_base=0x9f800000, mem_size=0x60200000,
+    gicd=0x17a00000, gicr=0x17b00000,
+    vtimer=19,  # Qualcomm PPI numbering like sweet: CNTV is PPI 3
+    fb=0x9d400000, fb_size=0x2300000, fb_w=1080, fb_h=2520, fb_bpp=32,  # B, G, R, X
+    # MPIDR, cluster, max clock: two clusters of four Cortex-A53; xboot boots
+    # on 0x100, the 2.2 GHz cluster (Linux cpu0-3)
+    cpus=[(0x0, 0, 1843200000), (0x1, 0, 1843200000), (0x2, 0, 1843200000), (0x3, 0, 1843200000),
+          (0x100, 1, 2208000000), (0x101, 1, 2208000000), (0x102, 1, 2208000000), (0x103, 1, 2208000000)],
+)
+
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
@@ -85,13 +104,16 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, pixel1=False):
+def build(seed=None, qemu=False, highmem=False, pixel1=False, kirin=False, boot_mpidr=0x100):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     vtimer = QEMU_VTIMER_INTID if qemu else VTIMER_INTID
     if pixel1:
         P = PIXEL1
+        phys_base, mem_size, gicd, gicr, vtimer = P['phys_base'], P['mem_size'], P['gicd'], P['gicr'], P['vtimer']
+    elif kirin:
+        P = KIRIN
         phys_base, mem_size, gicd, gicr, vtimer = P['phys_base'], P['mem_size'], P['gicd'], P['gicr'], P['vtimer']
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -152,7 +174,7 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
     for core in range(1 if qemu else 8):
-        if pixel1:
+        if pixel1 or kirin:
             break
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
@@ -195,6 +217,29 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
             ('peripheral-frequency', u32(timebase)),
             ('fixed-frequency', u32(timebase)),
         ]))
+    # kirin: 4 + 4 Cortex-A53 as one SMP cluster too; xboot's boot core is "running".
+    for core, (mpidr, cluster, hz) in enumerate(KIRIN['cpus'] if kirin else []):
+        cpu_nodes.append(node(f'cpu{core}', [
+            ph(),
+            ('device_type', cstr('cpu')),
+            ('compatible', cstr('arm,cortex-a53') + cstr('ARM,v8')),
+            ('reg', u32(mpidr)),
+            ('cpu-id', u32(core)),
+            ('cluster-id', u32(0)),
+            ('cluster-type', u32(0)),
+            ('die-cluster-id', u32(0)),
+            ('cluster-core-id', u32(core)),
+            ('l2-cache-id', u32(cluster)),  # one L2 per cluster of four
+            ('state', cstr('running' if mpidr == boot_mpidr else 'stopped')),
+            ('timebase-frequency', u32(timebase)),
+            ('clock-frequency', u32(hz)),
+            ('bus-frequency', u32(100000000)),
+            ('memory-frequency', u32(1866000000)),
+            ('peripheral-frequency', u32(timebase)),
+            ('fixed-frequency', u32(timebase)),
+        ]))
+    if kirin and not any(m == boot_mpidr for m, _, _ in KIRIN['cpus']):
+        raise SystemExit(f'--boot-mpidr={boot_mpidr:#x} is not a kirin core')
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], cpu_nodes)
 
@@ -248,6 +293,16 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
             # write 1 here after drawing: the panel only refreshes on request
             ('kickoff-reg', u64(P['fb_kickoff'])),
         ])
+    elif kirin:
+        P = KIRIN
+        fbcon = node('sweet-fbcon', [
+            ph(),
+            ('reg', u64(P['fb'], P['fb_size'])),
+            ('width', u32(P['fb_w'])),
+            ('height', u32(P['fb_h'])),
+            ('stride', u32(P['fb_w'] * P['fb_bpp'] // 8)),
+            ('bits-per-pixel', u32(P['fb_bpp'])),
+        ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
@@ -272,8 +327,8 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
     ])
 
     product_props = d22ap_product(D20AP_ADT if pixel1 else D22AP_ADT)
-    if pixel1 and product_props:
-        # The Pixel panel is sRGB, and with "P3" iOS picks deep-color snapshot
+    if (pixel1 or kirin) and product_props:
+        # The Pixel and kirin panels are sRGB, and with "P3" iOS picks deep-color snapshot
         # surfaces (MaterialKit b3a8, CA w30r) that CoreAnimation's CPU renderer
         # cannot draw into: the dock / App Library backgrounds stayed white.
         product_props = [(k, cstr('sRGB') if k in ('artwork-display-gamut', 'display-gamut') else v)
@@ -285,9 +340,10 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     # Pixel 1 keeps 'xiaomi,sweet' for the same kernel matching (one platform expert).
     ident = (('D20AP', 'iPhone10,1', 'D20', 'google,sailfish', 'qcom,msm8996') if pixel1 else
+             ('D22AP', 'iPhone10,3', 'D22', 'sony,kirin', 'qcom,sdm630') if kirin else
              ('D22AP', 'iPhone10,3', 'D22', 'xiaomi,sweet', 'qcom,sm7150'))
     compat = cstr(ident[0]) + cstr(ident[1]) + cstr('xiaomi,sweet')
-    if pixel1:
+    if pixel1 or kirin:
         compat += cstr(ident[3])
     return node('device-tree', [
         ph(),
@@ -298,11 +354,13 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu or kirin else [ufs]))
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, pixel1='--pixel1' in sys.argv)
+    boot_mpidr = next((int(a.split("=", 1)[1], 0) for a in sys.argv if a.startswith("--boot-mpidr=")), 0x100)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, pixel1='--pixel1' in sys.argv,
+                 kirin='--kirin' in sys.argv, boot_mpidr=boot_mpidr)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
