@@ -1,0 +1,530 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -105,6 +105,7 @@
+ extern bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
+ extern ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
+ extern vm_map_address_t phystokv(uint64_t pa);
++extern boolean_t pmap_valid_page(ppnum_t pn);
+ void sweet_gpu_init(void);
+ 
+ #define MMCC_PA         0x008c0000u
+@@ -977,7 +978,10 @@
+ {
+ 	uint64_t off = va - g_maps[m].va;
+ 	for (uint64_t p = off / PAGE_SIZE; p <= (off + len - 1) / PAGE_SIZE; p++) {
+-		flush_dcache64((addr64_t)g_maps[m].pa[p], PAGE_SIZE, TRUE);
++		/* not kernel RAM (the panel buffers): no physmap alias, nothing cached */
++		if (pmap_valid_page((ppnum_t)atop(g_maps[m].pa[p]))) {
++			flush_dcache64((addr64_t)g_maps[m].pa[p], PAGE_SIZE, TRUE);
++		}
+ 	}
+ }
+ 
+@@ -1701,30 +1705,40 @@
+ }
+ 
+ /*
+- * sweetgpuclk=400: the 401.8 MHz corner. GFX rail (PMI8994 S2) first to that
+- * corner's ceiling voltage, 825 mV (downstream msm8996 gfx_cpr
+- * qcom,cpr-voltage-ceiling), read back, then gfx3d = GPLL0 / 1.5 (field
+- * 2). mem-acc is already in its high-voltage setting (0 at boot). VM lock
+- * held: no quad runs meanwhile.
++ * sweetgpuclk=400: the 401.8 MHz corner; 600: GPLL0 undivided, inside the
++ * 624 MHz corner (MSM8996 Pro max; 600 is the closest GPLL0 rate, mmpll9
++ * stays untouched). GFX rail (PMI8994 S2) first to that corner's ceiling
++ * voltage (downstream msm8996 gfx_cpr qcom,cpr-voltage-ceiling: 825 mV at
++ * 401.8, 1015 mV at 624; open loop, no CPR), above 510 MHz VDD_MX to super
++ * turbo over the RPM, read back, then gfx3d = GPLL0 / 1.5 (field 2) or / 1
++ * (field 1). mem-acc is already in its high-voltage setting (0 at boot,
++ * corner-acc-map <1 0>). VM lock held: no quad runs meanwhile.
+  */
++extern bool sweet_rpm_mx_corner(uint32_t corner);
++
+ static bool
+-gfx_400(void)
++gfx_raise(int mhz)
+ {
+ 	uint8_t sub = 0, v = 0;
++	uint32_t mv = mhz == 600 ? 1015 : 825;
+ 	if (!sweet_pmic_read(GFX_S2, 0x05, &sub) || (sub != 8 && sub != 9)) {
+ 		return false;
+ 	}
+-	uint8_t vset = (uint8_t)((825 - (sub == 9 ? 80 : 0)) / 5);
++	if (mhz == 600 && !sweet_rpm_mx_corner(7)) {
++		return false;
++	}
++	uint8_t vset = (uint8_t)((mv - (sub == 9 ? 80 : 0)) / 5);
+ 	if (!sweet_pmic_write(GFX_S2, 0x41, vset)) {
+ 		return false;
+ 	}
+-	delay(2000);                    /* slew 80 mV, then settle */
++	delay(4000);                    /* slew up to 270 mV, then settle */
+ 	if (!sweet_pmic_read(GFX_S2, 0x41, &v) || v != vset) {
+ 		printf("SWEET GPU: S2 vset %u, want %u: clock stays\n", v, vset);
+ 		return false;
+ 	}
+-	return gfx_clock(2);
++	return gfx_clock(mhz == 600 ? 1 : 2);
+ }
++
+ 
+ /* Full-screen (750x1334, pitch 3072) source-over quads: average us of 5. */
+ static uint64_t
+@@ -2045,14 +2059,15 @@
+ 			(void)PE_parse_boot_argn("sweetgpuclk", &mhz, sizeof(mhz));
+ 			g_max_mhz = 300;
+ 			uint64_t us300 = quad_bench();
+-			if (mhz == 400) {
++			if (mhz == 400 || mhz == 600) {
+ 				lck_mtx_lock(&sweet_gpu_vm_lock);
+-				bool ok = gfx_400();
++				bool ok = gfx_raise(mhz);
+ 				lck_mtx_unlock(&sweet_gpu_vm_lock);
+-				g_max_mhz = ok ? 400 : 300;
+-				uint64_t us400 = ok ? quad_bench() : 0;
+-				printf("SWEET GPU: full-screen quad %llu us at 300 MHz, %llu us at 400 MHz (%s)\n",
+-				    us300, us400, ok ? "S2 825 mV, GPLL0/1.5" : "switch FAILED");
++				g_max_mhz = ok ? mhz : 300;
++				uint64_t usx = ok ? quad_bench() : 0;
++				printf("SWEET GPU: full-screen quad %llu us at 300 MHz, %llu us at %d MHz (%s)\n",
++				    us300, usx, mhz, !ok ? "switch FAILED" : mhz == 600 ? "S2 1015 mV, MX turbo, GPLL0/1" :
++				    "S2 825 mV, GPLL0/1.5");
+ 				if (ok) {
+ 					api_selftest();
+ 				}
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -359,6 +359,23 @@
+ }
+ 
+ /*
++ * VDD_MX (PM8994 S2+S12, RPM "smpa" 2) corner vote in the active set, like
++ * Linux's pm8994_s2_corner: key "corn" = corner - 1 (rpm-smd-regulator
++ * voltage_offset RPM_REGULATOR_CORNER_NONE); corner 7 = super turbo, which
++ * the GPU needs above 510 MHz (gfxfreq-mx-speedbin0).
++ */
++bool
++sweet_rpm_mx_corner(uint32_t corner)
++{
++	uint32_t kv[4] = {0x6e657773u, 1u, 0x6e726f63u, corner - 1};   /* swen = 1, corn */
++	lck_mtx_lock(&sweet_rpm_lock);
++	bool ok = rpm_request("MX", 0, 0x61706d73u, 2, kv, 2);           /* "smpa" */
++	lck_mtx_unlock(&sweet_rpm_lock);
++	printf("SWEET RPM: MX corner %u: %s\n", corner, ok ? "ok" : "FAILED");
++	return ok;
++}
++
++/*
+  * Clock vote in the sleep and the active set, like a Linux clk-smd-rpm
+  * clock without an _a twin: type e.g. "clk2" (memory clocks: id 0 bimc =
+  * DDR), key "KHz ", rate in kHz; the RPM rounds to a supported rate. Takes
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -86,6 +86,8 @@
+ #define SWEET_FB_P1_DOT_PITCH           326
+ 
+ extern "C" void sweet_fbcon_kick(bool force);           /* pexpert/arm/pe_serial.c */
++extern "C" void sweet_fbcon_flip(uint64_t pa, uint32_t stride);
++#include "../../../bsd/dev/sweet_gpu.h"
+ extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ /* Read by bsd/dev/sweet_perf.c. */
+ extern "C" uint64_t sweet_fb_stat_swaps, sweet_fb_stat_presents, sweet_fb_stat_present_abs;
+@@ -132,6 +134,18 @@
+ 	IOBufferMemoryDescriptor *fShadow;
+ 	uint8_t      *fRow, *fOut;     /* one source row, one panel row */
+ 	uint32_t     *fXmap;           /* panel column -> byte offset in fRow */
++	/* GPU present: two 32 bpp panel buffers, the MDP flips between them */
++	bool          fGpu;
++	bool          fGpuTried;
++	bool          fGpuClean[2];     /* cleared once (garbage RAM at first) */
++	bool          fGpuTest;         /* sweetfb_gpu=2: GPU draws, the panel keeps the CPU copy */
++	uint32_t      fGpuStride, fGpuBack;
++	uint64_t      fGpuPa[2], fGpuVa[2];
++	struct {
++		SweetSurface *s;
++		uint64_t      va;
++	}             fGmap[4];         /* swap surfaces mapped for the GPU */
++	uint32_t      fGmapNext;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -140,6 +154,9 @@
+ 	void present(const uint8_t *rec);
+ 	void presentPending(void);
+ 	bool startScaled(void);
++	bool gpuStart(void);
++	uint64_t gpuMap(SweetSurface *s);
++	bool gpuLayer(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h);
+ 	void blitScaled(uintptr_t src, uint32_t bpr, int32_t sx, int32_t sy,
+ 	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ };
+@@ -218,7 +235,7 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	uint32_t hz = 30;
++	uint32_t hz = 60;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	/*
+ 	 * Swaps come on the 16.7 ms vsync grid with jitter: a strict 33.3 ms
+@@ -317,8 +334,161 @@
+ 		}
+ 		memcpy((void *)(fPanel + (uint64_t)y * fPanelStride + (uint64_t)x0 * 3), fOut, (size_t)n * 3);
+ 	}
++}
++
++/* num / den as IEEE single bits (truncated); |num| < 2^20, den > 0. */
++static uint32_t
++fbits(int64_t num, uint32_t den)
++{
++	if (num == 0) {
++		return 0;
++	}
++	uint32_t sign = num < 0 ? 0x80000000u : 0;
++	uint64_t q = ((uint64_t)(num < 0 ? -num : num) << 40) / den;
++	int t = 63 - __builtin_clzll(q);
++	uint64_t mant = t >= 23 ? q >> (t - 23) : q << (23 - t);
++	return sign | ((uint32_t)(t - 40 + 127) << 23) | ((uint32_t)mant & 0x7fffffu);
+ }
+ 
++/*
++ * Panel buffers for the GPU present: 1080x1920 B,G,R,X, rows padded to 64
++ * bytes, in the lower RAM bank next to the bootloader's splash (0xc0001000;
++ * XNU only owns the upper bank, Linux has this as free RAM). The MDP fetches
++ * physical addresses below 4 GB, the GPU through its SMMU (identity there).
++ * Not mapped for the CPU (the kernel io map is 8 MB: a whole buffer
++ * panicked kmem_alloc, 0164a); the GPU clears each before its first use.
++ * From the first GPU frame on VIG0 is switched to 32 bpp (sweet_fbcon_flip):
++ * the kernel text console (24 bpp in the old buffer) no longer shows.
++ * Boot-arg sweetfb_gpu=0 keeps the CPU copy.
++ */
++#define SWEET_FB_GPU_PA0        0xc0800000ull
++#define SWEET_FB_GPU_PA1        0xc1000000ull
++#define SWEET_FB_GPU_SLOT       0x00800000ull
++
++bool
++AppleCLCD::gpuStart(void)
++{
++	int on = 1;
++	PE_parse_boot_argn("sweetfb_gpu", &on, sizeof(on));
++	fGpuStride = (fPanelW * 4 + 63) & ~63u;
++	uint64_t bytes = round_page((uint64_t)fGpuStride * fPanelH);
++	fGpuTest = on == 2;
++	if (!on || bytes > SWEET_FB_GPU_SLOT) {
++		return false;
++	}
++	uint32_t npages = (uint32_t)(bytes / PAGE_SIZE);
++	uint64_t *pa = (uint64_t *)IOMallocData(npages * sizeof(uint64_t));
++	if (pa == NULL) {
++		return false;
++	}
++	for (int b = 0; b < 2; b++) {
++		fGpuPa[b] = b ? SWEET_FB_GPU_PA1 : SWEET_FB_GPU_PA0;
++		for (uint32_t p = 0; p < npages; p++) {
++			pa[p] = fGpuPa[b] + (uint64_t)p * PAGE_SIZE;
++		}
++		fGpuVa[b] = sweet_gpu_vm_map(pa, npages, false);
++	}
++	IOFreeData(pa, npages * sizeof(uint64_t));
++	bool ok = fGpuVa[0] != 0 && fGpuVa[1] != 0;
++	IOLog("SWEET FB: GPU present %s (panel buffers 0x%llx 0x%llx, stride %u)\n",
++	    ok ? "on" : "FAILED", fGpuPa[0], fGpuPa[1], fGpuStride);
++	return ok;
++}
++
++/* GPU VA of a swap surface; up to 4 stay mapped (and retained), oldest out. */
++uint64_t
++AppleCLCD::gpuMap(SweetSurface *s)
++{
++	for (uint32_t i = 0; i < 4; i++) {
++		if (fGmap[i].s == s) {
++			return fGmap[i].va;
++		}
++	}
++	IOMemoryDescriptor *md = s->memory;
++	uint64_t size = md != NULL ? md->getLength() : 0;
++	if (size == 0 || (size & PAGE_MASK) || md->prepare() != kIOReturnSuccess) {
++		return 0;
++	}
++	uint32_t npages = (uint32_t)(size / PAGE_SIZE);
++	uint64_t *pa = (uint64_t *)IOMallocData(npages * sizeof(uint64_t));
++	bool ok = pa != NULL;
++	for (uint32_t p = 0; ok && p < npages; p++) {
++		IOByteCount seg = 0;
++		pa[p] = md->getPhysicalSegment((IOByteCount)p * PAGE_SIZE, &seg, kIOMemoryMapperNone);
++		ok = pa[p] != 0 && (pa[p] & PAGE_MASK) == 0 && seg >= PAGE_SIZE;
++	}
++	uint64_t va = ok ? sweet_gpu_vm_map(pa, npages, true) : 0;
++	if (pa != NULL) {
++		IOFreeData(pa, npages * sizeof(uint64_t));
++	}
++	if (va == 0) {
++		md->complete();
++		return 0;
++	}
++	uint32_t i = fGmapNext++ % 4;
++	if (fGmap[i].s != NULL) {
++		sweet_gpu_vm_unmap(fGmap[i].va);
++		fGmap[i].s->memory->complete();
++		fGmap[i].s->release();
++	}
++	s->retain();
++	fGmap[i].s = s;
++	fGmap[i].va = va;
++	return va;
++}
++
++/*
++ * Logical rect (dx,dy,w,h) of a BGRA source at (sx,sy) -> the panel pixels
++ * it covers in the back buffer, bilinear (the CPU path is nearest).
++ */
++bool
++AppleCLCD::gpuLayer(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	uint32_t lw = fWidth, lh = fHeight;
++	uint32_t x0 = ((uint32_t)dx * fPanelW + lw - 1) / lw;
++	uint32_t x1 = MIN(((uint32_t)(dx + w) * fPanelW + lw - 1) / lw, fPanelW);
++	uint32_t y0 = ((uint32_t)dy * fPanelH + lh - 1) / lh;
++	uint32_t y1 = MIN(((uint32_t)(dy + h) * fPanelH + lh - 1) / lh, fPanelH);
++	if (x0 >= x1 || y0 >= y1) {
++		return true;
++	}
++	if ((s->offset & 63) || (s->bytesPerRow & 63)) {
++		return false;
++	}
++	uint64_t va = gpuMap(s);
++	if (va == 0) {
++		return false;
++	}
++	struct sweet_gpu_quad q = {
++		.src_va = va + s->offset, .dst_va = fGpuVa[fGpuBack],
++		.src_w = s->width, .src_h = s->height, .src_pitch = s->bytesPerRow,
++		.dst_w = fPanelW, .dst_h = fPanelH, .dst_pitch = fGpuStride,
++		.x0 = x0, .y0 = y0, .w = x1 - x0, .h = y1 - y0,
++		/* u = (X + .5) lw / pw + sx - dx, v likewise */
++		.m = {fbits(lw, fPanelW), 0, 0, fbits(lh, fPanelH), fbits(sx - dx, 1), fbits(sy - dy, 1)},
++		.flags = SWEET_GPU_QUAD_COPY,
++		.color = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u},
++		.src_fmt = SWEET_GPU_FMT_RGBA8,
++		.src_swiz = 0x688,      /* xyzw: bytes B, G, R, A as they are */
++	};
++	if (!fGpuClean[fGpuBack]) {
++		struct sweet_gpu_quad c = q;    /* the whole panel, colour 0 */
++		c.x0 = c.y0 = 0;
++		c.w = fPanelW;
++		c.h = fPanelH;
++		memset(c.color, 0, sizeof(c.color));
++		IOLog("SWEET FB: GPU clear of panel buffer %u (gva 0x%llx, src gva 0x%llx)\n", fGpuBack, c.dst_va, c.src_va);
++		IOSleep(100);           /* the line reaches pstore before a hard hang */
++		int rc = sweet_gpu_quad(&c);
++		IOLog("SWEET FB: GPU clear -> %d\n", rc);
++		if (rc != 0) {
++			return false;
++		}
++		fGpuClean[fGpuBack] = true;
++	}
++	return sweet_gpu_quad(&q) == 0;
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -379,60 +549,6 @@
+ 
+ extern "C" void sweet_user_backtrace(const char *tag);
+ 
+-/*
+- * Diagnostic: find the black frame seen at the end of blur transitions.
+- * Samples a 16x16 grid of each layer-0 frame; when a frame is (almost) all
+- * black after one that was not, logs the last frames' stats (black samples,
+- * distinct colours, time since the previous present) and, on the swap path,
+- * backboardd's user backtrace.
+- */
+-struct SweetFrameStat {
+-	uint32_t seq, surface, black, uniq, px0;
+-	uint64_t abs;
+-};
+-
+-static void
+-sweet_fb_sample(uint32_t seq, uint32_t surface, uintptr_t base, uint32_t bpr,
+-    int32_t sx, int32_t sy, int32_t w, int32_t h)
+-{
+-	static SweetFrameStat ring[4];
+-	static uint32_t n, events;
+-	uint32_t px[256], black = 0, uniq = 0;
+-	for (int j = 0; j < 16; j++) {
+-		for (int i = 0; i < 16; i++) {
+-			uint32_t v = *(const volatile uint32_t *)(base + (uint64_t)(sy + h * j / 16) * bpr +
+-			    (uint64_t)(sx + w * i / 16) * 4);
+-			px[j * 16 + i] = v;
+-			black += (v & 0xffffff) == 0;
+-		}
+-	}
+-	for (int k = 0; k < 256; k++) {
+-		int m = 0;
+-		while (m < k && px[m] != px[k]) {
+-			m++;
+-		}
+-		uniq += m == k;
+-	}
+-	SweetFrameStat *cur = &ring[n % 4], *prev = &ring[(n + 3) % 4];
+-	*cur = (SweetFrameStat){seq, surface, black, uniq, px[136], mach_absolute_time()};
+-	n++;
+-	if (n < 2 || black < 200 || prev->black >= 200 || events >= 40) {
+-		return;
+-	}
+-	events++;
+-	for (uint32_t k = n < 4 ? 0 : n - 4; k < n; k++) {
+-		SweetFrameStat *f = &ring[k % 4], *b = &ring[(k + 3) % 4];
+-		uint64_t ns = 0;
+-		absolutetime_to_nanoseconds(f->abs - b->abs, &ns);
+-		IOLog("SWEET FB: frame %s seq %u surface %u black %u uniq %u px 0x%08x dt %llu us\n",
+-		    k == n - 1 ? "BLACK" : "before", f->seq, f->surface, f->black, f->uniq, f->px0, ns / 1000);
+-	}
+-	IOLog("SWEET FB: black px 0x%08x 0x%08x 0x%08x 0x%08x\n", px[0], px[17], px[136], px[255]);
+-	if (current_task() != kernel_task) {
+-		sweet_user_backtrace("blackframe");
+-	}
+-}
+-
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * Copy the frame into the panel inside the swap call, at most sweetfb_hz
+@@ -481,6 +597,10 @@
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
++	if (fScaled && !fGpuTried && sweet_gpu_ready()) {
++		fGpuTried = true;
++		fGpu = gpuStart();
++	}
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -571,10 +691,26 @@
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4 && layer == 0) {
+-			sweet_fb_sample(get32(rec, 0x50), id, src + s->offset, s->bytesPerRow, sx, sy, w, h);
+-		}
+-		if (src != 0 && bpe == 4 && fScaled) {
++		if (src != 0 && bpe == 4 && fGpu) {
++			static uint32_t marks;
++			uint64_t t0 = mach_absolute_time();
++			bool ok = gpuLayer(s, sx, sy, dx, dy, w, h);
++			if (marks < 6) {
++				uint64_t ns;
++				absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++				IOLog("SWEET FB: GPU layer %u surface %u: %s in %llu us\n", marks++, id, ok ? "ok" : "failed", ns / 1000);
++			}
++			if (fGpuTest) {
++				blitScaled(src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
++			}
++			if (!ok) {
++				static uint32_t failed;
++				if (failed++ < 20) {
++					IOLog("SWEET FB: GPU present of surface %u (bpr %u offset %u) failed\n",
++					    id, s->bytesPerRow, s->offset);
++				}
++			}
++		} else if (src != 0 && bpe == 4 && fScaled) {
+ 			blitScaled(src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
+ 		} else if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+@@ -585,8 +721,17 @@
+ 		}
+ 		s->release();
+ 	}
+-	if (fScaled) {
++	if (fGpu && !fGpuTest) {
++		static uint32_t flips;
++		if (flips++ < 3) {
++			IOLog("SWEET FB: flip %u to 0x%llx\n", flips, fGpuPa[fGpuBack]);
++			IOSleep(100);
++		}
++		sweet_fbcon_flip(fGpuPa[fGpuBack], fGpuStride);
++		fGpuBack ^= 1;
++	} else if (fScaled) {
+ 		sweet_fbcon_kick(true);
++		fGpuBack ^= fGpuTest;
+ 	}
+ }
+ 
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -736,6 +736,7 @@
+ }
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ void sweet_fbcon_kick(bool force);
++void sweet_fbcon_flip(uint64_t pa, uint32_t stride);
+ 
+ static void
+ fbcon_clear_row(uint32_t row)
+@@ -770,6 +771,9 @@
+  */
+ #define FBCON_PP0_DONE  (1u << 8)
+ static volatile uint32_t *fbcon_intr;   /* MDP INTR_STATUS; CLEAR is the next word */
++static volatile uint32_t *fbcon_vig0;   /* MDP VIG0 pipe (the panel's source) */
++static uint64_t fbcon_src_next;
++static uint32_t fbcon_src_stride;
+ uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
+ 
+ static bool
+@@ -794,6 +798,15 @@
+ 	if (ok) {
+ 		if (fbcon_intr != NULL) {
+ 			fbcon_intr[1] = FBCON_PP0_DONE;
++		}
++		uint64_t src = os_atomic_xchg(&fbcon_src_next, 0ull, relaxed);
++		if (src != 0 && fbcon_vig0 != NULL) {
++			fbcon_vig0[0x14 / 4] = (uint32_t)src;           /* SRC0_ADDR */
++			fbcon_vig0[0x24 / 4] = fbcon_src_stride;        /* SRC_YSTRIDE0 */
++			fbcon_vig0[0x30 / 4] = 0x000236ffu;             /* SRC_FORMAT: XRGB8888, 4 bpp */
++			fbcon_vig0[0x34 / 4] = 0x03020001u;             /* UNPACK: bytes B, G, R, X */
++			__builtin_arm_dsb(DSB_SY);
++			fbcon_kickoff[-1] = 1u;                         /* CTL0_FLUSH: VIG0 */
+ 		}
+ 		__builtin_arm_dsb(DSB_SY);
+ 		*fbcon_kickoff = 1;
+@@ -803,6 +816,23 @@
+ 	}
+ 	os_atomic_store(&lock, 0u, release);
+ 	return ok;
++}
++
++/*
++ * Show a 32 bpp B,G,R,X frame at pa (below 4 GB: the MDP fetches without
++ * its SMMU), stride bytes per row: the next START latches VIG0's new
++ * source (CTL0_FLUSH), so the frame being sent keeps its own buffer.
++ * Waits for the previous frame like sweet_fbcon_kick(true).
++ */
++void
++sweet_fbcon_flip(uint64_t pa, uint32_t stride)
++{
++	if (fbcon_vig0 == NULL) {
++		return;
++	}
++	fbcon_src_stride = stride;
++	os_atomic_store(&fbcon_src_next, pa, release);
++	sweet_fbcon_kick(true);
+ }
+ 
+ void
+@@ -921,6 +951,16 @@
+ 		if (page != 0) {
+ 			fbcon_kickoff = (volatile uint32_t *)(page + (*kick & PAGE_MASK));
+ 		}
++		/*
++		 * VIG0 pipe 0x905000 = MDP (0x901000) + 0x4000 = CTL0 (kick - 0x1c) + 0x3000, for
++		 * sweet_fbcon_flip. Mapped now: by the first GPU frame the 8 MB io
++		 * map is full and even one page panicked kmem_alloc (0164b).
++		 */
++		uint64_t vig = *kick - 0x1c + 0x3000;
++		page = ml_io_map(trunc_page_64(vig), PAGE_SIZE);
++		if (page != 0) {
++			fbcon_vig0 = (volatile uint32_t *)(page + (vig & PAGE_MASK));
++		}
+ 		/* MDP top (mdss base + 0x1000) INTR_STATUS +0x14, CLEAR +0x18 */
+ 		uint64_t intr = (*kick & ~0xffffull) + 0x1014;
+ 		page = ml_io_map(trunc_page_64(intr), PAGE_SIZE);
