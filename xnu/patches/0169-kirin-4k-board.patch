@@ -324,6 +324,20 @@ index 0000000..a5efcf0
 +};
 +
 +#endif /* _ARM64_SWEET_FONT8X8_H_ */
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 182b44a..3697009 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -160,7 +160,8 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if XNU_PLATFORM_MacOSX
++/* SWEET_KIRIN: iOS kernel VA layout (112GB), no room for the macOS zone map */
++#if XNU_PLATFORM_MacOSX && !defined(SWEET_KIRIN)
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else /* XNU_PLATFORM_MacOSX */
 diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
 index c013288..294b4f5 100644
 --- a/osfmk/mach/arm/vm_param.h
