@@ -356,6 +356,48 @@ index c013288..294b4f5 100644
  #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
  #else
  #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 54edb01..f702842 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3563,6 +3563,18 @@ kmem_add_extra_claims(void)
+ 	data_range_size = largest_free_size
+ 	    - (ptr_range_size * kmem_ptr_ranges)
+ 	    - sprayqtn_range_size;
++#if defined(SWEET_KIRIN)
++	/*
++	 * The claims above add up to exactly the largest free range. With 16K
++	 * VM pages on 4K hardware pages any alignment slack makes the last
++	 * claim miss (kmem_range_init panic): keep 1GB of the data range free.
++	 */
++	data_range_size -= 1ULL << 30;
++	printf("SWEET kmem: largest free %#llx, claims %#llx, ptr %#llx, sprayqtn %#llx, data %#llx\n",
++	    (unsigned long long)(largest_free_size + total_claims), (unsigned long long)total_claims,
++	    (unsigned long long)ptr_range_size, (unsigned long long)sprayqtn_range_size,
++	    (unsigned long long)data_range_size);
++#endif
+ 
+ 	/*
+ 	 * Add claims for kmem's ranges
+@@ -3639,11 +3651,18 @@ kmem_scramble_ranges(void)
+ 		vm_map_offset_t end = 0;
+ 		struct kmem_range_startup_spec sp = kmem_claims[i];
+ 		struct mach_vm_range *sp_range = sp.kc_range;
++#if defined(SWEET_KIRIN)
++		vm_map_offset_t from = start;
++#endif
+ 		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
+ 		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
+ 			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
+ 			    sp.kc_name);
+ 		}
++#if defined(SWEET_KIRIN)
++		printf("SWEET kmem: %-20s %#llx from %p at %p\n", sp.kc_name,
++		    (unsigned long long)sp.kc_size, (void *)from, (void *)start);
++#endif
+ 
+ 		end = start + sp.kc_size;
+ 		/*
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 index 5d2856f..cdf69c0 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
