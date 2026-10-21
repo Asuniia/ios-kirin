@@ -2,14 +2,39 @@
 backup/
 dtb/
 recovery/
-# third-party/Apple sources fetched for reading
+# third-party/Apple sources fetched for reading, phone pulls, IPSW parts, firmware
 research/
+# build outputs and boot images
 shim/out/
 xnu/out/
 xnu/out-*/
-__pycache__/
-logs/
 tools/sweetgpu-test/out/
 tools/sweetgpu-ca/out/
 tools/sweetgl/out/
 tools/sweetgl/out-build.log
+# kernel logs pulled from the phone
+logs/
+# never commit Apple or vendor binaries, disk images or photos
+*.ipsw
+*.dmg
+*.img
+*.simg
+*.shadow
+*.bundle
+*.mbn
+*.mdt
+*.b0[0-9]
+*.fw
+*.ips
+*.HEIC
+*.heic
+IMG_*.jpg
+IMG_*.jpeg
+# local tooling and OS clutter
+__pycache__/
+.DS_Store
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.vscode/
+.idea/
