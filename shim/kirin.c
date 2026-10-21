@@ -7,6 +7,7 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "emmc.h"
 #include "fdt.h"
 #include "loader.h"
 
@@ -99,6 +100,11 @@ void shim_main(uint64_t dtb)
 	if (rd_start > (uintptr_t)_end && rd_start < limit)
 		limit = rd_start;
 	con_hex("LIMIT", limit);
+#ifdef KIRIN_EMMC_PROBE
+	con_skip();
+	emmc_probe();
+	fail("EMMC", "probe done, nothing written");
+#endif
 
 	uint64_t size = payload_size((uintptr_t)_end);
 	if (!size)
