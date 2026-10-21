@@ -13,6 +13,7 @@ This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generati
 - Display updates **up to 60 Hz**. The GPU scales each frame onto the panel and the display flips between two buffers, so there is no tearing and no CPU copy. The UI runs at roughly 15–35 frames/s depending on the screen: CoreAnimation's CPU work in backboardd is now the limit, not the GPU.
 - Lock screen, home screen, App Library, Control Center, notification center, Settings, the stock iOS 16 wallpaper with its layered artwork, and **all stock Apple apps** (Weather, Calendar, Clock, Mail, Notes, Maps, Music, Calculator, Files, ...).
 - Touchscreen, power / volume buttons, **real battery percentage and charging**.
+- **Brightness control and display sleep**: the Control Center / Settings slider, and the screen fades out on lock and back in on wake.
 
 ## What works
 
@@ -25,6 +26,7 @@ This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generati
 | iOS userland | Real iPhone 8 16.7.16 root filesystem, cryptexes and shared cache (the userland is ARMv8.0-clean, so it runs on Kryo) |
 | GPU | Adreno 530 at 600 MHz: power, clocks, SMMU, CP microcode, zap shader via TrustZone; buffer objects and command submission for user space. Mesa (freedreno, GLES 3.1) runs inside backboardd as `sweetgl.dylib`, behind an EAGL shim that CoreAnimation's GL renderer uses as if it were Apple's |
 | Display | Command-mode Samsung panel through the MDP: iOS sees an iPhone 8 panel (750×1334 @2x), scaled (bilinear, on the GPU) to 1080×1920; double-buffered, up to 60 Hz |
+| Brightness / sleep | iOS's CoreBrightness drives a kernel `AppleARMBacklight`, which sends the panel's DCS brightness command (0x51) through the DSI command FIFO between frames; display sleep blanks the layer mixer (black = pixels off on the AMOLED panel) |
 | Touch | Synaptics RMI4 over I²C (BLSP QUP), rails switched on through the RPM, delivered as HID digitizer events |
 | Buttons | Power, volume up, volume down = **Home** (PMIC/TLMM), as HID keys |
 | Battery | Fuel gauge readout and charging at 1.5 A (PMI8994) |
@@ -36,7 +38,6 @@ This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generati
 - **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS, Touch ID or SEP.**
 - **No hardware video decoder:** HEIC images and video do not decode. The stock wallpapers' HEIC layers are converted to PNG when the root is built (`tools/wallpaper-heic2png.sh`).
 - **No Metal.** CoreAnimation falls back to its OpenGL ES renderer, which is what runs on the GPU. Apps that need Metal do not work.
-- **No display sleep or brightness control:** the panel stays on.
 - **No thermal management:** keep turbo off for normal use.
 - **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
 
