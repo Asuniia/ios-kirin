@@ -899,10 +899,10 @@ index 0000000..a5efcf0
 +
 +#endif /* _ARM64_SWEET_FONT8X8_H_ */
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
-index 437adb1..3247195 100644
+index 437adb1..eb98779 100644
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
-@@ -1065,6 +1065,36 @@ panic_with_thread_context(unsigned int reason, void *ctx, uint64_t debugger_opti
+@@ -1065,6 +1065,39 @@ panic_with_thread_context(unsigned int reason, void *ctx, uint64_t debugger_opti
  #endif /* defined (__x86_64__) */
  
  #pragma clang diagnostic push
@@ -918,6 +918,9 @@ index 437adb1..3247195 100644
 +sweet_panic_backtrace(void)
 +{
 +	uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
++	/* unbuffered: the buffered console is not drained before the panic spins */
++	kdb_printf_unbuffered("SWEET bt from fp 0x%lx (pa 0x%llx)\n", fp,
++	    (unsigned long long)kvtophys((vm_offset_t)fp));
 +	for (int i = 0; i < 24 && fp && !(fp & 0xf); i++) {
 +		/* 16-byte aligned: the frame record never straddles a page */
 +		if (!kvtophys((vm_offset_t)fp)) {
@@ -927,7 +930,7 @@ index 437adb1..3247195 100644
 +		if (!frame[1]) {
 +			break;
 +		}
-+		kdb_printf("SWEET bt %2d: 0x%lx\n", i, frame[1]);
++		kdb_printf_unbuffered("SWEET bt %2d: 0x%lx\n", i, frame[1]);
 +		if (frame[0] <= fp) {
 +			break;
 +		}
@@ -939,7 +942,7 @@ index 437adb1..3247195 100644
  #pragma clang diagnostic ignored "-Wmissing-noreturn"
  void
  panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsigned int reason, void *ctx,
-@@ -1076,6 +1106,9 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+@@ -1076,6 +1109,9 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
  	/* No CPU/thread/debugger state is required for this first panic copy. */
  	sweet_early_panic(panic_format_str, panic_args);
  #endif
