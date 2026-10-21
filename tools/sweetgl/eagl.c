@@ -24,6 +24,7 @@
 #include <time.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/vm_page_size.h>
+#include <mach/mach_time.h>
 #include <libkern/OSCacheControl.h>
 
 #include "eagl.h"
@@ -1297,11 +1298,45 @@ sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLs
  * (IOMFB swap, copied by the kernel at once) without waiting for the GPU;
  * per-surface fences in the swap path would let the GPU run ahead.
  */
+/*
+ * Frame timing, logged every 10 s: flushes, time blocked in glFinish (GPU
+ * still busy) and the CPU time between one flush's return and the next.
+ */
+static void
+flush_stats(uint64_t t0, uint64_t t1)
+{
+	static uint64_t last, window, n, wait, wait_max, cpu;
+	static mach_timebase_info_data_t tb;
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	if (last != 0) {
+		cpu += t0 - last;
+	}
+	wait += t1 - t0;
+	wait_max = t1 - t0 > wait_max ? t1 - t0 : wait_max;
+	n++;
+	last = t1;
+	if (window == 0) {
+		window = t1;
+	}
+	uint64_t span = (t1 - window) * tb.numer / tb.denom;
+	if (span >= 10000000000ull) {
+		sweet_drm_log("sweetgl: %.1f flushes/s, finish avg %llu us max %llu us, between %llu us",
+		    n * 1e9 / span, wait * tb.numer / tb.denom / 1000 / n, wait_max * tb.numer / tb.denom / 1000,
+		    cpu * tb.numer / tb.denom / 1000 / n);
+		window = t1;
+		n = wait = wait_max = cpu = 0;
+	}
+}
+
 void
 sgl_Flush(void *rctx)
 {
 	SGL_CUR(rctx);
+	uint64_t t0 = mach_absolute_time();
 	glFinish();
+	flush_stats(t0, mach_absolute_time());
 }
 
 void

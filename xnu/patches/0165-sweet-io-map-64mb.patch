@@ -1,0 +1,17 @@
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,13 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/*
++ * SWEET: 64 MB (was 8). The Pixel panel framebuffer alone is 6.2 MB and the
++ * SoC drivers (GPU, RPM, SPMI, UFS, USB, clocks, MDP) map dozens of pages:
++ * with 8 MB a 16 KB mapping panicked kmem_alloc depending on the boot-args
++ * (0164e, 0164h).
++ */
++#define IO_MAP_SIZE            (64ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
