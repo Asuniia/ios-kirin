@@ -757,6 +757,20 @@ index c013288..294b4f5 100644
  #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
  #else
  #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 1e7ca07..d06272a 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -811,7 +811,8 @@ vm_compressor_set_size(void)
+ 	compressor_pool_max_size = C_SEG_MAX_LIMIT;
+ 	compressor_pool_max_size *= c_seg_bufsize;
+ 
+-#if XNU_TARGET_OS_OSX
++	/* SWEET_KIRIN: iOS kernel VA layout, no room for 16x RAM of compressor VA */
++#if XNU_TARGET_OS_OSX && !defined(SWEET_KIRIN)
+ 
+ 	if (vm_compression_limit == 0) {
+ 		if (max_mem <= (4ULL * 1024ULL * 1024ULL * 1024ULL)) {
 diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
 index 54edb01..f702842 100644
 --- a/osfmk/vm/vm_kern.c
