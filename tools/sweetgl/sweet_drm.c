@@ -178,7 +178,8 @@ get_param(struct drm_msm_param *p)
 {
 	switch (p->param) {
 	case MSM_PARAM_GPU_ID:
-		p->value = 530;
+		/* core.major.minor of the kernel's chip id: 0x05030002 = 530, 0x05000800 = 508 */
+		p->value = ((chip_id >> 24) & 0xff) * 100 + ((chip_id >> 16) & 0xff) * 10 + ((chip_id >> 8) & 0xff);
 		return 0;
 	case MSM_PARAM_GMEM_SIZE:
 		p->value = gmem_size;

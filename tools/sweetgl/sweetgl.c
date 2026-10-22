@@ -62,6 +62,15 @@ struct sweetgl_ctx {
 
 static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct pipe_frontend_screen *fscreen;
+
+/* st_api_create_context calls it unconditionally (ST_MANAGER_BROKEN_INVALIDATE): no. */
+static int
+sweetgl_get_param(struct pipe_frontend_screen *fs, enum st_manager_param param)
+{
+	(void)fs;
+	(void)param;
+	return 0;
+}
 static driOptionCache opt_info, opts;
 
 void
@@ -115,6 +124,7 @@ sweetgl_init(void)
 			} else {
 				fscreen = calloc(1, sizeof(*fscreen));
 				fscreen->screen = screen;
+				fscreen->get_param = sweetgl_get_param;
 				sweetgl_image_hooks(fscreen);  /* before any context: st checks them at creation */
 				sweet_drm_log("sweetgl: screen %s (%s)", screen->get_name(screen),
 				    screen->get_vendor(screen));

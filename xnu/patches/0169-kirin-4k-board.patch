@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index a8c7bde..da2dd0e 100644
+index a8c7bde..9987c52 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -113,10 +113,22 @@ void sweet_gpu_init(void);
@@ -168,7 +168,7 @@ index a8c7bde..da2dd0e 100644
  			int mhz = 300;
  			(void)PE_parse_boot_argn("sweetgpuclk", &mhz, sizeof(mhz));
  			g_max_mhz = 300;
-@@ -2224,6 +2298,165 @@ gpu_thread(void *arg, wait_result_t result)
+@@ -2224,6 +2298,166 @@ gpu_thread(void *arg, wait_result_t result)
  	}
  }
  
@@ -286,6 +286,7 @@ index a8c7bde..da2dd0e 100644
 +{
 +	int level = (int)(uintptr_t)arg;
 +	(void)wr;
++	g_level = level;        /* service mode skips the MSM8996 log-flush pauses (gpu_wait) */
 +	vm_offset_t g71 = ml_io_map(0x00171000u, 0x1000), g52 = ml_io_map(0x00152000u, 0x1000);
 +	vm_offset_t cc = ml_io_map(0x05065000u, 0x2000), ldo = ml_io_map(0x0506e000u, 0x1000);
 +	if (!g71 || !g52 || !cc || !ldo) {
@@ -334,7 +335,7 @@ index a8c7bde..da2dd0e 100644
  void
  sweet_gpu_init(void)
  {
-@@ -2232,6 +2465,13 @@ sweet_gpu_init(void)
+@@ -2232,6 +2466,13 @@ sweet_gpu_init(void)
  	if (!PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) || on == 0) {
  		return;
  	}
