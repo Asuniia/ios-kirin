@@ -595,7 +595,7 @@ index bb2a2bf..df660a8 100644
  #else
  #define bsd_init_kprintf(x, ...)
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..58bfb04 100644
+index 0631685..5b40f66 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 @@ -9,6 +9,7 @@
@@ -606,18 +606,19 @@ index 0631685..58bfb04 100644
  
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
-@@ -22,6 +23,10 @@ public:
+@@ -22,6 +23,11 @@ public:
  
  OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
  
 +#if defined(SWEET_KIRIN)
 +extern "C" void sweet_gic_dump(const char *when);       /* pexpert/arm/pe_fiq.c */
++extern "C" void sweet_gic_enable_test(void);
 +#endif
 +
  bool
  SweetPlatformExpert::start(IOService *provider)
  {
-@@ -31,6 +36,23 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +37,24 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");
@@ -634,6 +635,7 @@ index 0631685..58bfb04 100644
 +	while (mach_absolute_time() < end) {
 +	}
 +	sweet_gic_dump("after 100 ms spin");
++	sweet_gic_enable_test();
 +	IOLog("SWEET: timer IRQ test, sleeping 100 ms\n");
 +	IOSleep(100);
 +	IOLog("SWEET: timer IRQ test passed\n");
@@ -1129,7 +1131,7 @@ index 54edb01..f702842 100644
  		end = start + sp.kc_size;
  		/*
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index b8f1807..66c70d1 100644
+index b8f1807..5ab1f03 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -11,6 +11,9 @@
@@ -1142,7 +1144,7 @@ index b8f1807..66c70d1 100644
  
  
  #if HAS_GIC_V3
-@@ -78,6 +81,32 @@ find_gicr_pe_base()
+@@ -78,6 +81,48 @@ find_gicr_pe_base()
  	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
  }
  
@@ -1169,6 +1171,22 @@ index b8f1807..66c70d1 100644
 +	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTV_CVAL_EL0"),
 +	    __builtin_arm_rsr64("CNTVCT_EL0"), __builtin_arm_rsr64("CNTPCT_EL0"),
 +	    __builtin_arm_rsr64("CNTFRQ_EL0"), sweet_vtimer_intid);
++}
++/* Re-enable the timer PPI and the IPI SGI now, read back at once. */
++void sweet_gic_enable_test(void);
++void
++sweet_gic_enable_test(void)
++{
++	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++	uint32_t before = gicr_read32(GICR_ISENABLER0);
++	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	__builtin_arm_dsb(DSB_SY);
++	uint32_t after = gicr_read32(GICR_ISENABLER0);
++	printf("SWEET GIC enable: rd %#lx TYPER %#llx CTLR %#x MODR0 %#x CFG1 %#x PRIO19 %#x EN0 %#x -> %#x\n",
++	    gicr_pe_base - gicr_base, gicr_read64(GICR_TYPER), gicr_read32(0x0),
++	    gicr_read32(0x10d00), gicr_read32(0x10c04), gicr_read32(GICR_IPRIORITYR0 + 16), before, after);
++	printf("SWEET GIC enable: GICD TYPER %#x IIDR %#x PIDR2 %#x\n",
++	    gicd_read32(0x4), gicd_read32(0x8), gicd_read32(0xffe8));
 +}
 +#endif /* SWEET_KIRIN */
 +
