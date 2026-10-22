@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index a8c7bde..1c6ada8 100644
+index a8c7bde..9251e55 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -2224,6 +2224,146 @@ gpu_thread(void *arg, wait_result_t result)
+@@ -2224,6 +2224,159 @@ gpu_thread(void *arg, wait_result_t result)
  	}
  }
  
@@ -32,7 +32,11 @@ index a8c7bde..1c6ada8 100644
 + *   clocks     GCC: GPLL0 for the GPU (vote bits 4, 3) and bimc_gfx;
 + *              gfx3d RCG = GPLL0 (source 5) / 4 = 150 MHz (cfg hid 7),
 + *              root forced on (CMD bit 1) as the GX GDSC needs its root clock
-+ *   gpu_gx     GDSCR SW_COLLAPSE off, wait PWR_ON
++ *   gpu_gx     as Linux gdsc_enable with DT sw-reset, domain-addr,
++ *              qcom,reset-aon-logic: pulse BLK_ARES of GPU_GX_BCR 0x5066090,
++ *              pulse GMEM_RESET (bit 4) of GPU_GX_DOMAIN_MISC 0x5065130 and
++ *              clear its GMEM_CLAMP_IO (bit 0), then SW_COLLAPSE off and
++ *              wait PWR_ON (without the clamp/resets PWR_ON never came)
 + *   branches   gfx3d, rbbmtimer (XO); then RBBM and VBIF are read.
 + * Any step that does not complete stops here, before the GPU is touched.
 + */
@@ -75,7 +79,16 @@ index a8c7bde..1c6ada8 100644
 +	printf("SWEET GPU: gfx3d RCG cmd %#x cfg %#x, gpll0 vote %#x bimc_gfx %#x\n",
 +	    RD(cc, 0x1070), RD(cc, 0x1074), RD(g52, 0x00c), RD(g71, 0x06c));
 +
++	printf("SWEET GPU: gx bcr %#x domain misc %#x\n", RD(cc, 0x1090), RD(cc, 0x0130));
++	WR(cc, 0x1090, RD(cc, 0x1090) | 1u);
++	delay(1);
++	WR(cc, 0x1090, RD(cc, 0x1090) & ~1u);
++	WR(cc, 0x0130, RD(cc, 0x0130) | 0x10u);
++	delay(1);
++	WR(cc, 0x0130, RD(cc, 0x0130) & ~0x10u);
++	WR(cc, 0x0130, RD(cc, 0x0130) & ~1u);
 +	WR(cc, 0x1094, RD(cc, 0x1094) & ~1u);
++	delay(1);
 +	if (!kirin_wait_bit(cc, 0x1094, 1u << 31, true)) {
 +		printf("SWEET GPU: gpu_gx GDSC did not power on (%#x), ldo %#x %#x\n",
 +		    RD(cc, 0x1094), RD(ldo, 0x24), RD(ldo, 0x28));
@@ -149,7 +162,7 @@ index a8c7bde..1c6ada8 100644
  void
  sweet_gpu_init(void)
  {
-@@ -2232,6 +2372,13 @@ sweet_gpu_init(void)
+@@ -2232,6 +2385,13 @@ sweet_gpu_init(void)
  	if (!PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) || on == 0) {
  		return;
  	}
