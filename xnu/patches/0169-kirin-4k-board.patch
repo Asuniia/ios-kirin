@@ -1674,10 +1674,10 @@ index 9c42e45..1a3b8bf 100644
  }
  
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index bb2a2bf..1b1b406 100644
+index bb2a2bf..69f44cf 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -324,6 +324,49 @@ static void process_name(const char *, proc_t);
+@@ -324,6 +324,70 @@ static void process_name(const char *, proc_t);
  
  static void setconf(void);
  
@@ -1690,7 +1690,9 @@ index bb2a2bf..1b1b406 100644
 + * as /usr/lib/sweetgl.dylib update with a `fastboot boot`, without
 + * rewriting the whole iOS image. Each /chosen/memory-map property named
 + * FILE:<absolute path> is {pa, length}; the file is created or truncated
-+ * (mode 0755) and written. Failures are logged and skipped.
++ * (mode 0755) and written. Property names hold 31 characters, so an entry
++ * named FILEP:<anything> carries its path in the data instead: the first
++ * line ("/path\n"), then the contents. Failures are logged and skipped.
 + */
 +static void
 +sweet_file_drop(void)
@@ -1706,20 +1708,39 @@ index bb2a2bf..1b1b406 100644
 +	while (SecureDTIterateProperties(&it, &name) == kSuccess) {
 +		uint64_t const *v;
 +		unsigned int size;
-+		if (strncmp(name, "FILE:/", 6) != 0 ||
++		bool inpath = strncmp(name, "FILEP:", 6) == 0;
++		if ((strncmp(name, "FILE:/", 6) != 0 && !inpath) ||
 +		    SecureDTGetProperty(mm, name, (void const **)&v, &size) != kSuccess || size != 16) {
 +			continue;
 +		}
++		const char *data = (const char *)phystokv(v[0]);
++		uint64_t len = v[1];
++		char pbuf[256];
 +		const char *path = name + 5;
++		if (inpath) {
++			uint64_t n = 0;
++			while (n < len && n < sizeof(pbuf) - 1 && data[n] != '\n') {
++				pbuf[n] = data[n];
++				n++;
++			}
++			if (n == len || data[n] != '\n' || pbuf[0] != '/') {
++				printf("SWEET FILE: %s has no path line, skipped\n", name);
++				continue;
++			}
++			pbuf[n] = '\0';
++			path = pbuf;
++			data += n + 1;
++			len -= n + 1;
++		}
 +		vnode_t vp = NULLVP;
 +		int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, 0755, 0, &vp, ctx);
 +		if (err == 0) {
-+			err = vn_rdwr(UIO_WRITE, vp, (caddr_t)phystokv(v[0]), (int)v[1], 0, UIO_SYSSPACE,
++			err = vn_rdwr(UIO_WRITE, vp, (caddr_t)data, (int)len, 0, UIO_SYSSPACE,
 +			    IO_NOAUTH | IO_SYNC, vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx));
 +			int cerr = vnode_close(vp, FWRITE, ctx);
 +			err = err ? err : cerr;
 +		}
-+		printf("SWEET FILE: %s (%llu bytes) %s (error %d)\n", path, v[1], err ? "NOT written" : "written", err);
++		printf("SWEET FILE: %s (%llu bytes) %s (error %d)\n", path, len, err ? "NOT written" : "written", err);
 +	}
 +}
 +#endif
@@ -1727,7 +1748,7 @@ index bb2a2bf..1b1b406 100644
  #if CONFIG_BASESYSTEMROOT
  static int bsd_find_basesystem_dmg(char *bsdmgpath_out, bool *rooted_dmg, bool *skip_signature_check);
  static boolean_t bsdmgroot_bootable(void);
-@@ -490,9 +533,16 @@ bsd_init(void)
+@@ -490,9 +554,16 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -1745,7 +1766,7 @@ index bb2a2bf..1b1b406 100644
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
  #else
  #define bsd_init_kprintf(x, ...)
-@@ -1098,6 +1148,9 @@ bsdinit_task(void)
+@@ -1098,6 +1169,9 @@ bsdinit_task(void)
  
  	bsd_init_kprintf("bsd_do_post - done");
  
