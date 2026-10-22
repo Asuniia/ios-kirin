@@ -61,10 +61,11 @@ KIRIN = dict(
     vtimer=19,  # Qualcomm PPI numbering like sweet: CNTV is PPI 3
     fb=0x9d400000, fb_size=0x2300000, fb_w=1080, fb_h=2520, fb_bpp=32,  # B, G, R, X
     emmc=0x0c0c4000, emmc_size=0x1000,  # SDHC1 hc_mem (qcom,sdhci-msm-v5)
-    # MPIDR, cluster, max clock: two clusters of four Cortex-A53; xboot boots
-    # on 0x100, the 2.2 GHz cluster (Linux cpu0-3)
-    cpus=[(0x0, 0, 1843200000), (0x1, 0, 1843200000), (0x2, 0, 1843200000), (0x3, 0, 1843200000),
-          (0x100, 1, 2208000000), (0x101, 1, 2208000000), (0x102, 1, 2208000000), (0x103, 1, 2208000000)],
+    # MPIDR, cluster, max clock: two clusters of four Cortex-A53. xboot boots
+    # on 0x100, the 2.2 GHz cluster (Linux cpu0-3): listed first so that the
+    # boot CPU is logical CPU 0 (SweetCPU::startAll checks it).
+    cpus=[(0x100, 1, 2208000000), (0x101, 1, 2208000000), (0x102, 1, 2208000000), (0x103, 1, 2208000000),
+          (0x0, 0, 1843200000), (0x1, 0, 1843200000), (0x2, 0, 1843200000), (0x3, 0, 1843200000)],
 )
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
@@ -223,7 +224,8 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, kirin=False, boot_
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('arm,cortex-a53') + cstr('ARM,v8')),
+            # 'qcom,kryo' is what SweetCPU matches (iokit/KernelConfigTables.cpp)
+            ('compatible', cstr('qcom,kryo') + cstr('arm,cortex-a53') + cstr('ARM,v8')),
             ('reg', u32(mpidr)),
             ('cpu-id', u32(core)),
             ('cluster-id', u32(0)),

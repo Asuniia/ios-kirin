@@ -594,6 +594,49 @@ index bb2a2bf..df660a8 100644
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
  #else
  #define bsd_init_kprintf(x, ...)
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 93d6318..3fc5bce 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -85,7 +85,11 @@ SweetCPU::start(IOService *provider)
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
++#if defined(SWEET_KIRIN)
++	cpuName = OSSymbol::withCStringNoCopy("Cortex-A53");
++#else
+ 	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++#endif
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -147,10 +151,17 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		}
+ 		IOSleep(1);
+ 	}
++#if defined(SWEET_KIRIN)
++	/* kirin: xboot starts on MPIDR 0x100; the ADT lists that cluster first. */
++	if (topology->boot_cpu->cpu_id != 0) {
++		panic("SWEET CPU: expected the boot CPU to be logical CPU 0");
++	}
++#else
+ 	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+ 		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
+ 	}
++#endif
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+@@ -237,7 +248,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+ 	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
+ 	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
+-	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
++	if (start_paddr != 0 || arg_paddr != 0 || cpu == ml_get_topology_info()->boot_cpu ||
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 index 0631685..5b40f66 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
