@@ -1050,7 +1050,7 @@ static AudioServerPlugInDriverInterface *driver = &interface;
 void *
 RedwoodAudio_Create(__unused CFAllocatorRef allocator, CFUUIDRef type)
 {
-	bool ours = CFEqual(type, kAudioServerPlugInTypeUUID);
+	Boolean ours = CFEqual(type, kAudioServerPlugInTypeUUID);
 	say("sweetaudio: plug-in created by the HAL (%s type)\n", ours ? "AudioServerPlugIn" : "other");
 	return ours ? &driver : NULL;
 }
