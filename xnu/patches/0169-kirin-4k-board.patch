@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index a8c7bde..9987c52 100644
+index a8c7bde..53f61c4 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -113,10 +113,22 @@ void sweet_gpu_init(void);
@@ -80,7 +80,7 @@ index a8c7bde..9987c52 100644
  
  	/* Subset of a5xx_hw_init (A530 values; HWCG, GPMU firmware, CP_PROTECT left out). */
  	gw(gpu, R_VBIF_RR_QOS_ARB, 3);
-@@ -1959,19 +1990,37 @@ cp_test(vm_offset_t gpu, int level)
+@@ -1959,19 +1990,147 @@ cp_test(vm_offset_t gpu, int level)
  	gw64(gpu, R_UCHE_TRAP_BASE, 0x0001ffffffff0000ull);
  	gw64(gpu, R_UCHE_WRITE_THRU_BASE, 0x0001ffffffff0000ull);
  	gw64(gpu, R_UCHE_GMEM_RANGE_MIN, 0x00100000);
@@ -104,6 +104,116 @@ index a8c7bde..9987c52 100644
  	gw(gpu, R_UCHE_MODE_CNTL, 1u << 29);
  	gw(gpu, R_CP_CHICKEN_DBG, 0x02000000);
  	gw(gpu, R_RBBM_AHB_CNTL1, 0xa6ffffff);
++#if defined(SWEET_KIRIN)
++	/*
++	 * Hardware clock gating as mainline a5xx_set_hwcg(true) for
++	 * A505/A506/A508 (a50x_hwcg; offsets from a5xx.xml), then
++	 * RBBM_CLOCK_CNTL and RBBM_ISDB_CNT. Without it Mesa's draws came out
++	 * scrambled (75% of the pixels of a pattern written elsewhere, the
++	 * same in tiled and linear) while compute and uploads were exact.
++	 */
++	static const struct { uint16_t reg; uint32_t val; } a50x_hwcg[] = {
++	{0x0068, 0x02222222},	/* RBBM_CLOCK_CNTL_SP0 */
++	{0x006c, 0x02222220},	/* RBBM_CLOCK_CNTL2_SP0 */
++	{0x0070, 0x0000f3cf},	/* RBBM_CLOCK_HYST_SP0 */
++	{0x0074, 0x00000080},	/* RBBM_CLOCK_DELAY_SP0 */
++	{0x004a, 0x22222222},	/* RBBM_CLOCK_CNTL_TP0 */
++	{0x004e, 0x22222222},	/* RBBM_CLOCK_CNTL2_TP0 */
++	{0x0052, 0x00002222},	/* RBBM_CLOCK_CNTL3_TP0 */
++	{0x00b0, 0x77777777},	/* RBBM_CLOCK_HYST_TP0 */
++	{0x00b4, 0x77777777},	/* RBBM_CLOCK_HYST2_TP0 */
++	{0x00b8, 0x00007777},	/* RBBM_CLOCK_HYST3_TP0 */
++	{0x00a4, 0x11111111},	/* RBBM_CLOCK_DELAY_TP0 */
++	{0x00a8, 0x11111111},	/* RBBM_CLOCK_DELAY2_TP0 */
++	{0x00ac, 0x00001111},	/* RBBM_CLOCK_DELAY3_TP0 */
++	{0x005b, 0x22222222},	/* RBBM_CLOCK_CNTL2_UCHE */
++	{0x005c, 0x22222222},	/* RBBM_CLOCK_CNTL3_UCHE */
++	{0x005d, 0x00222222},	/* RBBM_CLOCK_CNTL4_UCHE */
++	{0x005a, 0x22222222},	/* RBBM_CLOCK_CNTL_UCHE */
++	{0x005e, 0x00fffff4},	/* RBBM_CLOCK_HYST_UCHE */
++	{0x005f, 0x00000002},	/* RBBM_CLOCK_DELAY_UCHE */
++	{0x0078, 0x22222222},	/* RBBM_CLOCK_CNTL_RB0 */
++	{0x007c, 0x00222222},	/* RBBM_CLOCK_CNTL2_RB0 */
++	{0x0082, 0x00022220},	/* RBBM_CLOCK_CNTL_CCU0 */
++	{0x008a, 0x05522222},	/* RBBM_CLOCK_CNTL_RAC */
++	{0x008b, 0x00505555},	/* RBBM_CLOCK_CNTL2_RAC */
++	{0x0086, 0x04040404},	/* RBBM_CLOCK_HYST_RB_CCU0 */
++	{0x0080, 0x07444044},	/* RBBM_CLOCK_HYST_RAC */
++	{0x008c, 0x00000002},	/* RBBM_CLOCK_DELAY_RB_CCU_L1_0 */
++	{0x0081, 0x00010011},	/* RBBM_CLOCK_DELAY_RAC */
++	{0x0063, 0x04222222},	/* RBBM_CLOCK_CNTL_TSE_RAS_RBBM */
++	{0x0060, 0x02222222},	/* RBBM_CLOCK_MODE_GPC */
++	{0x0091, 0x00002222},	/* RBBM_CLOCK_MODE_VFD */
++	{0x0064, 0x00000000},	/* RBBM_CLOCK_HYST_TSE_RAS_RBBM */
++	{0x0062, 0x04104004},	/* RBBM_CLOCK_HYST_GPC */
++	{0x0090, 0x00000000},	/* RBBM_CLOCK_HYST_VFD */
++	{0x0066, 0x00000000},	/* RBBM_CLOCK_DELAY_HLSQ */
++	{0x0065, 0x00004000},	/* RBBM_CLOCK_DELAY_TSE_RAS_RBBM */
++	{0x0061, 0x00000200},	/* RBBM_CLOCK_DELAY_GPC */
++	{0x0092, 0x00002222},	/* RBBM_CLOCK_DELAY_VFD */
++	{0x0068, 0x02222222},	/* RBBM_CLOCK_CNTL_SP0 */
++	{0x0069, 0x02222222},	/* RBBM_CLOCK_CNTL_SP1 */
++	{0x006c, 0x02222220},	/* RBBM_CLOCK_CNTL2_SP0 */
++	{0x006d, 0x02222220},	/* RBBM_CLOCK_CNTL2_SP1 */
++	{0x0070, 0x0000f3cf},	/* RBBM_CLOCK_HYST_SP0 */
++	{0x0071, 0x0000f3cf},	/* RBBM_CLOCK_HYST_SP1 */
++	{0x0074, 0x00000080},	/* RBBM_CLOCK_DELAY_SP0 */
++	{0x0075, 0x00000080},	/* RBBM_CLOCK_DELAY_SP1 */
++	{0x004a, 0x22222222},	/* RBBM_CLOCK_CNTL_TP0 */
++	{0x004b, 0x22222222},	/* RBBM_CLOCK_CNTL_TP1 */
++	{0x004e, 0x22222222},	/* RBBM_CLOCK_CNTL2_TP0 */
++	{0x004f, 0x22222222},	/* RBBM_CLOCK_CNTL2_TP1 */
++	{0x0052, 0x00002222},	/* RBBM_CLOCK_CNTL3_TP0 */
++	{0x0053, 0x00002222},	/* RBBM_CLOCK_CNTL3_TP1 */
++	{0x00b0, 0x77777777},	/* RBBM_CLOCK_HYST_TP0 */
++	{0x00b1, 0x77777777},	/* RBBM_CLOCK_HYST_TP1 */
++	{0x00b4, 0x77777777},	/* RBBM_CLOCK_HYST2_TP0 */
++	{0x00b5, 0x77777777},	/* RBBM_CLOCK_HYST2_TP1 */
++	{0x00b8, 0x00007777},	/* RBBM_CLOCK_HYST3_TP0 */
++	{0x00b9, 0x00007777},	/* RBBM_CLOCK_HYST3_TP1 */
++	{0x00a4, 0x11111111},	/* RBBM_CLOCK_DELAY_TP0 */
++	{0x00a5, 0x11111111},	/* RBBM_CLOCK_DELAY_TP1 */
++	{0x00a8, 0x11111111},	/* RBBM_CLOCK_DELAY2_TP0 */
++	{0x00a9, 0x11111111},	/* RBBM_CLOCK_DELAY2_TP1 */
++	{0x00ac, 0x00001111},	/* RBBM_CLOCK_DELAY3_TP0 */
++	{0x00ad, 0x00001111},	/* RBBM_CLOCK_DELAY3_TP1 */
++	{0x005a, 0x22222222},	/* RBBM_CLOCK_CNTL_UCHE */
++	{0x005b, 0x22222222},	/* RBBM_CLOCK_CNTL2_UCHE */
++	{0x005c, 0x22222222},	/* RBBM_CLOCK_CNTL3_UCHE */
++	{0x005d, 0x00222222},	/* RBBM_CLOCK_CNTL4_UCHE */
++	{0x005e, 0x00444444},	/* RBBM_CLOCK_HYST_UCHE */
++	{0x005f, 0x00000002},	/* RBBM_CLOCK_DELAY_UCHE */
++	{0x0078, 0x22222222},	/* RBBM_CLOCK_CNTL_RB0 */
++	{0x0079, 0x22222222},	/* RBBM_CLOCK_CNTL_RB1 */
++	{0x007c, 0x00222222},	/* RBBM_CLOCK_CNTL2_RB0 */
++	{0x007d, 0x00222222},	/* RBBM_CLOCK_CNTL2_RB1 */
++	{0x0082, 0x00022220},	/* RBBM_CLOCK_CNTL_CCU0 */
++	{0x0083, 0x00022220},	/* RBBM_CLOCK_CNTL_CCU1 */
++	{0x008a, 0x05522222},	/* RBBM_CLOCK_CNTL_RAC */
++	{0x008b, 0x00505555},	/* RBBM_CLOCK_CNTL2_RAC */
++	{0x0086, 0x04040404},	/* RBBM_CLOCK_HYST_RB_CCU0 */
++	{0x0087, 0x04040404},	/* RBBM_CLOCK_HYST_RB_CCU1 */
++	{0x0080, 0x07444044},	/* RBBM_CLOCK_HYST_RAC */
++	{0x008c, 0x00000002},	/* RBBM_CLOCK_DELAY_RB_CCU_L1_0 */
++	{0x008d, 0x00000002},	/* RBBM_CLOCK_DELAY_RB_CCU_L1_1 */
++	{0x0081, 0x00010011},	/* RBBM_CLOCK_DELAY_RAC */
++	{0x0063, 0x04222222},	/* RBBM_CLOCK_CNTL_TSE_RAS_RBBM */
++	{0x0060, 0x02222222},	/* RBBM_CLOCK_MODE_GPC */
++	{0x0091, 0x00002222},	/* RBBM_CLOCK_MODE_VFD */
++	{0x0064, 0x00000000},	/* RBBM_CLOCK_HYST_TSE_RAS_RBBM */
++	{0x0062, 0x04104004},	/* RBBM_CLOCK_HYST_GPC */
++	{0x0090, 0x00000000},	/* RBBM_CLOCK_HYST_VFD */
++	{0x0066, 0x00000000},	/* RBBM_CLOCK_DELAY_HLSQ */
++	{0x0065, 0x00004000},	/* RBBM_CLOCK_DELAY_TSE_RAS_RBBM */
++	{0x0061, 0x00000200},	/* RBBM_CLOCK_DELAY_GPC */
++	{0x0092, 0x00002222},	/* RBBM_CLOCK_DELAY_VFD */
++	};
++	for (unsigned i = 0; i < sizeof(a50x_hwcg) / sizeof(a50x_hwcg[0]); i++) {
++		gw(gpu, a50x_hwcg[i].reg, a50x_hwcg[i].val);
++	}
++	gw(gpu, 0x0067 /* RBBM_CLOCK_CNTL */, 0xaaa8aa00);
++	gw(gpu, 0x0533 /* RBBM_ISDB_CNT */, 0x182);
++#endif
  	gw(gpu, R_RBBM_AHB_CNTL2, 0x3f);
 +#if defined(SWEET_KIRIN)
 +	gw(gpu, R_TPL1_MODE_CNTL, 1u << 7);     /* highest bank bit 14 (SDM630, ubwc_config.c) */
@@ -118,7 +228,7 @@ index a8c7bde..9987c52 100644
  	gw(gpu, R_SECVID_TSB_CNTL, 0);
  	gw64(gpu, R_SECVID_TSB_BASE, 0);
  	gw(gpu, R_SECVID_TSB_SIZE, 0);
-@@ -2001,7 +2050,11 @@ cp_test(vm_offset_t gpu, int level)
+@@ -2001,7 +2160,11 @@ cp_test(vm_offset_t gpu, int level)
  	emit(0x20000000);
  	emit(0);
  	emit(0);
@@ -130,7 +240,7 @@ index a8c7bde..9987c52 100644
  	emit(0);
  	emit(0);
  	emit(pkt7(CP_MEM_WRITE, 3));
-@@ -2043,7 +2096,21 @@ cp_test(vm_offset_t gpu, int level)
+@@ -2043,7 +2206,21 @@ cp_test(vm_offset_t gpu, int level)
  		    *(volatile uint32_t *)(scratch_va + 8));
  		gpu_wait(2);
  		if (level >= 8) {
@@ -152,7 +262,7 @@ index a8c7bde..9987c52 100644
  			g_ksample4 = kernel_page(&k_sample4);
  			if (g_ksample4 == 0 || !vm_init(smmu)) {
  				printf("SWEET GPU: service bring-up FAILED\n");
-@@ -2053,8 +2120,15 @@ cp_test(vm_offset_t gpu, int level)
+@@ -2053,8 +2230,15 @@ cp_test(vm_offset_t gpu, int level)
  			g_scratch = scratch;
  			g_scratch_va = scratch_va;
  			g_ready = true;
@@ -168,7 +278,7 @@ index a8c7bde..9987c52 100644
  			int mhz = 300;
  			(void)PE_parse_boot_argn("sweetgpuclk", &mhz, sizeof(mhz));
  			g_max_mhz = 300;
-@@ -2224,6 +2298,166 @@ gpu_thread(void *arg, wait_result_t result)
+@@ -2224,6 +2408,166 @@ gpu_thread(void *arg, wait_result_t result)
  	}
  }
  
@@ -335,7 +445,7 @@ index a8c7bde..9987c52 100644
  void
  sweet_gpu_init(void)
  {
-@@ -2232,6 +2466,13 @@ sweet_gpu_init(void)
+@@ -2232,6 +2576,13 @@ sweet_gpu_init(void)
  	if (!PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) || on == 0) {
  		return;
  	}
