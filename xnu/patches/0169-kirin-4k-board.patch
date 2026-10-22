@@ -595,10 +595,29 @@ index bb2a2bf..df660a8 100644
  #else
  #define bsd_init_kprintf(x, ...)
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..c5103bd 100644
+index 0631685..58bfb04 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -31,6 +31,16 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <kern/clock.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -22,6 +23,10 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++#if defined(SWEET_KIRIN)
++extern "C" void sweet_gic_dump(const char *when);       /* pexpert/arm/pe_fiq.c */
++#endif
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -31,6 +36,23 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");
@@ -608,6 +627,13 @@ index 0631685..c5103bd 100644
 +	 * interrupt (spinning delays, threads that block until signalled). A
 +	 * timed sleep needs the CNTV interrupt through the GIC.
 +	 */
++	sweet_gic_dump("before");
++	uint64_t end;
++	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &end);
++	end += mach_absolute_time();
++	while (mach_absolute_time() < end) {
++	}
++	sweet_gic_dump("after 100 ms spin");
 +	IOLog("SWEET: timer IRQ test, sleeping 100 ms\n");
 +	IOSleep(100);
 +	IOLog("SWEET: timer IRQ test passed\n");
@@ -1102,6 +1128,53 @@ index 54edb01..f702842 100644
  
  		end = start + sp.kc_size;
  		/*
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index b8f1807..88cd8b9 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -11,6 +11,9 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm64/board_config.h>
++#if defined(SWEET_KIRIN)
++#include <kern/misc_protos.h>             /* printf */
++#endif
+ 
+ 
+ #if HAS_GIC_V3
+@@ -78,6 +81,32 @@ find_gicr_pe_base()
+ 	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
+ }
+ 
++#if defined(SWEET_KIRIN)
++/*
++ * Bring-up: timer and GIC state for the boot CPU, to see where the CNTV
++ * interrupt stops (timer condition, GIC pending, CPU interface).
++ */
++#define GICR_ISPENDR0           0x10200
++#define GICR_ISACTIVER0         0x10300
++void sweet_gic_dump(const char *when);
++void
++sweet_gic_dump(const char *when)
++{
++	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++	printf("SWEET GIC %s: CTLR %#x WAKER %#x GRP0 %#x EN0 %#x PEND0 %#x ACT0 %#x\n", when,
++	    gicd_read32(GICD_CTLR), gicr_read32(GICR_WAKER), gicr_read32(GICR_IGROUPR0),
++	    gicr_read32(GICR_ISENABLER0), gicr_read32(GICR_ISPENDR0), gicr_read32(GICR_ISACTIVER0));
++	printf("SWEET ICC %s: SRE %#llx GRPEN1 %#llx PMR %#llx RPR %#llx HPPIR1 %#llx DAIF %#llx\n", when,
++	    __builtin_arm_rsr64("ICC_SRE_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
++	    __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_RPR_EL1"),
++	    __builtin_arm_rsr64("ICC_HPPIR1_EL1"), __builtin_arm_rsr64("DAIF"));
++	printf("SWEET TMR %s: CNTV_CTL %#llx CVAL %#llx VCT %#llx PCT %#llx FRQ %llu intid %u\n", when,
++	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTV_CVAL_EL0"),
++	    __builtin_arm_rsr64("CNTVCT_EL0"), __builtin_arm_rsr64("CNTPCT_EL0"),
++	    __builtin_arm_rsr64("CNTFRQ_EL0"), sweet_vtimer_intid);
++}
++#endif /* SWEET_KIRIN */
++
+ void
+ pe_init_fiq()
+ {
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 index 5d2856f..cdf69c0 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
