@@ -660,7 +660,7 @@ index 26b4001..290c611 100644
  		fLogicalH = SWEET_FB_LOGICAL_H;
  	}
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..5b40f66 100644
+index 0631685..9aef84e 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 @@ -9,6 +9,7 @@
@@ -700,7 +700,7 @@ index 0631685..5b40f66 100644
 +	while (mach_absolute_time() < end) {
 +	}
 +	sweet_gic_dump("after 100 ms spin");
-+	sweet_gic_enable_test();
++	/* Late re-enable workaround off: does the pe_init_fiq setup now survive? */
 +	IOLog("SWEET: timer IRQ test, sleeping 100 ms\n");
 +	IOSleep(100);
 +	IOLog("SWEET: timer IRQ test passed\n");
