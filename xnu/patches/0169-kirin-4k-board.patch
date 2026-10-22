@@ -1,3 +1,164 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 0c548d1..6f4fe7f 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -10,6 +10,15 @@
+  * sweet_pmic_write (the battery's charger setup) writes through the
+  * peripheral's own channel. The volume GPIOs only get their pull-up (as Linux's
+  * tlmm_gpio_key_active pinctrl) if the bootloader left them without one.
++ *
++ * SWEET_KIRIN (Xperia 10, SDM630, SPMI PMIC arbiter v3: same layout as v2
++ * for this): all three keys are on the PMICs, all read every 20 ms:
++ *   power        PM660 (SID 0) PON RT_STS 0x810 bit 0 (KPDPWR)
++ *   volume up    PM660 (SID 0) PON RT_STS 0x810 bit 1 (RESIN)
++ *   volume down  PM660L (SID 2) GPIO 7 (peripheral 0xc6) RT_STS 0x10 bit 0,
++ *                active low; set to input with the 30 uA pull-up (as Linux's
++ *                gpio-keys pinctrl) if the bootloader left it otherwise
++ * The iPhone X userland has no Home button: volume down stays volume down.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -27,12 +36,22 @@ void sweet_keys_init(void);
+ bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+ bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
+ 
++#if defined(SWEET_KIRIN)
++/* qcom,spmi@800f000: core, chnls, obsrvr, cnfg */
++#define KEYS_CORE_PA     0x0800f000u
++#define KEYS_OBS_PA      0x09400000u
++#define KEYS_CNFG_PA     0x0800a000u
++#define KEYS_CHNLS_PA    0x08400000u     /* write channels, EE 0 */
++#define KEYS_APIDS       512u            /* core is 0x1000: map 0x800 + 4n */
++#define KEYS_VOLDN_PPID  0x2c6u          /* PM660L GPIO 7 */
++#else
+ /* qcom,spmi@400f000: core, obsrvr, cnfg */
+ #define KEYS_CORE_PA     0x0400f000u
+ #define KEYS_OBS_PA      0x04c00000u
+ #define KEYS_CNFG_PA     0x0400a000u
+ #define KEYS_CHNLS_PA    0x04400000u     /* write channels, EE 0 */
+ #define KEYS_APIDS       256u            /* core is 0xc00: map 0x800 + 4n */
++#endif
+ #define KEYS_PON_RT      0x0810u
+ #define KEYS_NO_APID     0xffffu
+ /* pinctrl@1010000, one 4 KiB tile per GPIO: CFG +0, IN_OUT +4 */
+@@ -40,7 +59,7 @@ bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
+ #define KEYS_GPIO_VOLUP  126u
+ #define KEYS_GPIO_VOLDN  121u
+ 
+-enum { KEY_POWER = 0, KEY_VOLUP = 1, KEY_HOME = 3 };
++enum { KEY_POWER = 0, KEY_VOLUP = 1, KEY_VOLDN = 2, KEY_HOME = 3 };
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg, keys_volup, keys_voldn;
+ static uint16_t keys_pon_apid = KEYS_NO_APID;
+@@ -201,6 +220,7 @@ sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val)
+ 	return ok;
+ }
+ 
++#if !defined(SWEET_KIRIN)
+ static vm_offset_t
+ keys_gpio_map(uint32_t gpio)
+ {
+@@ -218,6 +238,7 @@ keys_gpio_map(uint32_t gpio)
+ 	}
+ 	return tile;
+ }
++#endif /* !SWEET_KIRIN */
+ 
+ static void
+ keys_wait(void)
+@@ -228,6 +249,56 @@ keys_wait(void)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++#if defined(SWEET_KIRIN)
++/* PM660L GPIO 7 as input with pull-up, as Linux's gpio-keys pinctrl. */
++static void
++keys_voldn_setup(void)
++{
++	uint8_t mode = 0, pull = 0, en = 0, rt = 0;
++	bool ok = sweet_pmic_read(KEYS_VOLDN_PPID, 0x40, &mode) &&
++	    sweet_pmic_read(KEYS_VOLDN_PPID, 0x42, &pull) &&
++	    sweet_pmic_read(KEYS_VOLDN_PPID, 0x46, &en) &&
++	    sweet_pmic_read(KEYS_VOLDN_PPID, 0x10, &rt);
++	printf("SWEET KEYS: volume down gpio mode=%#x pull=%#x en=%#x rt=%#x (%s)\n",
++	    mode, pull, en, rt, ok ? "read" : "READ FAILED");
++	/* MODE_CTL bits 6:4 = 0 (digital input), PULL 0 (30 uA up), EN bit 7 */
++	if (ok && (((mode >> 4) & 7u) != 0 || (pull & 7u) != 0 || !(en & 0x80u))) {
++		bool w = sweet_pmic_write(KEYS_VOLDN_PPID, 0x40, 0x00) &&
++		    sweet_pmic_write(KEYS_VOLDN_PPID, 0x42, 0x00) &&
++		    sweet_pmic_write(KEYS_VOLDN_PPID, 0x46, 0x80);
++		printf("SWEET KEYS: volume down gpio set to input pull-up (%s)\n", w ? "ok" : "FAILED");
++	}
++}
++
++static void
++keys_thread(void *arg, wait_result_t result)
++{
++	static const int code[3] = {KEY_POWER, KEY_VOLUP, KEY_VOLDN};
++	int state[3] = {0, 0, 0};
++	unsigned errors = 0;
++	(void)arg;
++	(void)result;
++	keys_voldn_setup();
++	for (;;) {
++		uint8_t pon = 0, gpio = 1;
++		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
++		bool gok = sweet_pmic_read(KEYS_VOLDN_PPID, 0x10, &gpio);
++		int now[3] = {!!(pon & 1u), !!(pon & 2u), !(gpio & 1u)};
++		bool valid[3] = {pok, pok, gok};
++		if ((!pok || !gok) && (errors++ % 250u) == 0) {
++			printf("SWEET KEYS: read error pon=%d gpio=%d arb-status=%#x\n", pok, gok, keys_last_status);
++		}
++		for (int k = 0; k < 3; ++k) {
++			if (valid[k] && now[k] != state[k]) {
++				state[k] = now[k];
++				printf("SWEET KEYS: key=%d down=%d\n", code[k], state[k]);
++				sweet_hid_key(code[k], state[k]);
++			}
++		}
++		keys_wait();
++	}
++}
++#else /* !SWEET_KIRIN */
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+@@ -257,6 +328,7 @@ keys_thread(void *arg, wait_result_t result)
+ 		keys_wait();
+ 	}
+ }
++#endif /* SWEET_KIRIN */
+ 
+ void
+ sweet_keys_init(void)
+@@ -274,9 +346,13 @@ sweet_keys_init(void)
+ 	}
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x1000);
+ 	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
++#if defined(SWEET_KIRIN)
++	if (!keys_core || !keys_cnfg) {
++#else
+ 	keys_volup = keys_gpio_map(KEYS_GPIO_VOLUP);
+ 	keys_voldn = keys_gpio_map(KEYS_GPIO_VOLDN);
+ 	if (!keys_core || !keys_cnfg || !keys_volup || !keys_voldn) {
++#endif
+ 		printf("SWEET KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
+@@ -294,8 +370,13 @@ sweet_keys_init(void)
+ 	}
+ 	uint8_t pon = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
++#if defined(SWEET_KIRIN)
++	printf("SWEET KEYS: arb=%#x pon-apid=%u pon=%#x/%d (power, volume up, volume down)\n",
++	    keys_version, keys_pon_apid, pon, pok);
++#else
+ 	printf("SWEET KEYS: arb=%#x pon-apid=%u pon=%#x/%d (Home = volume down)\n",
+ 	    keys_version, keys_pon_apid, pon, pok);
++#endif
+ 	if (!pok) {
+ 		printf("SWEET KEYS: power key unreadable; volume keys only\n");
+ 		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 index a9ad4f2..0b0f2a5 100644
 --- a/bsd/dev/sweet_touch.c
