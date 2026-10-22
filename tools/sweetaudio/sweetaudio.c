@@ -262,6 +262,14 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	/* kirin: mediaserverd's stderr goes nowhere; the kernel console reaches the USB log */
+	static int console = -2;
+	if (console == -2) {
+		console = open("/dev/console", O_WRONLY | O_NOCTTY | O_NONBLOCK);
+	}
+	if (console >= 0) {
+		write(console, line, (size_t)n);
+	}
 }
 
 /* The volume control's scale: a straight line of decibels over VOLUME_RANGE_DB. */
@@ -1042,5 +1050,7 @@ static AudioServerPlugInDriverInterface *driver = &interface;
 void *
 RedwoodAudio_Create(__unused CFAllocatorRef allocator, CFUUIDRef type)
 {
-	return CFEqual(type, kAudioServerPlugInTypeUUID) ? &driver : NULL;
+	bool ours = CFEqual(type, kAudioServerPlugInTypeUUID);
+	say("sweetaudio: plug-in created by the HAL (%s type)\n", ours ? "AudioServerPlugIn" : "other");
+	return ours ? &driver : NULL;
 }
