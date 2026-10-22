@@ -1,15 +1,232 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 2a6dc36..34326d1 100644
+index 2a6dc36..19e434d 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -107,6 +107,7 @@ bsd/dev/memdev.c			standard
+@@ -107,6 +107,8 @@ bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
 +bsd/dev/sweet_audio.c			standard
++bsd/dev/sweet_adsp.c			standard
  bsd/dev/sweet_perf.c			standard
  bsd/dev/sweet_gpu.c			standard
  bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+new file mode 100644
+index 0000000..40659d2
+--- /dev/null
++++ b/bsd/dev/sweet_adsp.c
+@@ -0,0 +1,210 @@
++/*
++ * kirin, boot-arg sweetadsp=1: the audio DSP (ADSP, the LPASS Hexagon) is
++ * loaded and started through TrustZone, as Linux's pil-tz-generic does it
++ * for DT qcom,lpass@15700000 (qcom,pas-id 1, firmware "adsp",
++ * memory-region adsp_fw_region@92a00000, 30 MB): the step before sound,
++ * microphone and sensors, which all live on it.
++ *
++ * The firmware comes in the boot payload as one blob, ADSP-FW
++ * (tools/mkadspfw.py): 'SADF', u32 segment count, u32 offset and length of
++ * the .mdt, then per program header u32 offset and length of its .bNN file
++ * (0 when there is none), then the files. As mainline qcom_mdt_load and
++ * qcom_scm_pas_*:
++ *   PAS_INIT_IMAGE    (SCM svc 2 cmd 1) pas id, the .mdt (ELF header,
++ *                     program headers, hash segment) in physically
++ *                     contiguous memory: TrustZone checks the signature
++ *   PAS_MEM_SETUP     (svc 2 cmd 2) pas id, region base, size
++ *   segments          every PT_LOAD that is not the hash segment, at its
++ *                     own physical address (this firmware is not
++ *                     relocatable: its segments span the region exactly),
++ *                     the part past filesz zeroed
++ *   PAS_AUTH_AND_RESET (svc 2 cmd 5) pas id: TrustZone authenticates the
++ *                     loaded image and releases the DSP from reset
++ * The region is outside the kernel's RAM and too big for the I/O map: it is
++ * written through a 1 MB kernel window moved over it (write-combined).
++ * Linux also votes the LPASS CX rail and XO through the RPM for the time of
++ * the boot (qcom,proxy-*); there is no RPM driver here yet: if the DSP needs
++ * them and the bootloader left them off, auth_and_reset will say so.
++ */
++#if defined(SWEET_KIRIN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++
++extern vm_map_address_t phystokv(uint64_t pa);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++void sweet_adsp_init(void);
++
++#define ADSP_PAS_ID     1u
++#define ADSP_REGION     0x92a00000ull
++#define ADSP_REGION_SZ  0x01e00000ull
++#define WINDOW          (1u << 20)
++
++/* Qualcomm SCM call, ARM SMCCC (as sweet_gpu.c's scm_call). */
++static int64_t
++adsp_scm(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
++{
++	uint64_t fn = (1ull << 30) | (2ull << 24) | ((uint64_t)svc << 8) | cmd;
++	for (int busy = 0;; busy++) {
++		uint64_t a0 = fn, a6 = 0;
++		register uint64_t x0 __asm__("x0"), x1 __asm__("x1"), x2 __asm__("x2"), x3 __asm__("x3");
++		register uint64_t x4 __asm__("x4"), x5 __asm__("x5"), x6 __asm__("x6"), x7 __asm__("x7");
++		do {
++			x0 = a0; x1 = arginfo; x2 = a; x3 = b; x4 = c; x5 = 0; x6 = a6; x7 = 0;
++			__asm__ volatile("smc #0"
++			    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++			    :
++			    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++			a0 = 1;
++			a6 = x6;
++		} while (x0 == 1);
++		if ((int64_t)x0 != -12 || busy >= 20) {
++			if (r1) {
++				*r1 = x1;
++			}
++			return (int64_t)x0;
++		}
++		delay(30000);
++	}
++}
++
++struct elf_phdr32 {
++	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++
++/* Copy len bytes (src NULL: zeros) to physical pa, through the moving window. */
++static bool
++adsp_write_phys(vm_offset_t window, uint64_t pa, const uint8_t *src, uint64_t len)
++{
++	while (len > 0) {
++		uint64_t base = pa & ~(uint64_t)(WINDOW - 1), off = pa - base;
++		uint64_t n = MIN(len, WINDOW - off);
++		for (uint64_t p = 0; p < WINDOW; p += PAGE_SIZE) {
++			if (pmap_enter(kernel_pmap, window + p, (ppnum_t)atop_64(base + p),
++			    VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE, VM_WIMG_WCOMB, TRUE) != KERN_SUCCESS) {
++				return false;
++			}
++		}
++		if (src) {
++			memcpy((void *)(window + off), src, (size_t)n);
++			src += n;
++		} else {
++			bzero((void *)(window + off), (size_t)n);
++		}
++		__builtin_arm_dsb(0xf);
++		pmap_remove(kernel_pmap, window, window + WINDOW);
++		pa += n;
++		len -= n;
++	}
++	return true;
++}
++
++static void
++adsp_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	DTEntry mm;
++	uint64_t const *v;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
++	    SecureDTGetProperty(mm, "ADSP-FW", (void const **)&v, &size) != kSuccess || size != 16) {
++		printf("SWEET ADSP: no ADSP-FW in the payload\n");
++		return;
++	}
++	const uint8_t *fw = (const uint8_t *)phystokv(v[0]);
++	uint64_t fwlen = v[1];
++	uint32_t nseg, mdt_off, mdt_len;
++	if (fwlen < 16 || memcmp(fw, "SADF", 4) != 0) {
++		printf("SWEET ADSP: ADSP-FW is not a SADF container\n");
++		return;
++	}
++	memcpy(&nseg, fw + 4, 4);
++	memcpy(&mdt_off, fw + 8, 4);
++	memcpy(&mdt_len, fw + 12, 4);
++	if (nseg > 64 || 16 + 8ull * nseg > fwlen || (uint64_t)mdt_off + mdt_len > fwlen || mdt_len < 0x34) {
++		printf("SWEET ADSP: ADSP-FW header out of range\n");
++		return;
++	}
++	const uint8_t *mdt = fw + mdt_off;
++	uint32_t phoff = *(const uint32_t *)(mdt + 0x1c);
++	uint16_t phnum = *(const uint16_t *)(mdt + 0x2c);
++	if (phnum != nseg || phoff + 32ull * phnum > mdt_len) {
++		printf("SWEET ADSP: %u program headers, %u segments in the container\n", phnum, nseg);
++		return;
++	}
++
++	/* the metadata in one physically contiguous page */
++	vm_offset_t meta_va = 0;
++	if (mdt_len > PAGE_SIZE || kmem_alloc_contig(kernel_map, &meta_va, PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET ADSP: no page for the %u-byte metadata\n", mdt_len);
++		return;
++	}
++	memcpy((void *)meta_va, mdt, mdt_len);
++	uint64_t meta = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)meta_va));
++	flush_dcache64((addr64_t)meta, PAGE_SIZE, TRUE);
++
++	uint64_t r1 = 0;
++	int64_t r = adsp_scm(2, 1, 2u | (2u << 6), ADSP_PAS_ID, meta, 0, &r1);
++	printf("SWEET ADSP: init_image (metadata %u bytes at %#llx) -> %lld/%#llx\n", mdt_len, meta, r, r1);
++	if (r != 0 || r1 != 0) {
++		return;
++	}
++	r = adsp_scm(2, 2, 3, ADSP_PAS_ID, ADSP_REGION, ADSP_REGION_SZ, &r1);
++	printf("SWEET ADSP: mem_setup %#llx + %#llx -> %lld/%#llx\n", ADSP_REGION, ADSP_REGION_SZ, r, r1);
++	if (r != 0 || r1 != 0) {
++		return;
++	}
++
++	vm_offset_t window = 0;
++	if (kmem_alloc(kernel_map, &window, WINDOW, KMA_VAONLY | KMA_KOBJECT | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET ADSP: no kernel window\n");
++		return;
++	}
++	unsigned loaded = 0;
++	for (uint32_t i = 0; i < phnum; i++) {
++		const struct elf_phdr32 *ph = (const struct elf_phdr32 *)(mdt + phoff + 32 * i);
++		if (ph->type != 1 || ((ph->flags >> 24) & 7) == 2 || ph->memsz == 0) {
++			continue;
++		}
++		uint32_t off, len;
++		memcpy(&off, fw + 16 + 8 * i, 4);
++		memcpy(&len, fw + 20 + 8 * i, 4);
++		if (ph->paddr < ADSP_REGION || ph->paddr + (uint64_t)ph->memsz > ADSP_REGION + ADSP_REGION_SZ ||
++		    ph->filesz > ph->memsz || len < ph->filesz || (uint64_t)off + len > fwlen) {
++			printf("SWEET ADSP: segment %u (%#x + %#x, file %u) does not fit, stop\n", i, ph->paddr, ph->memsz, len);
++			return;
++		}
++		if (!adsp_write_phys(window, ph->paddr, fw + off, ph->filesz) ||
++		    !adsp_write_phys(window, ph->paddr + ph->filesz, NULL, ph->memsz - ph->filesz)) {
++			printf("SWEET ADSP: segment %u: window mapping failed\n", i);
++			return;
++		}
++		loaded++;
++	}
++	printf("SWEET ADSP: %u segments loaded into %#llx\n", loaded, ADSP_REGION);
++	r = adsp_scm(2, 5, 1, ADSP_PAS_ID, 0, 0, &r1);
++	printf("SWEET ADSP: auth_and_reset -> %lld/%#llx%s\n", r, r1,
++	    r == 0 && r1 == 0 ? ": THE ADSP IS RUNNING" : "");
++}
++
++void
++sweet_adsp_init(void)
++{
++	int on = 0;
++	thread_t t;
++	if (!PE_parse_boot_argn("sweetadsp", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	if (kernel_thread_start(adsp_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_audio.c b/bsd/dev/sweet_audio.c
 new file mode 100644
 index 0000000..7097030
@@ -1344,7 +1561,7 @@ index a9ad4f2..0b0f2a5 100644
  void
  sweet_touch_init(void)
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index b8c6bc7..7dc03da 100644
+index b8c6bc7..289d5b1 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -17,6 +17,9 @@
@@ -1834,7 +2051,7 @@ index b8c6bc7..7dc03da 100644
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
-@@ -660,6 +1071,12 @@ sweet_ufs_init(void)
+@@ -660,10 +1071,22 @@ sweet_ufs_init(void)
  	sweet_sample_start();
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
  	sweet_keys_init();
@@ -1847,6 +2064,16 @@ index b8c6bc7..7dc03da 100644
  	sweet_touch_init();
  	sweet_usb_probe();
  	sweet_perf_init();
+ 	sweet_gpu_init();
++#if defined(SWEET_KIRIN)
++	{
++		extern void sweet_adsp_init(void);
++		sweet_adsp_init();
++	}
++#endif
+ 	return 0;
+ }
+ 
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
 index 9c42e45..a0860a4 100644
 --- a/bsd/dev/sweet_usb.c
