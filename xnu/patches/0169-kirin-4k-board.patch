@@ -1131,7 +1131,7 @@ index 54edb01..f702842 100644
  		end = start + sp.kc_size;
  		/*
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index b8f1807..5ab1f03 100644
+index b8f1807..d91c978 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -11,6 +11,9 @@
@@ -1193,6 +1193,25 @@ index b8f1807..5ab1f03 100644
  void
  pe_init_fiq()
  {
+@@ -229,12 +274,18 @@ pe_init_fiq()
+ 	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
+ 	/* bring-up: GIC state as programmed (Pixel 1 timer debugging) */
++#if defined(SWEET_KIRIN)
++#define kprintf printf  /* kirin: kprintf does not reach the screen console */
++#endif
+ 	kprintf("SWEET GIC dbg: GICD_CTLR 0x%x GICR_WAKER 0x%x GICR_ISENABLER0 0x%x GICR_IGROUPR0 0x%x\n",
+ 	    gicd_read32(GICD_CTLR), gicr_read32(GICR_WAKER), gicr_read32(GICR_ISENABLER0), gicr_read32(GICR_IGROUPR0));
+ 	kprintf("SWEET GIC dbg: ICC_SRE 0x%llx IGRPEN1 0x%llx PMR 0x%llx CTLR 0x%llx CNTV_CTL 0x%llx DAIF 0x%llx\n",
+ 	    __builtin_arm_rsr64("ICC_SRE_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
+ 	    __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_CTLR_EL1"),
+ 	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("DAIF"));
++#if defined(SWEET_KIRIN)
++#undef kprintf
++#endif
+ #else
+ 	// Enable the forwarding of the vtimer interrupt
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 index 5d2856f..cdf69c0 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
