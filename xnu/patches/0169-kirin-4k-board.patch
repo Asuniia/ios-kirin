@@ -905,10 +905,32 @@ index b8c6bc7..1e331e5 100644
  		error = ufs_find_partition(want);
  	}
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index 9c42e45..d74e9e3 100644
+index 9c42e45..2d920c9 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
-@@ -48,6 +48,16 @@ static const struct {
+@@ -33,6 +33,21 @@
+ #include <net/kpi_interface.h>
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
++#include <net/bpf.h>
++
++/*
++ * Interface name: kirin uses en2 and publishes it to IOKit (SweetNetwork.cpp)
++ * so that iOS's configd adopts it and runs DHCP; BPF is attached and fed
++ * both ways, which DHCP (IPConfiguration) needs.
++ */
++#if defined(SWEET_KIRIN)
++#define UD_IF_NAME      "en"
++#define UD_IF_UNIT      2
++extern void sweet_net_publish(const char *prefix, unsigned unit, const uint8_t *mac);
++#else
++#define UD_IF_NAME      "ue"
++#define UD_IF_UNIT      0
++#endif
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+@@ -48,6 +63,16 @@ static const struct {
  	const char *name;
  	uint32_t    off;
  } usb_cbcr[] = {
@@ -925,7 +947,7 @@ index 9c42e45..d74e9e3 100644
  	{ "master", 0x0f010 },
  	{ "sleep", 0x0f014 },
  	{ "utmi", 0x0f018 },
-@@ -55,12 +65,21 @@ static const struct {
+@@ -55,12 +80,21 @@ static const struct {
  	{ "aggre-axi", 0x8201c },
  	{ "ahb2phy", 0x6a004 },
  	{ "clkref", 0x8c010 },
@@ -947,7 +969,7 @@ index 9c42e45..d74e9e3 100644
  
  static uint32_t
  usb_rd(vm_offset_t base, uint32_t off)
-@@ -120,6 +139,10 @@ sweet_usb_probe(void)
+@@ -120,6 +154,10 @@ sweet_usb_probe(void)
  		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
  		return;
  	}
@@ -958,7 +980,7 @@ index 9c42e45..d74e9e3 100644
  	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
  	if (phy == 0) {
  		return;
-@@ -164,7 +187,7 @@ sweet_usb_probe(void)
+@@ -164,7 +202,7 @@ sweet_usb_probe(void)
   * session; Linux dwc3-qcom forces that in software when the charger
   * reports a cable (dwc3_qcom_vbus_override_enable).
   */
@@ -967,6 +989,67 @@ index 9c42e45..d74e9e3 100644
  #define QSCRATCH_HS_PHY_CTRL    0x10
  #define   UTMI_OTG_VBUS_VALID   (1u << 20)
  #define   SW_SESSVLD_SEL        (1u << 28)
+@@ -519,6 +557,9 @@ ud_rx_done(void)
+ 			stats.packets_in = 1;
+ 			stats.bytes_in = len;
+ 			ud.rx_frames++;
++#if defined(SWEET_KIRIN)
++			bpf_tap_in(ud.ifp, DLT_EN10MB, m, frame_header, ETHER_HDR_LEN);
++#endif
+ 			ifnet_input(ud.ifp, m, &stats);
+ 		} else if (m != NULL) {
+ 			mbuf_freem(m);
+@@ -564,6 +605,9 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+ 		return 0;
+ 	}
+ 	ifnet_stat_increment_out(ifp, 1, mbuf_pkthdr_len(m), 0);
++#if defined(SWEET_KIRIN)
++	bpf_tap_out(ifp, DLT_EN10MB, m, NULL, 0);
++#endif
+ 	ud.txq[(ud.txq_head + ud.txq_count) % UD_TXQ] = m;
+ 	ud.txq_count++;
+ 	ud_tx_kick_locked();
+@@ -609,8 +653,8 @@ ud_if_create(void)
+ 	init.flags = IFNET_INIT_LEGACY;
+ 	init.uniqueid = "sweet-usb-ecm";
+ 	init.uniqueid_len = sizeof("sweet-usb-ecm") - 1;
+-	init.name = "ue";
+-	init.unit = 0;
++	init.name = UD_IF_NAME;
++	init.unit = UD_IF_UNIT;
+ 	init.family = IFNET_FAMILY_ETHERNET;
+ 	init.type = IFT_ETHER;
+ 	init.output = ud_if_output;
+@@ -639,6 +683,10 @@ ud_if_create(void)
+ 		return;
+ 	}
+ 	ifnet_set_lladdr(ud.ifp, ud_phone_mac, ETHER_ADDR_LEN);
++#if defined(SWEET_KIRIN)
++	bpfattach(ud.ifp, DLT_EN10MB, sizeof(struct ether_header));
++	sweet_net_publish(UD_IF_NAME, UD_IF_UNIT, ud_phone_mac);
++#endif
+ 
+ 	errno_t err = proto_plumb(PF_INET, ud.ifp);
+ 	socket_t so = NULL;
+@@ -648,7 +696,7 @@ ud_if_create(void)
+ 	if (err == 0) {
+ 		struct ifaliasreq ifra;
+ 		bzero(&ifra, sizeof(ifra));
+-		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "ue0");
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "%s%d", UD_IF_NAME, UD_IF_UNIT);
+ 		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+@@ -665,7 +713,8 @@ ud_if_create(void)
+ 		sock_close(so);
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+-	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++	printf("SWEET USB: %s%d 192.168.7.2/24 %s (err %d)\n", UD_IF_NAME, UD_IF_UNIT,
++	    err ? "NOT configured" : "up", err);
+ }
+ 
+ static void
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
 index bb2a2bf..df660a8 100644
 --- a/bsd/kern/bsd_init.c
@@ -1390,6 +1473,175 @@ index 26b4001..b9f6c0c 100644
  	if (on && fDirty) {
  		presentPending();
  	}
+diff --git a/iokit/Kernel/arm/SweetNetwork.cpp b/iokit/Kernel/arm/SweetNetwork.cpp
+new file mode 100644
+index 0000000..d08a9f1
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNetwork.cpp
+@@ -0,0 +1,163 @@
++/*
++ * IOKit side of the USB Ethernet (bsd/dev/sweet_usb.c), so that iOS's
++ * configd sees it as a network interface and runs DHCP on it. Without
++ * IONetworkingFamily (not part of XNU), only what configd reads is here
++ * (configd SCNetworkInterface.c, InterfaceNamer ifnamer.c):
++ *   IONetworkStack       configd's InterfaceNamer waits for it and opens it
++ *                        (IOServiceOpen type 0) before it handles any
++ *                        interface; its naming commands are accepted and
++ *                        ignored (the interface is self-named)
++ *   AppleUSBCDCECMData   the controller: IOMACAddress, IOSelfNamed; configd
++ *                        classifies Ethernet interfaces by their controller's
++ *                        class, this one is a USB Ethernet (CDC-ECM)
++ *   IOEthernetInterface  (an IONetworkInterface) the interface: BSD Name,
++ *                        IOInterfaceType 6 (IFT_ETHER), IOInterfaceNamePrefix,
++ *                        IOInterfaceUnit, IOBuiltin, IOPrimaryInterface
++ * The controller hangs off IOResources (configd wants a bus node above it).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSBoolean.h>
++
++class IONetworkStackUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IONetworkStackUserClient);
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++IOReturn
++IONetworkStackUserClient::setProperties(OSObject *properties)
++{
++	static int logged;
++	if (logged++ < 8) {
++		OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++		IOLog("SWEET NET: IONetworkStack command (%u keys) ignored\n", d ? d->getCount() : 0);
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IONetworkStackUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++class IONetworkStack : public IOService {
++	OSDeclareDefaultStructors(IONetworkStack);
++public:
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++IOReturn
++IONetworkStack::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    IOUserClient **handler)
++{
++	IONetworkStackUserClient *uc = OSTypeAlloc(IONetworkStackUserClient);
++	if (uc == NULL || !uc->initWithTask(owningTask, securityID, type) ||
++	    !uc->attach(this) || !uc->start(this)) {
++		if (uc != NULL) {
++			uc->detach(this);
++			uc->release();
++		}
++		return kIOReturnNoMemory;
++	}
++	*handler = uc;
++	return kIOReturnSuccess;
++}
++
++class AppleUSBCDCECMData : public IOService {
++	OSDeclareDefaultStructors(AppleUSBCDCECMData);
++};
++
++OSDefineMetaClassAndStructors(AppleUSBCDCECMData, IOService);
++
++class IONetworkInterface : public IOService {
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class IOEthernetInterface : public IONetworkInterface {
++	OSDeclareDefaultStructors(IOEthernetInterface);
++};
++
++OSDefineMetaClassAndStructors(IOEthernetInterface, IONetworkInterface);
++
++static void
++sweet_net_set_number(IOService *s, const char *key, uint32_t v)
++{
++	OSNumber *n = OSNumber::withNumber(v, 32);
++	if (n != NULL) {
++		s->setProperty(key, n);
++		n->release();
++	}
++}
++
++/* Called by sweet_usb.c once the BSD interface prefix<unit> is attached. */
++extern "C" void
++sweet_net_publish(const char *prefix, unsigned unit, const uint8_t *mac)
++{
++	IOService *resources = IOService::getResourceService();
++	if (resources == NULL) {
++		IOLog("SWEET NET: no IOResources\n");
++		return;
++	}
++	IONetworkStack *stack = OSTypeAlloc(IONetworkStack);
++	if (stack != NULL && stack->init() && stack->attach(resources)) {
++		stack->registerService();
++	}
++	OSSafeReleaseNULL(stack);
++
++	AppleUSBCDCECMData *ctl = OSTypeAlloc(AppleUSBCDCECMData);
++	IOEthernetInterface *nif = OSTypeAlloc(IOEthernetInterface);
++	if (ctl == NULL || nif == NULL || !ctl->init() || !nif->init()) {
++		OSSafeReleaseNULL(ctl);
++		OSSafeReleaseNULL(nif);
++		IOLog("SWEET NET: allocation failed\n");
++		return;
++	}
++	char bsd[16];
++	snprintf(bsd, sizeof(bsd), "%s%u", prefix, unit);
++	OSData *m = OSData::withBytes(mac, 6);
++	if (m != NULL) {
++		ctl->setProperty("IOMACAddress", m);
++		m->release();
++	}
++	ctl->setProperty("IOSelfNamed", kOSBooleanTrue);
++	ctl->setName("sweet-usb-ecm");
++
++	nif->setProperty("BSD Name", bsd);
++	nif->setProperty("IOInterfaceNamePrefix", prefix);
++	sweet_net_set_number(nif, "IOInterfaceUnit", unit);
++	sweet_net_set_number(nif, "IOInterfaceType", 6);      /* IFT_ETHER */
++	sweet_net_set_number(nif, "IOMaxTransferUnit", 1500);
++	nif->setProperty("IOBuiltin", kOSBooleanFalse);
++	nif->setProperty("IOPrimaryInterface", kOSBooleanFalse);
++	nif->setProperty("IOLocation", "USB");
++	nif->setName(bsd);
++
++	if (ctl->attach(resources) && nif->attach(ctl)) {
++		ctl->registerService();
++		nif->registerService();
++		IOLog("SWEET NET: %s published (USB Ethernet, %02x:%02x:%02x:%02x:%02x:%02x)\n",
++		    bsd, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++	} else {
++		IOLog("SWEET NET: attach failed\n");
++	}
++	ctl->release();
++	nif->release();
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 index 0631685..8ba18b8 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
@@ -1552,6 +1804,18 @@ index defe307..3f9f3da 100644
  	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
  	if (was == down && !moved) {
  		IOLockUnlock(fLock);
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index fd4a820..f87f002 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
++iokit/Kernel/arm/SweetNetwork.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
 index a8809d1..ea4c75a 100644
 --- a/makedefs/MakeInc.def
