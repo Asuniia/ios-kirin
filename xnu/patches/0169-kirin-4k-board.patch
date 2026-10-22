@@ -1,3 +1,189 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 2a6dc36..34326d1 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
++bsd/dev/sweet_audio.c			standard
+ bsd/dev/sweet_perf.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_audio.c b/bsd/dev/sweet_audio.c
+new file mode 100644
+index 0000000..7097030
+--- /dev/null
++++ b/bsd/dev/sweet_audio.c
+@@ -0,0 +1,168 @@
++/*
++ * kirin: the devices iOS's audio plug-in writes to (tools/sweetaudio, after
++ * HackiOS's RedwoodAudio.driver, APSL 2.0): mediaserverd gets from it the
++ * iPhone X's "Speaker" and "Actuator" (Taptic Engine) devices.
++ *
++ *   /dev/sweet-audio   stereo 16-bit 48 kHz frames of what iOS plays. No
++ *                      sound path yet: taken and dropped, so that iOS has an
++ *                      output device. ioctl SWEET_AUDIO_SET_VOLUME accepted.
++ *   /dev/sweet-haptic  the Taptic Engine's waveform (one channel, 16-bit,
++ *                      48 kHz). There is no waveform playback on this phone's
++ *                      motor (PM660 haptics, ERM, direct mode): while a write
++ *                      is louder than HAPTIC_ON (peak sample) the motor runs,
++ *                      and it stops HAPTIC_TAIL_MS after the last loud write,
++ *                      or after HAPTIC_MAX_MS of running, then rests for as
++ *                      long as it ran.
++ * Writes never block (the audio server's real-time thread): the motor's PMIC
++ * writes are done by a kernel thread the writes wake.
++ */
++#if defined(SWEET_KIRIN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/errno.h>
++#include <sys/ioccom.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++extern bool sweet_haptic_set(bool on);
++void sweet_audio_init(void);
++
++struct sweet_audio_volume {
++	uint32_t below;
++	uint32_t muted;
++};
++#define SWEET_AUDIO_SET_VOLUME  _IOW('r', 1, struct sweet_audio_volume)
++
++#define HAPTIC_ON               2000    /* peak sample that runs the motor */
++#define HAPTIC_TAIL_MS          30
++#define HAPTIC_MAX_MS           1500
++
++static volatile uint64_t haptic_last_loud;     /* mach_absolute_time of the last loud write */
++static int haptic_chan;
++
++static int
++sa_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++sa_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++audio_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	static uint64_t frames;
++	if (frames == 0) {
++		printf("SWEET AUDIO: first sound from iOS (no speaker path yet: dropped)\n");
++	}
++	frames += (uint64_t)uio_resid(uio) / 4;
++	uio_update(uio, uio_resid(uio));
++	return 0;
++}
++
++static int
++audio_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flags, __unused struct proc *p)
++{
++	if (command != SWEET_AUDIO_SET_VOLUME) {
++		return ENOTTY;
++	}
++	const struct sweet_audio_volume *v = (const struct sweet_audio_volume *)data;
++	printf("SWEET AUDIO: volume %s%u.%03u dB under the loudest\n", v->muted ? "muted, " : "",
++	    v->below / 8, v->below % 8 * 125);
++	return 0;
++}
++
++static int
++haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t buf[256];
++	int peak = 0, error = 0;
++	while (uio_resid(uio) >= 2) {
++		user_ssize_t n = MIN(uio_resid(uio), (user_ssize_t)sizeof(buf));
++		n -= n % 2;
++		if ((error = uiomove((caddr_t)buf, (int)n, uio)) != 0) {
++			break;
++		}
++		for (int i = 0; i < n / 2; i++) {
++			int a = buf[i] < 0 ? -buf[i] : buf[i];
++			peak = a > peak ? a : peak;
++		}
++	}
++	if (peak >= HAPTIC_ON) {
++		haptic_last_loud = mach_absolute_time();
++		thread_wakeup(&haptic_chan);
++	}
++	return error;
++}
++
++static uint64_t
++ms_abs(unsigned ms)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &abs);
++	return abs;
++}
++
++static void
++haptic_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	bool on = false;
++	uint64_t since = 0, rest_until = 0;
++	unsigned plays = 0;
++	for (;;) {
++		uint64_t deadline;
++		clock_interval_to_deadline(on ? 5 : 1000, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&haptic_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		uint64_t now = mach_absolute_time(), loud = haptic_last_loud;
++		bool active = loud != 0 && now - loud < ms_abs(HAPTIC_TAIL_MS);
++		if (!on && active && now >= rest_until) {
++			on = sweet_haptic_set(true);
++			since = now;
++			if (plays++ < 10) {
++				printf("SWEET HAPTIC: motor on (%s)\n", on ? "ok" : "FAILED");
++			}
++		} else if (on && (!active || now - since > ms_abs(HAPTIC_MAX_MS))) {
++			(void)sweet_haptic_set(false);
++			on = false;
++			rest_until = now + (now - since > ms_abs(HAPTIC_MAX_MS) ? now - since : 0);
++		}
++	}
++}
++
++static const struct cdevsw audio_cdevsw = {
++	.d_open = sa_open, .d_close = sa_close, .d_read = eno_rdwrt, .d_write = audio_write,
++	.d_ioctl = audio_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static const struct cdevsw haptic_cdevsw = {
++	.d_open = sa_open, .d_close = sa_close, .d_read = eno_rdwrt, .d_write = haptic_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++void
++sweet_audio_init(void)
++{
++	int a = cdevsw_add(-1, &audio_cdevsw), h = cdevsw_add(-1, &haptic_cdevsw);
++	bool ok = a >= 0 && h >= 0 &&
++	    devfs_make_node(makedev(a, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-audio") != NULL &&
++	    devfs_make_node(makedev(h, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-haptic") != NULL;
++	thread_t t;
++	if (ok && kernel_thread_start(haptic_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++	printf("SWEET AUDIO: /dev/sweet-audio and /dev/sweet-haptic %s\n", ok ? "ready" : "NOT created");
++}
++#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
 index a8c7bde..53f61c4 100644
 --- a/bsd/dev/sweet_gpu.c
@@ -460,7 +646,7 @@ index a8c7bde..53f61c4 100644
  		thread_deallocate(thread);
  	}
 diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
-index 0c548d1..6239baf 100644
+index 0c548d1..9bc7611 100644
 --- a/bsd/dev/sweet_keys.c
 +++ b/bsd/dev/sweet_keys.c
 @@ -10,6 +10,15 @@
@@ -527,7 +713,7 @@ index 0c548d1..6239baf 100644
  
  static void
  keys_wait(void)
-@@ -228,6 +249,183 @@ keys_wait(void)
+@@ -228,6 +249,199 @@ keys_wait(void)
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -635,11 +821,27 @@ index 0c548d1..6239baf 100644
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
 +
++static LCK_GRP_DECLARE(hap_grp, "sweet_vib");
++static LCK_MTX_DECLARE(hap_lock, &hap_grp);
++
++/* Motor on or off and back (bsd/dev/sweet_audio.c, iOS's haptics). Thread context only. */
++bool
++sweet_haptic_set(bool on)
++{
++	lck_mtx_lock(&hap_lock);
++	bool ok = hap_setup();
++	if (ok && on) {
++		ok = sweet_pmic_write(HAP_PPID, 0x46, 0x80) && sweet_pmic_write(HAP_PPID, 0x70, 0x80);
++	} else if (ok) {
++		ok = sweet_pmic_write(HAP_PPID, 0x70, 0x00) && sweet_pmic_write(HAP_PPID, 0x46, 0x00);
++	}
++	lck_mtx_unlock(&hap_lock);
++	return ok;
++}
++
 +void
 +sweet_vibrate(unsigned ms)
 +{
-+	static LCK_GRP_DECLARE(hap_grp, "sweet_vib");
-+	static LCK_MTX_DECLARE(hap_lock, &hap_grp);
 +	lck_mtx_lock(&hap_lock);
 +	if (hap_setup()) {
 +		bool ok = sweet_pmic_write(HAP_PPID, 0x46, 0x80) && sweet_pmic_write(HAP_PPID, 0x70, 0x80);
@@ -711,7 +913,7 @@ index 0c548d1..6239baf 100644
  static void
  keys_thread(void *arg, wait_result_t result)
  {
-@@ -257,6 +455,7 @@ keys_thread(void *arg, wait_result_t result)
+@@ -257,6 +471,7 @@ keys_thread(void *arg, wait_result_t result)
  		keys_wait();
  	}
  }
@@ -719,7 +921,7 @@ index 0c548d1..6239baf 100644
  
  void
  sweet_keys_init(void)
-@@ -274,9 +473,13 @@ sweet_keys_init(void)
+@@ -274,9 +489,13 @@ sweet_keys_init(void)
  	}
  	keys_core = ml_io_map(KEYS_CORE_PA, 0x1000);
  	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
@@ -733,7 +935,7 @@ index 0c548d1..6239baf 100644
  		printf("SWEET KEYS: MMIO mapping failed\n");
  		return;
  	}
-@@ -294,8 +497,13 @@ sweet_keys_init(void)
+@@ -294,8 +513,13 @@ sweet_keys_init(void)
  	}
  	uint8_t pon = 0;
  	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
@@ -1142,7 +1344,7 @@ index a9ad4f2..0b0f2a5 100644
  void
  sweet_touch_init(void)
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index b8c6bc7..1e331e5 100644
+index b8c6bc7..17f436d 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -17,6 +17,9 @@
@@ -1542,6 +1744,19 @@ index b8c6bc7..1e331e5 100644
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
+@@ -660,6 +981,12 @@ sweet_ufs_init(void)
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
++#if defined(SWEET_KIRIN)
++	{
++		extern void sweet_audio_init(void);
++		sweet_audio_init();
++	}
++#endif
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_perf_init();
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
 index 9c42e45..1a3b8bf 100644
 --- a/bsd/dev/sweet_usb.c
@@ -1711,10 +1926,10 @@ index 9c42e45..1a3b8bf 100644
  }
  
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index bb2a2bf..69f44cf 100644
+index bb2a2bf..878fb4c 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -324,6 +324,70 @@ static void process_name(const char *, proc_t);
+@@ -324,6 +324,86 @@ static void process_name(const char *, proc_t);
  
  static void setconf(void);
  
@@ -1769,6 +1984,22 @@ index bb2a2bf..69f44cf 100644
 +			data += n + 1;
 +			len -= n + 1;
 +		}
++		if (inpath) {
++			/* parent directories of a FILEP: path (a plug-in bundle, ...): created as needed */
++			extern int sweet_mkdir(const char *path);
++			char dir[256];
++			strlcpy(dir, path, sizeof(dir));
++			for (char *c = dir + 1; *c; c++) {
++				if (*c == '/') {
++					*c = '\0';
++					int me = sweet_mkdir(dir);
++					if (me != 0 && me != EEXIST) {
++						printf("SWEET FILE: mkdir %s: error %d\n", dir, me);
++					}
++					*c = '/';
++				}
++			}
++		}
 +		vnode_t vp = NULLVP;
 +		int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, 0755, 0, &vp, ctx);
 +		if (err == 0) {
@@ -1785,7 +2016,7 @@ index bb2a2bf..69f44cf 100644
  #if CONFIG_BASESYSTEMROOT
  static int bsd_find_basesystem_dmg(char *bsdmgpath_out, bool *rooted_dmg, bool *skip_signature_check);
  static boolean_t bsdmgroot_bootable(void);
-@@ -490,9 +554,16 @@ bsd_init(void)
+@@ -490,9 +570,16 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -1803,7 +2034,7 @@ index bb2a2bf..69f44cf 100644
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
  #else
  #define bsd_init_kprintf(x, ...)
-@@ -1098,6 +1169,9 @@ bsdinit_task(void)
+@@ -1098,6 +1185,9 @@ bsdinit_task(void)
  
  	bsd_init_kprintf("bsd_do_post - done");
  
@@ -1886,6 +2117,30 @@ index 01e674f..5a3f0d0 100644
  	error = sweet_exec_env(imgp, new_ptr_size);
  	if (error) {
  		goto bad;
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 90e68bb..0c0879e 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9831,6 +9831,19 @@ out:
+ 	return error;
+ }
+ 
++#if defined(SWEET_KIRIN)
++/* mkdir from the kernel (bsd_init.c's boot-payload files): one level, mode 0755. */
++int sweet_mkdir(const char *path);
++int
++sweet_mkdir(const char *path)
++{
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, 0755);
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++#endif
++
+ /*
+  * mkdir_extended: Create a directory; with extended security (ACL).
+  *
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
 index bec47e0..4f6eecb 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp

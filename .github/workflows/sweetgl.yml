@@ -11,6 +11,7 @@ on:
   push:
     paths:
       - 'tools/sweetgl/**'
+      - 'tools/sweetaudio/**'
       - '.github/workflows/sweetgl.yml'
 
 jobs:
@@ -46,6 +47,21 @@ jobs:
 
       - name: Build sweetgl.dylib
         run: sh tools/sweetgl/build.sh
+
+      - name: Build SweetAudio.driver (tools/sweetaudio)
+        run: |
+          cd tools/sweetaudio
+          DEVELOPER_DIR=$GITHUB_WORKSPACE/research/xcode15/Xcode.app/Contents/Developer \
+            xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall \
+            -bundle -framework CoreFoundation -o SweetAudio sweetaudio.c
+          codesign -f -s - SweetAudio
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetaudio
+          path: |
+            tools/sweetaudio/SweetAudio
+            tools/sweetaudio/Info.plist
 
       - uses: actions/upload-artifact@v4
         with:
