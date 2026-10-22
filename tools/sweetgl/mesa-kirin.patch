@@ -1,0 +1,43 @@
+--- a/src/gallium/drivers/freedreno/a5xx/fd5_gmem.c
++++ b/src/gallium/drivers/freedreno/a5xx/fd5_gmem.c
+@@ -697,7 +697,30 @@
+    fd5_set_render_mode(batch->ctx, ring, BYPASS);
+ }
+ 
+-static void
++static /*
++ * RB_CCU_CNTL for sysmem (bypass) rendering. 0x10000000 is what the A530
++ * blob uses; read as on a6xx (COLOR_OFFSET in bits 31:21, 4 KB units) it
++ * puts the colour CCU 512 KB into GMEM, the middle of the A530's 1 MB but
++ * past the end of the A508's 136 KB (render target writes collide there).
++ * GPUs with less than 256 KB of GMEM get the same place relative to their
++ * GMEM: 64 KB in, 0x02000000. SWEETGL_CCU=hex overrides (experiments).
++ */
++static uint32_t
++fd5_ccu_bypass(struct fd_screen *screen)
++{
++   static int once;
++   static uint32_t v;
++   if (!once) {
++      const char *e = getenv("SWEETGL_CCU");
++      v = e ? (uint32_t)strtoul(e, NULL, 16) :
++          screen->gmemsize_bytes < 0x40000 ? 0x02000000 : 0x10000000;
++      mesa_logi("sweetgl: RB_CCU_CNTL bypass 0x%08x (GMEM %u bytes)", v, screen->gmemsize_bytes);
++      once = 1;
++   }
++   return v;
++}
++
++void
+ fd5_emit_sysmem_prep(struct fd_batch *batch) assert_dt
+ {
+    struct fd_context *ctx = batch->ctx;
+@@ -724,7 +747,7 @@
+    /* 0x10000000 for BYPASS.. 0x7c13c080 for GMEM: */
+    fd_wfi(batch, ring);
+    OUT_PKT4(ring, REG_A5XX_RB_CCU_CNTL, 1);
+-   OUT_RING(ring, 0x10000000); /* RB_CCU_CNTL */
++   OUT_RING(ring, fd5_ccu_bypass(batch->ctx->screen)); /* RB_CCU_CNTL */
+ 
+    OUT_PKT4(ring, REG_A5XX_RB_CNTL, 1);
+    OUT_RING(ring, A5XX_RB_CNTL_WIDTH(0) | A5XX_RB_CNTL_HEIGHT(0) |

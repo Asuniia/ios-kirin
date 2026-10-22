@@ -37,6 +37,7 @@ jobs:
         run: |
           git clone --depth 1 --branch mesa-26.2.5 https://gitlab.freedesktop.org/mesa/mesa.git research/mesa
           git -C research/mesa apply "$GITHUB_WORKSPACE/tools/sweetgl/mesa.patch"
+          git -C research/mesa apply "$GITHUB_WORKSPACE/tools/sweetgl/mesa-kirin.patch"
           sed -i '' "s|/Volumes/SamsungSSD/ios-sailfish|$GITHUB_WORKSPACE|g" tools/sweetgl/ios-cross.txt
           cat tools/sweetgl/ios-cross.txt
 
