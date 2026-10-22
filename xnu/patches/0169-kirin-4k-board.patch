@@ -14,10 +14,10 @@ index 2a6dc36..7f320ce 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
 new file mode 100644
-index 0000000..7201a29
+index 0000000..daa3007
 --- /dev/null
 +++ b/bsd/dev/sweet_adsp.c
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,185 @@
 +/*
 + * kirin, boot-arg sweetadsp=1: the audio DSP (ADSP, the LPASS Hexagon) is
 + * loaded and started through TrustZone, as Linux's pil-tz-generic does it
@@ -40,8 +40,8 @@ index 0000000..7201a29
 + *                     the part past filesz zeroed
 + *   PAS_AUTH_AND_RESET (svc 2 cmd 5) pas id: TrustZone authenticates the
 + *                     loaded image and releases the DSP from reset
-+ * The region is outside the kernel's RAM and too big for the I/O map: it is
-+ * written through a 1 MB kernel window moved over it (write-combined).
++ * The region is outside the kernel's RAM: it is mapped whole, once,
++ * write-combined (ml_io_map_wcomb).
 + * Linux also votes the LPASS CX rail and XO through the RPM for the time of
 + * the boot (qcom,proxy-*); there is no RPM driver here yet: if the DSP needs
 + * them and the bootloader left them off, auth_and_reset will say so.
@@ -60,12 +60,12 @@ index 0000000..7201a29
 +
 +extern vm_map_address_t phystokv(uint64_t pa);
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 +void sweet_adsp_init(void);
 +
 +#define ADSP_PAS_ID     1u
 +#define ADSP_REGION     0x92a00000ull
 +#define ADSP_REGION_SZ  0x01e00000ull
-+#define WINDOW          (1u << 20)
 +
 +/* Qualcomm SCM call, ARM SMCCC (as sweet_gpu.c's scm_call). */
 +static int64_t
@@ -99,32 +99,6 @@ index 0000000..7201a29
 +	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
 +};
 +
-+/* Copy len bytes (src NULL: zeros) to physical pa, through the moving window. */
-+static bool
-+adsp_write_phys(vm_offset_t window, uint64_t pa, const uint8_t *src, uint64_t len)
-+{
-+	while (len > 0) {
-+		uint64_t base = pa & ~(uint64_t)(WINDOW - 1), off = pa - base;
-+		uint64_t n = MIN(len, WINDOW - off);
-+		for (uint64_t p = 0; p < WINDOW; p += PAGE_SIZE) {
-+			if (pmap_enter(kernel_pmap, window + p, (ppnum_t)atop_64(base + p),
-+			    VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE, VM_WIMG_WCOMB, TRUE) != KERN_SUCCESS) {
-+				return false;
-+			}
-+		}
-+		if (src) {
-+			memcpy((void *)(window + off), src, (size_t)n);
-+			src += n;
-+		} else {
-+			bzero((void *)(window + off), (size_t)n);
-+		}
-+		__builtin_arm_dsb(0xf);
-+		pmap_remove(kernel_pmap, window, window + WINDOW);
-+		pa += n;
-+		len -= n;
-+	}
-+	return true;
-+}
 +
 +static void
 +adsp_thread(__unused void *arg, __unused wait_result_t wr)
@@ -162,16 +136,17 @@ index 0000000..7201a29
 +		return;
 +	}
 +
-+	/* the metadata in one physically contiguous page */
++	/* the metadata, physically contiguous */
 +	vm_offset_t meta_va = 0;
-+	if (mdt_len > PAGE_SIZE || kmem_alloc_contig(kernel_map, &meta_va, PAGE_SIZE, PAGE_MASK, 0, 0,
++	vm_size_t meta_sz = round_page(mdt_len);
++	if (kmem_alloc_contig(kernel_map, &meta_va, meta_sz, PAGE_MASK, 0, 0,
 +	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		printf("SWEET ADSP: no page for the %u-byte metadata\n", mdt_len);
 +		return;
 +	}
 +	memcpy((void *)meta_va, mdt, mdt_len);
 +	uint64_t meta = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)meta_va));
-+	flush_dcache64((addr64_t)meta, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)meta, (unsigned)meta_sz, TRUE);
 +
 +	uint64_t r1 = 0;
 +	int64_t r = adsp_scm(2, 1, 2u | (2u << 6), ADSP_PAS_ID, meta, 0, &r1);
@@ -185,10 +160,9 @@ index 0000000..7201a29
 +		return;
 +	}
 +
-+	vm_offset_t window = 0;
-+	if (kmem_alloc(kernel_map, &window, WINDOW, KMA_VAONLY | KMA_KOBJECT | KMA_PERMANENT,
-+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-+		printf("SWEET ADSP: no kernel window\n");
++	uint8_t *region = (uint8_t *)ml_io_map_wcomb(ADSP_REGION, ADSP_REGION_SZ);
++	if (!region) {
++		printf("SWEET ADSP: the region cannot be mapped\n");
 +		return;
 +	}
 +	unsigned loaded = 0;
@@ -205,13 +179,11 @@ index 0000000..7201a29
 +			printf("SWEET ADSP: segment %u (%#x + %#x, file %u) does not fit, stop\n", i, ph->paddr, ph->memsz, len);
 +			return;
 +		}
-+		if (!adsp_write_phys(window, ph->paddr, fw + off, ph->filesz) ||
-+		    !adsp_write_phys(window, ph->paddr + ph->filesz, NULL, ph->memsz - ph->filesz)) {
-+			printf("SWEET ADSP: segment %u: window mapping failed\n", i);
-+			return;
-+		}
++		memcpy(region + (ph->paddr - ADSP_REGION), fw + off, ph->filesz);
++		bzero(region + (ph->paddr - ADSP_REGION) + ph->filesz, ph->memsz - ph->filesz);
 +		loaded++;
 +	}
++	__builtin_arm_dsb(0xf);
 +	printf("SWEET ADSP: %u segments loaded into %#llx\n", loaded, ADSP_REGION);
 +	r = adsp_scm(2, 5, 1, ADSP_PAS_ID, 0, 0, &r1);
 +	printf("SWEET ADSP: auth_and_reset -> %lld/%#llx%s\n", r, r1,
@@ -407,10 +379,10 @@ index 0000000..7097030
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
 new file mode 100644
-index 0000000..fc7a0f5
+index 0000000..dff68e9
 --- /dev/null
 +++ b/bsd/dev/sweet_glink.c
-@@ -0,0 +1,896 @@
+@@ -0,0 +1,898 @@
 +/*
 + * kirin: talking to the ADSP once it runs (bsd/dev/sweet_adsp.c), as
 + * Linux 4.19's qcom_smem + qcom_glink_smem + qcom_glink_native do it for DT
@@ -441,10 +413,12 @@ index 0000000..fc7a0f5
 +#include <kern/thread.h>
 +#include <kern/clock.h>
 +#include <kern/locks.h>
++#include <kern/sched_prim.h>
 +#include <pexpert/pexpert.h>
-+#include <machine/machine_routines.h>
 +#include <kern/kalloc.h>
 +
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 +void sweet_glink_init(void);
 +int sweet_glink_apr_send(const void *pkt, uint32_t len);
 +void (*sweet_glink_apr_handler)(const uint8_t *pkt, uint32_t len);
