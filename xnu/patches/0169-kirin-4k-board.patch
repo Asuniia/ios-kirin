@@ -460,7 +460,7 @@ index a8c7bde..53f61c4 100644
  		thread_deallocate(thread);
  	}
 diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
-index 0c548d1..78b1a46 100644
+index 0c548d1..6239baf 100644
 --- a/bsd/dev/sweet_keys.c
 +++ b/bsd/dev/sweet_keys.c
 @@ -10,6 +10,15 @@
@@ -527,11 +527,47 @@ index 0c548d1..78b1a46 100644
  
  static void
  keys_wait(void)
-@@ -228,6 +249,146 @@ keys_wait(void)
+@@ -228,6 +249,183 @@ keys_wait(void)
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
 +#if defined(SWEET_KIRIN)
++/*
++ * Time of day from the PM660 RTC (SID 0, peripheral 0x60; DT
++ * qcom,pm660_rtc = qcom,pm8941-rtc, Linux rtc-pm8xxx): RTC_EN is bit 7 of
++ * 0x46, the seconds counter RDATA0..3 at 0x48..0x4b, least significant
++ * first, read twice until two reads agree (a carry in between). The
++ * calendar clock is set from it only if it reads a date after 2024-01-01:
++ * under Android the RTC may count from another origin (Android keeps an
++ * offset of its own), and then it is only logged.
++ */
++extern void clock_set_calendar_microtime(clock_sec_t secs, clock_usec_t microsecs);
++
++static void
++sweet_rtc_init(void)
++{
++	uint8_t ctl = 0, b[4] = {0}, c[4] = {0};
++	bool ok = sweet_pmic_read(0x060, 0x46, &ctl);
++	for (int tries = 0; ok && tries < 3; tries++) {
++		for (int i = 0; ok && i < 4; i++) {
++			ok = sweet_pmic_read(0x060, (uint8_t)(0x48 + i), &b[i]);
++		}
++		for (int i = 0; ok && i < 4; i++) {
++			ok = sweet_pmic_read(0x060, (uint8_t)(0x48 + i), &c[i]);
++		}
++		if (ok && memcmp(b, c, 4) == 0) {
++			break;
++		}
++	}
++	uint32_t secs = (uint32_t)c[0] | (uint32_t)c[1] << 8 | (uint32_t)c[2] << 16 | (uint32_t)c[3] << 24;
++	bool plausible = ok && (ctl & 0x80) && secs > 1704067200u;
++	printf("SWEET RTC: ctl %#x seconds %u%s -> %s\n", ctl, secs, ok ? "" : " (read failed)",
++	    plausible ? "calendar clock set" : "not a recent date, clock left alone");
++	if (plausible) {
++		clock_set_calendar_microtime((clock_sec_t)secs, 0);
++	}
++}
++
 +/*
 + * PS_HOLD reset type of both PMICs before PS_HOLD drops (Linux
 + * qpnp_pon_reset_config / qpnp_pon_system_pwr_off): PON base 0x800,
@@ -646,6 +682,7 @@ index 0c548d1..78b1a46 100644
 +	unsigned errors = 0;
 +	(void)arg;
 +	(void)result;
++	sweet_rtc_init();
 +	keys_voldn_setup();
 +	for (;;) {
 +		uint8_t pon = 0, gpio = 1;
@@ -674,7 +711,7 @@ index 0c548d1..78b1a46 100644
  static void
  keys_thread(void *arg, wait_result_t result)
  {
-@@ -257,6 +418,7 @@ keys_thread(void *arg, wait_result_t result)
+@@ -257,6 +455,7 @@ keys_thread(void *arg, wait_result_t result)
  		keys_wait();
  	}
  }
@@ -682,7 +719,7 @@ index 0c548d1..78b1a46 100644
  
  void
  sweet_keys_init(void)
-@@ -274,9 +436,13 @@ sweet_keys_init(void)
+@@ -274,9 +473,13 @@ sweet_keys_init(void)
  	}
  	keys_core = ml_io_map(KEYS_CORE_PA, 0x1000);
  	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
@@ -696,7 +733,7 @@ index 0c548d1..78b1a46 100644
  		printf("SWEET KEYS: MMIO mapping failed\n");
  		return;
  	}
-@@ -294,8 +460,13 @@ sweet_keys_init(void)
+@@ -294,8 +497,13 @@ sweet_keys_init(void)
  	}
  	uint8_t pon = 0;
  	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
