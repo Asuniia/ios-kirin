@@ -573,10 +573,10 @@ index b8c6bc7..1e331e5 100644
  		error = ufs_find_partition(want);
  	}
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index bb2a2bf..1956f49 100644
+index bb2a2bf..df660a8 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -490,7 +490,12 @@ bsd_init(void)
+@@ -490,9 +490,16 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -587,8 +587,34 @@ index bb2a2bf..1956f49 100644
  #define DEBUG_BSDINIT 0
 +#endif
  
- #if DEBUG_BSDINIT
+-#if DEBUG_BSDINIT
++#if DEBUG_BSDINIT && defined(SWEET_KIRIN)
++#define bsd_init_kprintf(x, ...) printf("bsd_init: " x, ## __VA_ARGS__)
++#elif DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
+ #else
+ #define bsd_init_kprintf(x, ...)
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..c5103bd 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -31,6 +31,16 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++#if defined(SWEET_KIRIN)
++	/*
++	 * Bring-up check: everything before this point can run without a timer
++	 * interrupt (spinning delays, threads that block until signalled). A
++	 * timed sleep needs the CNTV interrupt through the GIC.
++	 */
++	IOLog("SWEET: timer IRQ test, sleeping 100 ms\n");
++	IOSleep(100);
++	IOLog("SWEET: timer IRQ test passed\n");
++#endif
+ 	return true;
+ }
+ 
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
 index a8809d1..ea4c75a 100644
 --- a/makedefs/MakeInc.def
