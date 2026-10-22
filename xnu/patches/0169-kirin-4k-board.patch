@@ -1960,7 +1960,7 @@ index 93d6318..3fc5bce 100644
  		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
  	}
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 26b4001..3c35a0f 100644
+index 26b4001..91a7e3b 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -42,6 +42,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
@@ -2161,7 +2161,7 @@ index 26b4001..3c35a0f 100644
  #define SWEET_FB_GPU_PA0        0xc0800000ull
  #define SWEET_FB_GPU_PA1        0xc1000000ull
  #define SWEET_FB_GPU_SLOT       0x00800000ull
-@@ -538,6 +668,11 @@ AppleCLCD::gpuStart(void)
+@@ -538,19 +668,59 @@ AppleCLCD::gpuStart(void)
  {
  	int on = 1;
  	PE_parse_boot_argn("sweetfb_gpu", &on, sizeof(on));
@@ -2173,7 +2173,18 @@ index 26b4001..3c35a0f 100644
  	fGpuStride = (fPanelW * 4 + 63) & ~63u;
  	uint64_t bytes = round_page((uint64_t)fGpuStride * fPanelH);
  	fGpuTest = on == 2;
-@@ -549,8 +684,34 @@ AppleCLCD::gpuStart(void)
++#if defined(SWEET_KIRIN)
++	/* 4352 x 2520 is 11 MB: the Pixel's 8 MB slots do not apply, the kirin buffers are checked below. */
++	if (!on) {
++		return false;
++	}
++#else
+ 	if (!on || bytes > SWEET_FB_GPU_SLOT) {
+ 		return false;
+ 	}
++#endif
+ 	uint32_t npages = (uint32_t)(bytes / PAGE_SIZE);
+ 	uint64_t *pa = (uint64_t *)IOMallocData(npages * sizeof(uint64_t));
  	if (pa == NULL) {
  		return false;
  	}
@@ -2188,6 +2199,8 @@ index 26b4001..3c35a0f 100644
 +	 */
 +	if ((uint64_t)fGpuStride * fPanelH > SWEET_FB_KIRIN_PA1 - SWEET_FB_KIRIN_PA0 ||
 +	    SWEET_FB_KIRIN_PA1 + (uint64_t)fGpuStride * fPanelH > SWEET_FB_KIRIN_END) {
++		IOLog("SWEET FB: GPU present off: %ux%u at stride %u does not fit the splash region\n",
++		    fPanelW, fPanelH, fGpuStride);
 +		on = 0;
 +	}
 +	vm_offset_t vig = on ? ml_io_map(0x0c905000u, 0x1000) : 0, ctl = on ? ml_io_map(0x0c902000u, 0x1000) : 0;
@@ -2208,7 +2221,7 @@ index 26b4001..3c35a0f 100644
  		for (uint32_t p = 0; p < npages; p++) {
  			pa[p] = fGpuPa[b] + (uint64_t)p * PAGE_SIZE;
  		}
-@@ -653,6 +814,71 @@ AppleCLCD::gpuLayer(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t
+@@ -653,6 +823,71 @@ AppleCLCD::gpuLayer(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t
  	return sweet_gpu_quad(&q) == 0;
  }
  
@@ -2280,7 +2293,7 @@ index 26b4001..3c35a0f 100644
  void
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
-@@ -766,7 +992,13 @@ AppleCLCD::setPower(bool on)
+@@ -766,7 +1001,13 @@ AppleCLCD::setPower(bool on)
  		return;
  	}
  	fBlanked = !on;
@@ -2294,7 +2307,7 @@ index 26b4001..3c35a0f 100644
  	if (on && fDirty) {
  		presentPending();
  	}
-@@ -779,10 +1011,22 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -779,10 +1020,22 @@ AppleCLCD::present(const uint8_t *rec)
  {
  	uint32_t mask = get32(rec, 0x104);
  
@@ -2318,7 +2331,7 @@ index 26b4001..3c35a0f 100644
  
  	if (!fConsolePaused) {
  		int quiet = 0;
-@@ -827,6 +1071,9 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -827,6 +1080,9 @@ AppleCLCD::present(const uint8_t *rec)
  			    get32(a, 12), dx, dy, w, h);
  		}
  		if (s == NULL || (s == fSurface && !fScaled)) {
@@ -2328,7 +2341,7 @@ index 26b4001..3c35a0f 100644
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -876,7 +1123,11 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -876,7 +1132,11 @@ AppleCLCD::present(const uint8_t *rec)
  		if (src != 0 && bpe == 4 && fGpu) {
  			static uint32_t marks;
  			uint64_t t0 = mach_absolute_time();
@@ -2340,7 +2353,7 @@ index 26b4001..3c35a0f 100644
  			if (marks < 6) {
  				uint64_t ns;
  				absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
-@@ -886,6 +1137,9 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -886,6 +1146,9 @@ AppleCLCD::present(const uint8_t *rec)
  				blitScaled(src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
  			}
  			if (!ok) {
@@ -2350,7 +2363,7 @@ index 26b4001..3c35a0f 100644
  				static uint32_t failed;
  				if (failed++ < 20) {
  					IOLog("SWEET FB: GPU present of surface %u (bpr %u offset %u) failed\n",
-@@ -903,6 +1157,27 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -903,6 +1166,27 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		s->release();
  	}
