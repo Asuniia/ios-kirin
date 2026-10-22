@@ -24,6 +24,7 @@ LIBS="src/mesa/libmesa.a src/gallium/auxiliary/libgallium.a
 	src/util/libxmlconfig.a src/util/libmesa_util.a src/util/libmesa_util_simd.a src/util/blake3/libblake3.a
 	src/c11/impl/libmesa_util_c11.a"
 (cd "$B" && ninja $LIBS)
+mkdir -p "$H/out"
 nm -g "$B/src/mesa/glapi/glapi/libglapi_bridge.a" > "$H/out/bridge.nm"
 CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0"
 INC="-I$H/include -I$M/include -I$M/src -I$M/src/mesa -I$M/src/mapi -I$M/src/gallium/include
