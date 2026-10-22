@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
-index 0c548d1..2a663e1 100644
+index 0c548d1..78b1a46 100644
 --- a/bsd/dev/sweet_keys.c
 +++ b/bsd/dev/sweet_keys.c
 @@ -10,6 +10,15 @@
@@ -66,11 +66,96 @@ index 0c548d1..2a663e1 100644
  
  static void
  keys_wait(void)
-@@ -228,6 +249,61 @@ keys_wait(void)
+@@ -228,6 +249,146 @@ keys_wait(void)
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
 +#if defined(SWEET_KIRIN)
++/*
++ * PS_HOLD reset type of both PMICs before PS_HOLD drops (Linux
++ * qpnp_pon_reset_config / qpnp_pon_system_pwr_off): PON base 0x800,
++ * PS_HOLD_RST_CTL2 0x5b bit 7 off, 500 us, PS_HOLD_RST_CTL 0x5a [3:0] =
++ * type, bit 7 on again. Types: 4 shutdown, 7 hard reset. PM660L (SID 2)
++ * turns hard reset into shutdown (DT qcom,hard-reset-poweroff-type = 4).
++ * Thread context only (the PMIC lock).
++ */
++bool
++sweet_pmic_pshold_config(bool shutdown)
++{
++	static const struct { uint16_t ppid; uint8_t type[2]; } pon[] = {
++		{0x008, {7, 4}}, {0x208, {4, 4}},
++	};
++	bool ok = true;
++	for (unsigned i = 0; i < sizeof(pon) / sizeof(pon[0]); i++) {
++		uint8_t ctl = 0, ctl2 = 0;
++		bool r = sweet_pmic_read(pon[i].ppid, 0x5b, &ctl2) &&
++		    sweet_pmic_write(pon[i].ppid, 0x5b, (uint8_t)(ctl2 & ~0x80u));
++		delay(500);
++		r = r && sweet_pmic_read(pon[i].ppid, 0x5a, &ctl) &&
++		    sweet_pmic_write(pon[i].ppid, 0x5a, (uint8_t)((ctl & ~0x0fu) | pon[i].type[shutdown])) &&
++		    sweet_pmic_write(pon[i].ppid, 0x5b, (uint8_t)(ctl2 | 0x80u));
++		ok = ok && r;
++	}
++	return ok;
++}
++
++/*
++ * PM660 haptics (SID 1, base 0xc000; Linux leds-qpnp-haptics.c, DT
++ * qcom,haptics@c000): ERM motor, direct mode, VMAX 3000 mV, ILIM 800 mA,
++ * play rate 6667 us. Configured on first use; a pulse is EN_CTL 0x46 bit 7
++ * and PLAY 0x70 bit 7 on, then both off. Thread context only.
++ */
++#define HAP_PPID        0x1c0u
++
++static bool
++hap_setup(void)
++{
++	static int state;	/* 0 not tried, 1 ok, -1 failed */
++	if (state == 0) {
++		uint8_t cfg1 = 0, sel = 0, vmax = 0;
++		bool ok = sweet_pmic_read(HAP_PPID, 0x4c, &cfg1) &&
++		    sweet_pmic_write(HAP_PPID, 0x4c, (uint8_t)(cfg1 | 1u)) &&           /* ERM */
++		    sweet_pmic_read(HAP_PPID, 0x4e, &sel) &&
++		    sweet_pmic_write(HAP_PPID, 0x4e, (uint8_t)(sel & ~0x30u)) &&        /* direct */
++		    sweet_pmic_read(HAP_PPID, 0x51, &vmax) &&
++		    sweet_pmic_write(HAP_PPID, 0x51, (uint8_t)((vmax & ~0x7eu) | (26u << 1))) &&
++		    sweet_pmic_write(HAP_PPID, 0x52, 0x01) &&                           /* 800 mA */
++		    sweet_pmic_write(HAP_PPID, 0x54, 1333u & 0xff) &&                   /* 6667 us / 5 */
++		    sweet_pmic_write(HAP_PPID, 0x55, 1333u >> 8);
++		state = ok ? 1 : -1;
++		printf("SWEET VIB: haptics setup %s (cfg1 %#x sel %#x vmax %#x)\n",
++		    ok ? "ok" : "FAILED", cfg1, sel, vmax);
++	}
++	return state == 1;
++}
++
++static void
++keys_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&keys_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_vibrate(unsigned ms)
++{
++	static LCK_GRP_DECLARE(hap_grp, "sweet_vib");
++	static LCK_MTX_DECLARE(hap_lock, &hap_grp);
++	lck_mtx_lock(&hap_lock);
++	if (hap_setup()) {
++		bool ok = sweet_pmic_write(HAP_PPID, 0x46, 0x80) && sweet_pmic_write(HAP_PPID, 0x70, 0x80);
++		keys_sleep_ms(ms);
++		(void)sweet_pmic_write(HAP_PPID, 0x70, 0x00);
++		(void)sweet_pmic_write(HAP_PPID, 0x46, 0x00);
++		if (!ok) {
++			printf("SWEET VIB: play FAILED\n");
++		}
++	}
++	lck_mtx_unlock(&hap_lock);
++}
++
 +/* PM660L GPIO 7 as input with pull-up, as Linux's gpio-keys pinctrl. */
 +static void
 +keys_voldn_setup(void)
@@ -128,7 +213,7 @@ index 0c548d1..2a663e1 100644
  static void
  keys_thread(void *arg, wait_result_t result)
  {
-@@ -257,6 +333,7 @@ keys_thread(void *arg, wait_result_t result)
+@@ -257,6 +418,7 @@ keys_thread(void *arg, wait_result_t result)
  		keys_wait();
  	}
  }
@@ -136,7 +221,7 @@ index 0c548d1..2a663e1 100644
  
  void
  sweet_keys_init(void)
-@@ -274,9 +351,13 @@ sweet_keys_init(void)
+@@ -274,9 +436,13 @@ sweet_keys_init(void)
  	}
  	keys_core = ml_io_map(KEYS_CORE_PA, 0x1000);
  	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
@@ -150,7 +235,7 @@ index 0c548d1..2a663e1 100644
  		printf("SWEET KEYS: MMIO mapping failed\n");
  		return;
  	}
-@@ -294,8 +375,13 @@ sweet_keys_init(void)
+@@ -294,8 +460,13 @@ sweet_keys_init(void)
  	}
  	uint8_t pon = 0;
  	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
@@ -164,6 +249,87 @@ index 0c548d1..2a663e1 100644
  	if (!pok) {
  		printf("SWEET KEYS: power key unreadable; volume keys only\n");
  		keys_pon_apid = KEYS_NO_APID;
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index a0a9ae1..42a236a 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -563,6 +563,60 @@ fastboot_thread(void *arg, wait_result_t result)
+ 	printf("SWEET FASTBOOT: still running after PS_HOLD\n");
+ }
+ 
++#if defined(SWEET_KIRIN)
++/*
++ * SDM630 CPU clocks, read only (step 1 before any clock change): the two
++ * cluster PLLs (DT qcom,clk-cpu-osm-sdm630: pwrcl_pll 0x17916000, perfcl_pll
++ * 0x17816000, L value at +0x04, mode at +0x00, user ctl at +0x0c, rate =
++ * L x 19.2 MHz), the cluster muxes (apcs cmd/cfg rcgr 0x17911050/54,
++ * 0x17811050/54), the OSM block (0x179c0000) and each CPU's measured clock.
++ */
++static void
++kirin_clk_probe(void)
++{
++	static const struct { const char *name; uint32_t pll, rcg; } cl[] = {
++		{"pwrcl (cpu4-7, 0x0xx)", 0x17916000u, 0x17911000u},
++		{"perfcl (cpu0-3, 0x1xx)", 0x17816000u, 0x17811000u},
++	};
++	for (unsigned i = 0; i < 2; i++) {
++		vm_offset_t pll = ml_io_map(cl[i].pll, 0x1000), rcg = ml_io_map(cl[i].rcg, 0x1000);
++		if (pll == 0 || rcg == 0) {
++			continue;
++		}
++		uint32_t mode = clk_rd(pll, 0x00), l = clk_rd(pll, 0x04), user = clk_rd(pll, 0x0c);
++		printf("SWEET CLK: %s PLL mode %#x L %u (%u MHz) user %#x rcg cmd %#x cfg %#x\n",
++		    cl[i].name, mode, l & 0xffu, (l & 0xffu) * 192u / 10u, user,
++		    clk_rd(rcg, 0x50), clk_rd(rcg, 0x54));
++	}
++	vm_offset_t osm = ml_io_map(0x179c0000u, 0x4000);
++	if (osm != 0) {
++		printf("SWEET CLK: osm +0 %#x +4 %#x +1000 %#x +1004 %#x +1100 %#x +3000 %#x\n",
++		    clk_rd(osm, 0x0), clk_rd(osm, 0x4), clk_rd(osm, 0x1000), clk_rd(osm, 0x1004),
++		    clk_rd(osm, 0x1100), clk_rd(osm, 0x3000));
++	}
++	for (int c = 0; c < (int)ml_get_cpu_count(); c++) {
++		struct processor *p = cpu_to_processor(c);
++		if (p == NULL) {
++			continue;
++		}
++		thread_bind(p);
++		thread_block(THREAD_CONTINUE_NULL);
++		printf("SWEET CLK: cpu%d %llu MHz\n", c, perf_mhz());
++	}
++	thread_bind(PROCESSOR_NULL);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++kirin_perf_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	perf_wait(5);
++	kirin_clk_probe();
++}
++#endif
++
+ void
+ sweet_perf_init(void)
+ {
+@@ -577,6 +631,15 @@ sweet_perf_init(void)
+ 	int enabled = 1;
+ 	thread_t thread;
+ 	(void)PE_parse_boot_argn("sweetperf", &enabled, sizeof(enabled));
++#if defined(SWEET_KIRIN)
++	/* The Pixel clock code below must never run here (other addresses). */
++	int clk = 1;
++	(void)PE_parse_boot_argn("sweetclkprobe", &clk, sizeof(clk));
++	if (clk && kernel_thread_start(kirin_perf_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	return;
++#endif
+ 	if (!enabled) {
+ 		return;
+ 	}
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 index a9ad4f2..0b0f2a5 100644
 --- a/bsd/dev/sweet_touch.c
@@ -761,10 +927,10 @@ index bb2a2bf..df660a8 100644
  #else
  #define bsd_init_kprintf(x, ...)
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
-index bec47e0..a2b8a14 100644
+index bec47e0..4f6eecb 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
-@@ -28,7 +28,24 @@
+@@ -28,7 +28,27 @@
  extern "C" bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
  extern "C" bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
  
@@ -775,13 +941,16 @@ index bec47e0..a2b8a14 100644
 + *   voltage   FG_BATT_INFO VBATT 0x41a0 (copy 0x41a6), 122.07 uV per bit
 + *   current   FG_BATT_INFO IBATT 0x41a2 (copy 0x41a8), signed, 488.281 uA
 + *             per bit, positive = discharging (iOS wants the opposite)
-+ *   plugged   USBIN INT_RT_STS 0x1310 bit 4 (USBIN_PLUGIN)
++ *   temp      FG_BATT_INFO BATT_TEMP 0x4150/0x4151 [10:0], 0.25 K per bit
++ *   plugged   USBIN INT_RT_STS 0x1310 bit 4 (USBIN_PLUGIN), with a short
++ *             vibration when the cable goes in
 + *   charging  BATTERY_CHARGER_STATUS_1 0x1006 bits 2:0: trickle, pre, fast,
 + *             full-on, taper = charging; terminate = full
 + * No charger writes: the bootloader and the PMIC defaults charge as is.
 + */
 +#define SWEET_BATTERY_MAH       2870    /* Xperia 10 */
 +#define SWEET_BATTERY_GAUGE     "PM660 fuel gauge"
++extern "C" void sweet_vibrate(unsigned ms);     /* bsd/dev/sweet_keys.c */
 +#else
  #define SWEET_BATTERY_MAH       2770    /* Pixel 1 */
 +#define SWEET_BATTERY_GAUGE     "PMI8994 fuel gauge"
@@ -789,7 +958,16 @@ index bec47e0..a2b8a14 100644
  
  class SweetBattery : public IOPMPowerSource {
  	OSDeclareDefaultStructors(SweetBattery);
-@@ -52,6 +69,9 @@ private:
+@@ -42,6 +62,8 @@ private:
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	int fTemperature;       /* centidegrees C */
++	bool fTemperatureValid;
+ 	uint8_t fLastRegs[6];
+ 	bool fWasExternal;
+ 	unsigned fChargeMA;
+@@ -52,6 +74,9 @@ private:
  	void publish(unsigned percent, unsigned mv, int ma, bool external,
  	    bool capable, bool charging, bool full, bool measured, bool currentValid);
  	void poll(void);
@@ -799,7 +977,32 @@ index bec47e0..a2b8a14 100644
  	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
  	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
  	static bool reg(uint16_t address, uint8_t *value);
-@@ -173,7 +193,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -90,6 +115,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fTemperature = 2500;
++	fTemperatureValid = false;
+ 	fLastRegs[5] = 0xff;
+ 	return true;
+ }
+@@ -141,12 +168,12 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putNumber("AppleRawMaxCapacity", SWEET_BATTERY_MAH);
+ 	putNumber("DesignCapacity", SWEET_BATTERY_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C; 25 C unless measured. */
++	putNumber("Temperature", (UInt32)fTemperature);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryTemperatureEstimated", !fTemperatureValid);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -173,7 +200,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
  	int mode = measured ? 1 : 0;
  	if (mode != fLastMode) {
  		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
@@ -808,7 +1011,7 @@ index bec47e0..a2b8a14 100644
  		    percent, mv, external, charging);
  		fLastMode = mode;
  	}
-@@ -182,7 +202,11 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -182,7 +209,11 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
  bool
  SweetBattery::reg(uint16_t address, uint8_t *value)
  {
@@ -820,7 +1023,7 @@ index bec47e0..a2b8a14 100644
  }
  
  /* Masked write; secure registers (0xf0+) get the SEC_ACCESS unlock first. */
-@@ -226,6 +250,67 @@ SweetBattery::setupCharger(void)
+@@ -226,6 +257,77 @@ SweetBattery::setupCharger(void)
  	    ok ? "ok" : "FAILED", ma[icl], ma[fcc], cmd, il, fc, s1, s2);
  }
  
@@ -868,18 +1071,28 @@ index bec47e0..a2b8a14 100644
 +	}
 +	bool vok = reg16(0x41a0, 0x41a6, &vraw);
 +	bool iok = reg16(0x41a2, 0x41a8, &iraw);
++	uint8_t tl = 0, th = 0;
++	fTemperatureValid = reg(0x4150, &tl) && reg(0x4151, &th);
++	if (fTemperatureValid) {
++		fTemperature = (int)(((th & 7u) << 8) | tl) * 25 - 27315;
++	}
 +	unsigned mv = vok ? (unsigned)((uint64_t)vraw * 122070u / 1000000u) : 3700;
 +	int ma = iok ? -(int)((int64_t)(int16_t)iraw * 488281 / 1000000) : 0;
 +	unsigned percent = soc == 0xff ? 100 : soc == 0 ? 0 :
 +	    ((unsigned)(soc - 1) * 98 + 126) / 253 + 1;
 +	bool external = (usb & 0x10u) != 0;
++	if (external && !fWasExternal && fLastRegs[5] != 0xff) {
++		sweet_vibrate(60);
++	}
++	fWasExternal = external;
 +	unsigned st = chgr & 7u;
 +	bool full = external && st == 5;
 +	bool charging = external && st <= 4;
 +	uint8_t regs[6] = {soc, usb, chgr, 0, 0, 0};
 +	if (memcmp(regs, fLastRegs, sizeof(regs)) != 0) {
-+		IOLog("SWEET BATTERY: soc 0x%02x = %u%% %u mV %d mA usb rt 0x%02x chgr sts 0x%02x -> external %d charging %d full %d\n",
-+		    soc, percent, mv, ma, usb, chgr, external, charging, full);
++		IOLog("SWEET BATTERY: soc 0x%02x = %u%% %u mV %d mA %d.%d C usb rt 0x%02x chgr sts 0x%02x -> external %d charging %d full %d\n",
++		    soc, percent, mv, ma, fTemperature / 100, (fTemperature < 0 ? -fTemperature : fTemperature) / 10 % 10,
++		    usb, chgr, external, charging, full);
 +		memcpy(fLastRegs, regs, sizeof(regs));
 +	}
 +	publish(percent, mv, ma, external, external, charging, full, true, iok);
@@ -888,7 +1101,7 @@ index bec47e0..a2b8a14 100644
  void
  SweetBattery::poll(void)
  {
-@@ -282,6 +367,7 @@ SweetBattery::poll(void)
+@@ -282,6 +384,7 @@ SweetBattery::poll(void)
  	/* The 3.7 V nominal: the real voltage is in FG SRAM. */
  	publish(percent, 3700, 0, external, external, charging, full, true, false);
  }
@@ -1069,34 +1282,84 @@ index 26b4001..2784d1f 100644
  		presentPending();
  	}
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..3642fa5 100644
+index 0631685..8ba18b8 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -9,6 +9,7 @@
+@@ -9,6 +9,12 @@
  #include <IOKit/IOPlatformExpert.h>
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
 +#include <kern/clock.h>
++#if defined(SWEET_KIRIN)
++#include <IOKit/system.h>
++#include <pexpert/pexpert.h>
++extern "C" int get_preemption_level(void);
++#endif
  
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
-@@ -22,6 +23,11 @@ public:
+@@ -18,10 +24,55 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++#if defined(SWEET_KIRIN)
++	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
++#endif
+ };
  
  OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
  
 +#if defined(SWEET_KIRIN)
 +extern "C" void sweet_gic_dump(const char *when);       /* pexpert/arm/pe_fiq.c */
 +extern "C" void sweet_gic_enable_test(void);
++extern "C" bool sweet_pmic_pshold_config(bool shutdown);        /* bsd/dev/sweet_keys.c */
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/* MPM PS_HOLD (DT restart@10ac000, Linux msm-poweroff deassert_ps_hold). */
++#define KIRIN_PSHOLD_PA         0x010ac000u
++static volatile uint32_t *kirin_pshold;
++
++/*
++ * Power off and restart as Linux does on SDM630: the PMICs' PS_HOLD reset
++ * type (shutdown or hard reset), then PS_HOLD low; PSCI SYSTEM_OFF/RESET if
++ * the SoC is still running 100 ms later. Panic restarts are left alone so
++ * the panic stays on screen.
++ */
++int
++SweetPlatformExpert::haltRestart(unsigned int type)
++{
++	if (type != kPEHaltCPU && type != kPERestartCPU) {
++		return IODTPlatformExpert::haltRestart(type);
++	}
++	bool off = type == kPEHaltCPU;
++	bool cfg = false;
++	if (ml_get_interrupts_enabled() && get_preemption_level() == 0) {
++		cfg = sweet_pmic_pshold_config(off);
++	}
++	kprintf("SWEET: %s (PMIC reset type %s)\n", off ? "power off" : "restart", cfg ? "set" : "NOT set");
++	(void)ml_set_interrupts_enabled(FALSE);
++	if (kirin_pshold != NULL) {
++		*kirin_pshold = 0;
++		__builtin_arm_dsb(0xf);
++	}
++	delay(100000);
++	register uint64_t x0 __asm__("x0") = off ? 0x84000008ull : 0x84000009ull;
++	__asm__ volatile ("smc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
++	for (;;) {
++		__builtin_arm_wfi();
++	}
++}
 +#endif
 +
  bool
  SweetPlatformExpert::start(IOService *provider)
  {
-@@ -31,6 +37,28 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +82,29 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");
 +#if defined(SWEET_KIRIN)
++	kirin_pshold = (volatile uint32_t *)ml_io_map(KIRIN_PSHOLD_PA, 0x1000);
 +	/*
 +	 * Bring-up check: everything before this point can run without a timer
 +	 * interrupt (spinning delays, threads that block until signalled). A
