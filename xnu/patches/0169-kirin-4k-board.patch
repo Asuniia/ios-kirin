@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index a8c7bde..a91f048 100644
+index a8c7bde..da2dd0e 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
 @@ -113,10 +113,22 @@ void sweet_gpu_init(void);
@@ -26,7 +26,46 @@ index a8c7bde..a91f048 100644
  
  /* a5xx.xml dword offsets */
  #define R_CP_RB_BASE            0x0800
-@@ -1944,12 +1956,14 @@ cp_test(vm_offset_t gpu, int level)
+@@ -1193,12 +1205,24 @@ blend_cpu(const uint32_t *src, uint32_t *dst, uint32_t n)
+ }
+ 
+ /* gfx3d RCG = GPLL0 (600 MHz) / div, div in half steps (field 2*div - 1). */
++#if defined(SWEET_KIRIN)
++static vm_offset_t kirin_gpucc;         /* GPU CC 0x5065000; gfx3d RCG at +0x1070 */
++#endif
+ static bool
+ gfx_clock(uint32_t field)
+ {
++#if defined(SWEET_KIRIN)
++	if (kirin_gpucc == 0) {
++		return false;
++	}
++	wr(kirin_gpucc, 0x1074, (5u << 8) | field);
++	wr(kirin_gpucc, 0x1070, rd(kirin_gpucc, 0x1070) | 1u);
++	return poll(kirin_gpucc, 0x1070, 1u, 0, 10);
++#else
+ 	wr(mmcc, 0x4004, (5u << 8) | field);
+ 	wr(mmcc, 0x4000, rd(mmcc, 0x4000) | 1u);
+ 	return poll(mmcc, 0x4000, 1u, 0, 10);
++#endif
+ }
+ 
+ /*
+@@ -1696,8 +1720,13 @@ void
+ sweet_gpu_get_info(struct sweet_gpu_info *info)
+ {
+ 	*info = (struct sweet_gpu_info){
++#if defined(SWEET_KIRIN)
++		.chip_id = 0x05000800u,         /* A508 (DT qcom,chipid) */
++		.gmem_size = 0x22000u,          /* 128 + 8 KB (mainline a5xx_catalog.c) */
++#else
+ 		.chip_id = 0x05030002u,         /* A530 v2 (MSM8996 Pro) */
+ 		.gmem_size = 0x100000u,
++#endif
+ 		.gmem_base = 0x100000u,
+ 		.max_freq = (uint64_t)g_max_mhz * 1000000u,
+ 		.fence_pa = g_fence_pa,
+@@ -1944,12 +1973,14 @@ cp_test(vm_offset_t gpu, int level)
  	 * a5xx_pm_resume (A530): power the RB/CCU and SP islands; without them
  	 * the CP hung on the first 2D blit (0126a, RBBM_STATUS c00001c3).
  	 */
@@ -41,7 +80,7 @@ index a8c7bde..a91f048 100644
  
  	/* Subset of a5xx_hw_init (A530 values; HWCG, GPMU firmware, CP_PROTECT left out). */
  	gw(gpu, R_VBIF_RR_QOS_ARB, 3);
-@@ -1959,19 +1973,37 @@ cp_test(vm_offset_t gpu, int level)
+@@ -1959,19 +1990,37 @@ cp_test(vm_offset_t gpu, int level)
  	gw64(gpu, R_UCHE_TRAP_BASE, 0x0001ffffffff0000ull);
  	gw64(gpu, R_UCHE_WRITE_THRU_BASE, 0x0001ffffffff0000ull);
  	gw64(gpu, R_UCHE_GMEM_RANGE_MIN, 0x00100000);
@@ -79,7 +118,7 @@ index a8c7bde..a91f048 100644
  	gw(gpu, R_SECVID_TSB_CNTL, 0);
  	gw64(gpu, R_SECVID_TSB_BASE, 0);
  	gw(gpu, R_SECVID_TSB_SIZE, 0);
-@@ -2001,7 +2033,11 @@ cp_test(vm_offset_t gpu, int level)
+@@ -2001,7 +2050,11 @@ cp_test(vm_offset_t gpu, int level)
  	emit(0x20000000);
  	emit(0);
  	emit(0);
@@ -91,7 +130,45 @@ index a8c7bde..a91f048 100644
  	emit(0);
  	emit(0);
  	emit(pkt7(CP_MEM_WRITE, 3));
-@@ -2224,6 +2260,164 @@ gpu_thread(void *arg, wait_result_t result)
+@@ -2043,7 +2096,21 @@ cp_test(vm_offset_t gpu, int level)
+ 		    *(volatile uint32_t *)(scratch_va + 8));
+ 		gpu_wait(2);
+ 		if (level >= 8) {
++#if defined(SWEET_KIRIN)
++			/*
++			 * The GPU runs from CX through the BHS at whatever level the
++			 * RPM keeps CX: 150 MHz (GPLL0 / 4, the probe's rate) unless
++			 * boot-arg sweetgpumhz asks for 200 (/ 3) or 300 (/ 2).
++			 */
++			int kmhz = 150;
++			(void)PE_parse_boot_argn("sweetgpumhz", &kmhz, sizeof(kmhz));
++			kmhz = kmhz >= 300 ? 300 : kmhz >= 200 ? 200 : 150;
++			bool kclk = gfx_clock(kmhz == 300 ? 3 : kmhz == 200 ? 5 : 7);
++			printf("SWEET GPU: gfx3d %d MHz %s\n", kmhz, kclk ? "set" : "FAILED");
++			g_max_mhz = kmhz;
++#else
+ 			(void)gfx_clock(3);     /* 300 MHz */
++#endif
+ 			g_ksample4 = kernel_page(&k_sample4);
+ 			if (g_ksample4 == 0 || !vm_init(smmu)) {
+ 				printf("SWEET GPU: service bring-up FAILED\n");
+@@ -2053,8 +2120,15 @@ cp_test(vm_offset_t gpu, int level)
+ 			g_scratch = scratch;
+ 			g_scratch_va = scratch_va;
+ 			g_ready = true;
++#if defined(SWEET_KIRIN)
++			printf("SWEET GPU: service ready (%d MHz, GPU VA window 8-16 GB)\n", g_max_mhz);
++			api_selftest();
++			printf("SWEET GPU: full-screen quad %llu us at %d MHz\n", quad_bench(), g_max_mhz);
++			return;
++#else
+ 			printf("SWEET GPU: service ready (300 MHz, GPU VA window 8-16 GB)\n");
+ 			api_selftest();
++#endif
+ 			int mhz = 300;
+ 			(void)PE_parse_boot_argn("sweetgpuclk", &mhz, sizeof(mhz));
+ 			g_max_mhz = 300;
+@@ -2224,6 +2298,165 @@ gpu_thread(void *arg, wait_result_t result)
  	}
  }
  
@@ -237,6 +314,7 @@ index a8c7bde..a91f048 100644
 +	if (!on) {
 +		printf("SWEET GPU: GPU core off or unclocked; not read\n");
 +		if (level >= 2) {
++			kirin_gpucc = cc;
 +			vm_offset_t gpu = kirin_gpu_power_up(g71, g52, cc, ldo);
 +			/* Step 3+ (sweetgpu=3..): the MSM8996 CP / zap / blit path with A508 values */
 +			if (gpu != 0 && level >= 3) {
@@ -256,7 +334,7 @@ index a8c7bde..a91f048 100644
  void
  sweet_gpu_init(void)
  {
-@@ -2232,6 +2426,13 @@ sweet_gpu_init(void)
+@@ -2232,6 +2465,13 @@ sweet_gpu_init(void)
  	if (!PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) || on == 0) {
  		return;
  	}
