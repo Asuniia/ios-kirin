@@ -904,6 +904,69 @@ index b8c6bc7..1e331e5 100644
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 9c42e45..d74e9e3 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -48,6 +48,16 @@ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
++#if defined(SWEET_KIRIN)
++	/* SDM630 (Linux gcc-sdm660.c); same order: master, cfg-noc-axi, ahb2phy at 0, 3, 5 */
++	{ "master", 0x0f008 },
++	{ "sleep", 0x0f00c },
++	{ "utmi", 0x0f010 },
++	{ "cfg-noc-axi", 0x05018 },
++	{ "aggre-axi", 0x0f03c },
++	{ "ahb2phy", 0x6a004 },
++	{ "clkref", 0x8800c },
++#else
+ 	{ "master", 0x0f010 },
+ 	{ "sleep", 0x0f014 },
+ 	{ "utmi", 0x0f018 },
+@@ -55,12 +65,21 @@ static const struct {
+ 	{ "aggre-axi", 0x8201c },
+ 	{ "ahb2phy", 0x6a004 },
+ 	{ "clkref", 0x8c010 },
++#endif
+ };
+ 
++#if defined(SWEET_KIRIN)
++/* DT ssusb@a800000 (dwc3, high-speed, otg), QUSB2 PHY qusb@c012000 (v1 layout) */
++#define DWC3_PA                 0x0a800000
++#define DWC3_SIZE               0x0000d000
++#define QUSB2_PA                0x0c012000
++#define QUSB2_SIZE              0x00000180
++#else
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+ #define QUSB2_PA                0x088e2000
+ #define QUSB2_SIZE              0x00000400
++#endif
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -120,6 +139,10 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;
+ 	}
++#if defined(SWEET_KIRIN)
++	/* The register offsets below are the QUSB2 v2 ones; the SDM630 PHY is v1. */
++	return;
++#endif
+ 	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+ 	if (phy == 0) {
+ 		return;
+@@ -164,7 +187,7 @@ sweet_usb_probe(void)
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
+-#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_PA             (DWC3_PA + 0xf8800)
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
 index bb2a2bf..df660a8 100644
 --- a/bsd/kern/bsd_init.c
