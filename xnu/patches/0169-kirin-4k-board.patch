@@ -572,6 +572,23 @@ index b8c6bc7..1e331e5 100644
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..1956f49 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -490,7 +490,12 @@ bsd_init(void)
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
++/* SWEET_KIRIN bring-up: show each bsd_init step on the screen console */
++#if defined(SWEET_KIRIN)
++#define DEBUG_BSDINIT 1
++#else
+ #define DEBUG_BSDINIT 0
++#endif
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
 index a8809d1..ea4c75a 100644
 --- a/makedefs/MakeInc.def
