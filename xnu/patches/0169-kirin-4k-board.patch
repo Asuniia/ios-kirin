@@ -1042,6 +1042,61 @@ index 437adb1..eb98779 100644
  
  #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
  	read_lbr();
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index bec97fb..a000977 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -221,20 +221,34 @@ TUNABLE(startup_debug_t, startup_debug, "startup_debug", 0);
+ static inline void
+ kernel_bootstrap_log(const char *message)
+ {
++#if defined(SWEET_KIRIN)
++	/* bring-up: every step on the screen console (kprintf does not reach it) */
++	if (startup_phase >= STARTUP_SUB_KPRINTF) {
++		printf("kernel_bootstrap: %s\n", message);
++	}
++#else
+ 	if ((startup_debug & STARTUP_DEBUG_VERBOSE) &&
+ 	    startup_phase >= STARTUP_SUB_KPRINTF) {
+ 		kprintf("kernel_bootstrap: %s\n", message);
+ 	}
++#endif
+ 	kernel_debug_string_early(message);
+ }
+ 
+ static inline void
+ kernel_bootstrap_thread_log(const char *message)
+ {
++#if defined(SWEET_KIRIN)
++	/* bring-up: every step on the screen console (kprintf does not reach it) */
++	if (startup_phase >= STARTUP_SUB_KPRINTF) {
++		printf("kernel_bootstrap_thread: %s\n", message);
++	}
++#else
+ 	if ((startup_debug & STARTUP_DEBUG_VERBOSE) &&
+ 	    startup_phase >= STARTUP_SUB_KPRINTF) {
+ 		kprintf("kernel_bootstrap_thread: %s\n", message);
+ 	}
++#endif
+ 	kernel_debug_string_early(message);
+ }
+ 
+@@ -776,6 +790,7 @@ kernel_bootstrap_thread(void)
+ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
+ 	 * at the latest
+ 	 */
++	kernel_bootstrap_log("vm_set_restrictions");
+ 	vm_set_restrictions(machine_info.max_cpus);
+ 
+ 
+@@ -787,6 +802,7 @@ kernel_bootstrap_thread(void)
+ 	 *	Start the user bootstrap.
+ 	 */
+ #ifdef  MACH_BSD
++	kernel_bootstrap_log("bsd_init");
+ 	bsd_init();
+ #endif
+ 
 diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
 index 182b44a..3697009 100644
 --- a/osfmk/kern/zalloc.c
