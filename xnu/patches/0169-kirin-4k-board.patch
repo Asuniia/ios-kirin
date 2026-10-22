@@ -1,3 +1,81 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index a8c7bde..7c3a4cf 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2224,6 +2224,59 @@ gpu_thread(void *arg, wait_result_t result)
+ 	}
+ }
+ 
++#if defined(SWEET_KIRIN)
++/*
++ * SDM630 / Adreno 508, step 1: read-only probe of what the bootloader left
++ * (Linux gpucc-sdm660.c, gcc-sdm660.c, DT kgsl-3d0@5000000):
++ *   GCC        gpu_cfg_ahb 0x171004, gpu_bimc_gfx 0x171010, bimc_gfx
++ *              0x17106c, gpu_gpll0 / gpu_gpll0_div = 0x15200c bits 4 / 3
++ *              (vote register)
++ *   GPU CC     0x5065000: PLL0 +0x0 (mode, L +0x4), PLL1 +0x40, GDSC gpu_cx
++ *              +0x1004, gpu_gx +0x1094, cxo +0x1020, gfx3d RCG +0x1070 /
++ *              branch +0x1098, rbcpr +0x1054, rbbmtimer +0x10d0
++ *   GFX LDO    0x506e000 (msm_gfx_ldo, BHS or LDO mode), first 13 words
++ *   GPU        0x5000000, only when gpu_cx is on and the AHB and gfx3d
++ *              clocks run (a gated block hangs the bus): RBBM_STATUS 0x4f5,
++ *              VBIF_VERSION 0x3000 (a5xx.xml dwords)
++ * Nothing is written.
++ */
++static void
++kirin_gpu_probe(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	vm_offset_t g71 = ml_io_map(0x00171000u, 0x1000), g52 = ml_io_map(0x00152000u, 0x1000);
++	vm_offset_t cc = ml_io_map(0x05065000u, 0x2000), ldo = ml_io_map(0x0506e000u, 0x1000);
++	if (!g71 || !g52 || !cc || !ldo) {
++		printf("SWEET GPU: map failed\n");
++		return;
++	}
++#define RD(b, o) (*(volatile uint32_t *)((b) + (o)))
++	uint32_t ahb = RD(g71, 0x004), gbimc = RD(g71, 0x010), bimc = RD(g71, 0x06c), vote = RD(g52, 0x00c);
++	printf("SWEET GPU: gcc gpu_cfg_ahb %#x gpu_bimc_gfx %#x bimc_gfx %#x gpll0 vote %#x (gpu %d div %d)\n",
++	    ahb, gbimc, bimc, vote, !!(vote & 0x10), !!(vote & 0x08));
++	uint32_t cx = RD(cc, 0x1004), gx = RD(cc, 0x1094), gfx = RD(cc, 0x1098);
++	printf("SWEET GPU: gpucc pll0 mode %#x L %#x pll1 mode %#x L %#x gdsc cx %#x gx %#x\n",
++	    RD(cc, 0x0), RD(cc, 0x4), RD(cc, 0x40), RD(cc, 0x44), cx, gx);
++	printf("SWEET GPU: gpucc cxo %#x gfx3d rcg %#x/%#x cbcr %#x rbcpr %#x rbbmtimer %#x\n",
++	    RD(cc, 0x1020), RD(cc, 0x1070), RD(cc, 0x1074), gfx, RD(cc, 0x1054), RD(cc, 0x10d0));
++	printf("SWEET GPU: gfx ldo %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n",
++	    RD(ldo, 0x00), RD(ldo, 0x04), RD(ldo, 0x08), RD(ldo, 0x0c), RD(ldo, 0x10), RD(ldo, 0x14),
++	    RD(ldo, 0x18), RD(ldo, 0x1c), RD(ldo, 0x20), RD(ldo, 0x24), RD(ldo, 0x28), RD(ldo, 0x2c),
++	    RD(ldo, 0x30));
++	bool on = (cx & (1u << 31)) && !(ahb & (1u << 31)) && !(gfx & (1u << 31));
++	if (!on) {
++		printf("SWEET GPU: GPU core off or unclocked; not read\n");
++		return;
++	}
++	vm_offset_t gpu = ml_io_map(0x05000000u, 0x10000);
++	if (gpu != 0) {
++		printf("SWEET GPU: RBBM_STATUS %#x VBIF_VERSION %#x\n", RD(gpu, 0x4f5 * 4), RD(gpu, 0x3000 * 4));
++	}
++#undef RD
++}
++#endif
++
+ void
+ sweet_gpu_init(void)
+ {
+@@ -2232,6 +2285,13 @@ sweet_gpu_init(void)
+ 	if (!PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
++#if defined(SWEET_KIRIN)
++	/* The MSM8996 code below has other addresses: probe only. */
++	if (kernel_thread_start(kirin_gpu_probe, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	return;
++#endif
+ 	if (kernel_thread_start(gpu_thread, (void *)(uintptr_t)on, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
 diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
 index 0c548d1..78b1a46 100644
 --- a/bsd/dev/sweet_keys.c
