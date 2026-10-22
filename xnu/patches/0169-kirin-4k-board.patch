@@ -1153,10 +1153,18 @@ index 93d6318..3fc5bce 100644
  		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
  	}
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 26b4001..2784d1f 100644
+index 26b4001..dc30d47 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -196,6 +196,71 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+@@ -42,6 +42,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+@@ -196,6 +197,71 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
  #define SWEET_BL_MAX            255
  #define SWEET_BL_STEP_MS        16
  
@@ -1228,7 +1236,7 @@ index 26b4001..2784d1f 100644
  class AppleARMBacklight : public IOService {
  	OSDeclareDefaultStructors(AppleARMBacklight);
  
-@@ -256,10 +321,20 @@ AppleARMBacklight::apply(uint32_t level)
+@@ -256,10 +322,20 @@ AppleARMBacklight::apply(uint32_t level)
  	if (fKnown && level == fLevel) {
  		return;
  	}
@@ -1249,7 +1257,36 @@ index 26b4001..2784d1f 100644
  	fKnown = true;
  	fLevel = level;
  }
-@@ -366,7 +441,17 @@ AppleCLCD::start(IOService *provider)
+@@ -298,6 +374,28 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 		    d->getCount(), b ? (int)b->unsigned32BitValue() : -1, f ? (int)f->unsigned32BitValue() : -1,
+ 		    l ? (int)l->unsigned32BitValue() : -1);
+ 	}
++	/* Every key with its value (number, bool, data length or class). */
++	if (fLogged < 40 && (b == NULL || d->getCount() > 3)) {
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++		OSSymbol *k;
++		while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++			OSObject *o = d->getObject(k);
++			OSNumber *n = OSDynamicCast(OSNumber, o);
++			OSBoolean *bo = OSDynamicCast(OSBoolean, o);
++			OSData *da = OSDynamicCast(OSData, o);
++			if (n != NULL) {
++				IOLog("SWEET BL:   key %s = %lld\n", k->getCStringNoCopy(), (long long)n->unsigned64BitValue());
++			} else if (bo != NULL) {
++				IOLog("SWEET BL:   key %s = %s\n", k->getCStringNoCopy(), bo->isTrue() ? "true" : "false");
++			} else if (da != NULL) {
++				IOLog("SWEET BL:   key %s = data[%u]\n", k->getCStringNoCopy(), da->getLength());
++			} else {
++				IOLog("SWEET BL:   key %s = <%s>\n", k->getCStringNoCopy(),
++				    o != NULL ? o->getMetaClass()->getClassName() : "null");
++			}
++		}
++		OSSafeReleaseNULL(it);
++	}
+ 	if (b == NULL) {
+ 		return kIOReturnSuccess;
+ 	}
+@@ -366,7 +464,17 @@ AppleCLCD::start(IOService *provider)
  	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
  	fLogicalW = fWidth;
  	fLogicalH = fHeight;
@@ -1267,7 +1304,7 @@ index 26b4001..2784d1f 100644
  		fLogicalW = SWEET_FB_LOGICAL_W;
  		fLogicalH = SWEET_FB_LOGICAL_H;
  	}
-@@ -766,7 +851,13 @@ AppleCLCD::setPower(bool on)
+@@ -766,7 +874,13 @@ AppleCLCD::setPower(bool on)
  		return;
  	}
  	fBlanked = !on;
