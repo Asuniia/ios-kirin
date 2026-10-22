@@ -1661,18 +1661,20 @@ index bb2a2bf..1b1b406 100644
  	lock_trace = 1;
  }
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 01e674f..104afd3 100644
+index 01e674f..8ffda35 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -453,6 +453,53 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
+@@ -453,6 +453,56 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
   * without editing launchd.plist on the phone). Several NAME:... entries
   * are separated by ';'.
   */
 +/*
-+ * Boot-arg sweetnoexec=NAME,NAME,...: exec of an executable whose file name
-+ * is in the list fails with EPERM (launchd then backs off). For daemons that
-+ * spin on hardware this port does not have (health, widgets, accessory
-+ * updates, ...) and keep the CPU busy. Each name is logged once.
++ * Boot-arg sweetnoexec=NAME,NAME,...: a process that execs an executable
++ * whose file name is in the list gets SIGSTOP before the new image runs:
++ * it stays stopped, so launchd and xpcproxy see a running job and do not
++ * retry (failing the exec with EPERM made xpcproxy spin at 50-85% CPU).
++ * For daemons that spin on hardware this port does not have (health,
++ * widgets, accessory updates, ...). Each name is logged once.
 + */
 +static int
 +sweet_exec_denied(struct image_params *imgp)
@@ -1703,9 +1705,10 @@ index 01e674f..104afd3 100644
 +			if (ll + n + 2 < sizeof(logged) && strnstr(logged, base, sizeof(logged)) == NULL) {
 +				strlcat(logged, base, sizeof(logged));
 +				strlcat(logged, ",", sizeof(logged));
-+				printf("SWEET NOEXEC: %s denied (sweetnoexec)\n", base);
++				printf("SWEET NOEXEC: %s stopped (sweetnoexec)\n", base);
 +			}
-+			return EPERM;
++			psignal(current_proc(), SIGSTOP);
++			return 0;
 +		}
 +		e += n;
 +		if (*e == ',') {
@@ -1718,7 +1721,7 @@ index 01e674f..104afd3 100644
  static int
  sweet_exec_env(struct image_params *imgp, int ptr_size)
  {
-@@ -5814,6 +5861,10 @@ exec_extract_strings(struct image_params *imgp)
+@@ -5814,6 +5864,10 @@ exec_extract_strings(struct image_params *imgp)
  	}
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
