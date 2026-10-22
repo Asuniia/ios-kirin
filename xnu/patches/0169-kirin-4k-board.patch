@@ -1,22 +1,23 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 2a6dc36..19e434d 100644
+index 2a6dc36..7f320ce 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -107,6 +107,8 @@ bsd/dev/memdev.c			standard
+@@ -107,6 +107,9 @@ bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
 +bsd/dev/sweet_audio.c			standard
 +bsd/dev/sweet_adsp.c			standard
++bsd/dev/sweet_glink.c			standard
  bsd/dev/sweet_perf.c			standard
  bsd/dev/sweet_gpu.c			standard
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
 new file mode 100644
-index 0000000..40659d2
+index 0000000..7201a29
 --- /dev/null
 +++ b/bsd/dev/sweet_adsp.c
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,213 @@
 +/*
 + * kirin, boot-arg sweetadsp=1: the audio DSP (ADSP, the LPASS Hexagon) is
 + * loaded and started through TrustZone, as Linux's pil-tz-generic does it
@@ -136,6 +137,9 @@ index 0000000..40659d2
 +		printf("SWEET ADSP: no ADSP-FW in the payload\n");
 +		return;
 +	}
++	/* the GLINK descriptor and our fifo are in SMEM before the DSP starts */
++	extern void sweet_glink_init(void);
++	sweet_glink_init();
 +	const uint8_t *fw = (const uint8_t *)phystokv(v[0]);
 +	uint64_t fwlen = v[1];
 +	uint32_t nseg, mdt_off, mdt_len;
@@ -399,6 +403,908 @@ index 0000000..7097030
 +		thread_deallocate(t);
 +	}
 +	printf("SWEET AUDIO: /dev/sweet-audio and /dev/sweet-haptic %s\n", ok ? "ready" : "NOT created");
++}
++#endif /* SWEET_KIRIN */
+diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
+new file mode 100644
+index 0000000..fc7a0f5
+--- /dev/null
++++ b/bsd/dev/sweet_glink.c
+@@ -0,0 +1,896 @@
++/*
++ * kirin: talking to the ADSP once it runs (bsd/dev/sweet_adsp.c), as
++ * Linux 4.19's qcom_smem + qcom_glink_smem + qcom_glink_native do it for DT
++ * /soc/qcom,glink/adsp (remote pid 2, mailbox APCS 0x17911000 bit 9):
++ *
++ *   SMEM      0x86000000 (2 MB, reserved smem-mem): partition table "$TOC" in
++ *             its last 4 KB, the APPS<->ADSP partition "$PRT" (hosts 0, 2);
++ *             items are allocated under TCSR mutex 3 (0x1f40000 + 3 * 0x1000)
++ *   GLINK     item 478: 32-byte descriptor (tx tail, tx head, rx tail, rx
++ *             head), 479: our 16 KB tx fifo, 480: the ADSP's (it allocates
++ *             it); 8-byte aligned commands (VERSION, OPEN, OPEN_ACK, INTENT,
++ *             TX_DATA, RX_DONE...), a kick through the APCS IPC register
++ *             after each write. There is no interrupt here: a thread polls
++ *             the rx fifo (1 ms while busy, 4 ms idle).
++ *   channels  apr_audio_svc: APR, the audio services (CORE, AFE, ASM, ADM);
++ *             IPCRTR: QRTR, the QMI services (sensors among them).
++ *
++ * This file only brings the link up and says what is on the other side:
++ * the ADSP's audio core state (AVCS_CMD_ADSP_EVENT_GET_STATE) and every QMI
++ * service the ADSP announces (QRTR NEW_SERVER: service, instance, node,
++ * port). sweet_glink_apr_send/sweet_glink_apr_handler and
++ * sweet_glink_qrtr_send are for the audio and sensor clients.
++ */
++#if defined(SWEET_KIRIN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++#include <kern/kalloc.h>
++
++void sweet_glink_init(void);
++int sweet_glink_apr_send(const void *pkt, uint32_t len);
++void (*sweet_glink_apr_handler)(const uint8_t *pkt, uint32_t len);
++int sweet_glink_qrtr_send(const void *pkt, uint32_t len);
++void (*sweet_glink_qrtr_handler)(const uint8_t *pkt, uint32_t len);
++bool sweet_glink_up(void);
++
++#define SMEM_PA         0x86000000ull
++#define SMEM_SZ         0x00200000u
++#define TCSR_MUTEX_PA   (0x01f40000ull + 3 * 0x1000)
++#define APCS_IPC_PA     0x17911000ull
++#define APCS_IPC_OFF    0x8
++#define ADSP_IPC_BIT    (1u << 9)
++#define ADSP_PID        2
++#define ITEM_DESC       478
++#define ITEM_TX_FIFO    479
++#define ITEM_RX_FIFO    480
++#define TX_FIFO_SZ      16384u
++
++#define CMD_VERSION             0
++#define CMD_VERSION_ACK         1
++#define CMD_OPEN                2
++#define CMD_CLOSE               3
++#define CMD_OPEN_ACK            4
++#define CMD_INTENT              5
++#define CMD_RX_DONE             6
++#define CMD_RX_INTENT_REQ       7
++#define CMD_RX_INTENT_REQ_ACK   8
++#define CMD_TX_DATA             9
++#define CMD_CLOSE_ACK           11
++#define CMD_TX_DATA_CONT        12
++#define CMD_READ_NOTIF          13
++#define CMD_RX_DONE_W_REUSE     14
++#define CMD_SIGNALS             15
++
++struct ptable_entry {
++	uint32_t offset, size, flags;
++	uint16_t host0, host1;
++	uint32_t cacheline, reserved[7];
++} __attribute__((packed));
++
++struct part_header {
++	uint8_t magic[4];
++	uint16_t host0, host1;
++	uint32_t size, offset_free_uncached, offset_free_cached, reserved[3];
++} __attribute__((packed));
++
++struct private_entry {
++	uint16_t canary, item;
++	uint32_t size;
++	uint16_t padding_data, padding_hdr;
++	uint32_t reserved;
++} __attribute__((packed));
++
++/* our receive buffers (intents) and the ADSP's, per channel */
++#define NLOCAL  12
++#define NREMOTE 32
++struct gchan {
++	const char *name;
++	uint16_t lcid, rcid;
++	bool open_sent, open_acked, remote_open, intents_sent;
++	struct { uint32_t id, size; uint8_t *buf; uint32_t off; } local[NLOCAL];
++	uint32_t nlocal;
++	struct { uint32_t id, size; bool used; } remote[NREMOTE];
++	void (**handler)(const uint8_t *, uint32_t);
++	uint32_t isize[NLOCAL];
++};
++
++static struct {
++	volatile uint8_t *smem, *mutex, *apcs;
++	volatile uint8_t *part;
++	uint32_t part_size;
++	volatile uint32_t *desc;        /* tx tail, tx head, rx tail, rx head */
++	volatile uint8_t *txf, *rxf;
++	uint32_t txlen, rxlen;
++	bool version_done, up;
++	uint32_t next_liid;
++	struct gchan ch[2];
++	lck_mtx_t *tx_lock;
++	int sleep_chan;
++} g;
++
++static LCK_GRP_DECLARE(sweet_glink_grp, "sweet_glink");
++static LCK_MTX_DECLARE(sweet_glink_tx_lock, &sweet_glink_grp);
++
++static void
++g_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&g.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- SMEM ---- */
++
++static bool
++hwlock(void)
++{
++	for (int i = 0; i < 1000; i++) {
++		*(volatile uint32_t *)g.mutex = 1;      /* QCOM_MUTEX_APPS_PROC_ID */
++		__builtin_arm_dsb(0xf);
++		if (*(volatile uint32_t *)g.mutex == 1) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static void
++hwunlock(void)
++{
++	__builtin_arm_dsb(0xf);
++	*(volatile uint32_t *)g.mutex = 0;
++	__builtin_arm_dsb(0xf);
++}
++
++static bool
++smem_find_partition(void)
++{
++	volatile uint8_t *pt = g.smem + SMEM_SZ - 4096;
++	if (memcmp((const void *)pt, "$TOC", 4) != 0) {
++		printf("SWEET GLINK: no SMEM partition table (%02x %02x %02x %02x)\n", pt[0], pt[1], pt[2], pt[3]);
++		return false;
++	}
++	uint32_t n = *(volatile uint32_t *)(pt + 8);
++	for (uint32_t i = 0; i < n && i < 32; i++) {
++		volatile struct ptable_entry *e = (volatile struct ptable_entry *)(pt + 32 + i * sizeof(struct ptable_entry));
++		if (((e->host0 == 0 && e->host1 == ADSP_PID) || (e->host0 == ADSP_PID && e->host1 == 0)) &&
++		    e->offset && e->size && e->offset + (uint64_t)e->size <= SMEM_SZ) {
++			g.part = g.smem + e->offset;
++			g.part_size = e->size;
++			if (memcmp((const void *)g.part, "$PRT", 4) != 0) {
++				printf("SWEET GLINK: APPS/ADSP partition without its magic\n");
++				return false;
++			}
++			printf("SWEET GLINK: SMEM partition APPS/ADSP at +%#x, %u KB\n", e->offset, e->size >> 10);
++			return true;
++		}
++	}
++	printf("SWEET GLINK: no APPS/ADSP partition among %u\n", n);
++	return false;
++}
++
++static volatile uint8_t *
++smem_get(uint16_t item, uint32_t *size)
++{
++	volatile struct part_header *ph = (volatile struct part_header *)g.part;
++	uint32_t end = ph->offset_free_uncached;
++	uint32_t off = sizeof(struct part_header);
++	if (end > g.part_size) {
++		return NULL;
++	}
++	while (off + sizeof(struct private_entry) <= end) {
++		volatile struct private_entry *e = (volatile struct private_entry *)(g.part + off);
++		if (e->canary != 0xa5a5) {
++			printf("SWEET GLINK: SMEM bad canary at +%#x\n", off);
++			return NULL;
++		}
++		uint32_t next = off + sizeof(struct private_entry) + e->padding_hdr + e->size;
++		if (e->item == item) {
++			if (size) {
++				*size = e->size - e->padding_data;
++			}
++			return g.part + off + sizeof(struct private_entry) + e->padding_hdr;
++		}
++		if (next <= off) {
++			return NULL;
++		}
++		off = next;
++	}
++	return NULL;
++}
++
++static volatile uint8_t *
++smem_alloc(uint16_t item, uint32_t size, uint32_t *got)
++{
++	volatile uint8_t *p = smem_get(item, got);
++	if (p) {
++		return p;
++	}
++	if (!hwlock()) {
++		printf("SWEET GLINK: TCSR mutex 3 stays taken\n");
++		return NULL;
++	}
++	volatile struct part_header *ph = (volatile struct part_header *)g.part;
++	uint32_t off = ph->offset_free_uncached;
++	uint32_t asz = (uint32_t)sizeof(struct private_entry) + ((size + 7) & ~7u);
++	if (off + asz > ph->offset_free_cached) {
++		hwunlock();
++		printf("SWEET GLINK: SMEM partition full for item %u\n", item);
++		return NULL;
++	}
++	volatile struct private_entry *e = (volatile struct private_entry *)(g.part + off);
++	e->canary = 0xa5a5;
++	e->item = item;
++	e->size = (size + 7) & ~7u;
++	e->padding_data = (uint16_t)(e->size - size);
++	e->padding_hdr = 0;
++	e->reserved = 0;
++	__builtin_arm_dsb(0xf);
++	ph->offset_free_uncached = off + asz;
++	hwunlock();
++	return smem_get(item, got);
++}
++
++/* ---- fifos ---- */
++
++static uint32_t
++rx_avail(void)
++{
++	if (!g.rxf) {
++		uint32_t len = 0;
++		volatile uint8_t *f = smem_get(ITEM_RX_FIFO, &len);
++		if (!f) {
++			return 0;
++		}
++		g.rxf = f;
++		g.rxlen = len;
++		printf("SWEET GLINK: the ADSP's fifo is there (%u bytes)\n", len);
++	}
++	uint32_t head = g.desc[3], tail = g.desc[2];
++	uint32_t n = head >= tail ? head - tail : g.rxlen - tail + head;
++	return n > g.rxlen ? 0 : n;
++}
++
++static void
++rx_peek(void *out, uint32_t off, uint32_t n)
++{
++	uint32_t t = g.desc[2] + off;
++	if (t >= g.rxlen) {
++		t -= g.rxlen;
++	}
++	uint32_t a = MIN(n, g.rxlen - t);
++	for (uint32_t i = 0; i < a; i++) {
++		((uint8_t *)out)[i] = g.rxf[t + i];
++	}
++	for (uint32_t i = 0; i < n - a; i++) {
++		((uint8_t *)out)[a + i] = g.rxf[i];
++	}
++}
++
++static void
++rx_advance(uint32_t n)
++{
++	uint32_t t = g.desc[2] + ((n + 7) & ~7u);
++	if (t >= g.rxlen) {
++		t %= g.rxlen;
++	}
++	__builtin_arm_dmb(0xf);
++	g.desc[2] = t;
++}
++
++static uint32_t
++tx_avail(void)
++{
++	uint32_t head = g.desc[1], tail = g.desc[0];
++	uint32_t a = tail <= head ? g.txlen - head + tail : tail - head;
++	return a < 16 ? 0 : a - 16;
++}
++
++static uint32_t
++tx_write_one(uint32_t head, const void *d, uint32_t n)
++{
++	uint32_t a = MIN(n, g.txlen - head);
++	for (uint32_t i = 0; i < a; i++) {
++		g.txf[head + i] = ((const uint8_t *)d)[i];
++	}
++	for (uint32_t i = 0; i < n - a; i++) {
++		g.txf[i] = ((const uint8_t *)d)[a + i];
++	}
++	head += n;
++	return head >= g.txlen ? head - g.txlen : head;
++}
++
++static void
++kick(void)
++{
++	__builtin_arm_dsb(0xf);
++	*(volatile uint32_t *)(g.apcs + APCS_IPC_OFF) = ADSP_IPC_BIT;
++}
++
++/* one command (+ data), 8-byte aligned in the fifo */
++static int
++g_tx(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint32_t tlen = (hlen + dlen + 7) & ~7u;
++	if (tlen >= g.txlen) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_glink_tx_lock);
++	for (int i = 0; tx_avail() < tlen; i++) {
++		if (i > 2000) {
++			lck_mtx_unlock(&sweet_glink_tx_lock);
++			printf("SWEET GLINK: tx fifo stays full\n");
++			return EBUSY;
++		}
++		kick();
++		g_sleep_ms(1);
++	}
++	uint32_t head = g.desc[1];
++	head = tx_write_one(head, hdr, hlen);
++	if (dlen) {
++		head = tx_write_one(head, data, dlen);
++	}
++	head = (head + 7) & ~7u;
++	if (head >= g.txlen) {
++		head -= g.txlen;
++	}
++	__builtin_arm_dsb(0xf);
++	g.desc[1] = head;
++	kick();
++	lck_mtx_unlock(&sweet_glink_tx_lock);
++	return 0;
++}
++
++static int
++g_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	struct { uint16_t cmd, p1; uint32_t p2; } m = { cmd, p1, p2 };
++	return g_tx(&m, sizeof(m), NULL, 0);
++}
++
++/* ---- channels ---- */
++
++static struct gchan *
++ch_by_rcid(uint16_t rcid)
++{
++	for (int i = 0; i < 2; i++) {
++		if (g.ch[i].remote_open && g.ch[i].rcid == rcid) {
++			return &g.ch[i];
++		}
++	}
++	return NULL;
++}
++
++static struct gchan *
++ch_by_lcid(uint16_t lcid)
++{
++	for (int i = 0; i < 2; i++) {
++		if (g.ch[i].lcid == lcid) {
++			return &g.ch[i];
++		}
++	}
++	return NULL;
++}
++
++static void
++ch_open(struct gchan *c)
++{
++	struct { uint16_t cmd, lcid; uint32_t namelen; char name[32]; } req;
++	bzero(&req, sizeof(req));
++	uint32_t nl = (uint32_t)strlen(c->name) + 1;
++	req.cmd = CMD_OPEN;
++	req.lcid = c->lcid;
++	req.namelen = nl;
++	strlcpy(req.name, c->name, sizeof(req.name));
++	c->open_sent = true;
++	(void)g_tx(&req, (8 + nl + 7) & ~7u, NULL, 0);
++}
++
++static void
++ch_advertise(struct gchan *c, uint32_t i)
++{
++	struct { uint16_t cmd, lcid; uint32_t count, size, liid; } m;
++	c->local[i].id = ++g.next_liid;
++	c->local[i].off = 0;
++	m.cmd = CMD_INTENT;
++	m.lcid = c->lcid;
++	m.count = 1;
++	m.size = c->local[i].size;
++	m.liid = c->local[i].id;
++	(void)g_tx(&m, sizeof(m), NULL, 0);
++}
++
++static void
++ch_ready(struct gchan *c)
++{
++	if (!c->open_acked || !c->remote_open || c->intents_sent) {
++		return;
++	}
++	c->intents_sent = true;
++	for (uint32_t i = 0; i < c->nlocal; i++) {
++		c->local[i].size = c->isize[i];
++		if (!c->local[i].buf) {
++			c->local[i].buf = kalloc_data(c->local[i].size, Z_WAITOK | Z_ZERO);
++		}
++		ch_advertise(c, i);
++	}
++	printf("SWEET GLINK: channel %s open (local %u, remote %u)\n", c->name, c->lcid, c->rcid);
++}
++
++static int
++ch_send(struct gchan *c, const void *d, uint32_t len)
++{
++	if (!c->intents_sent) {
++		return ENOTCONN;
++	}
++	for (int tries = 0; tries < 500; tries++) {
++		lck_mtx_lock(&sweet_glink_tx_lock);
++		int best = -1;
++		for (int i = 0; i < NREMOTE; i++) {
++			if (c->remote[i].size >= len && !c->remote[i].used &&
++			    (best < 0 || c->remote[i].size < c->remote[best].size)) {
++				best = i;
++			}
++		}
++		if (best >= 0) {
++			c->remote[best].used = true;
++		}
++		lck_mtx_unlock(&sweet_glink_tx_lock);
++		if (best >= 0) {
++			struct { uint16_t cmd, lcid; uint32_t iid, chunk, left; } h;
++			h.cmd = CMD_TX_DATA;
++			h.lcid = c->lcid;
++			h.iid = c->remote[best].id;
++			h.chunk = len;
++			h.left = 0;
++			return g_tx(&h, sizeof(h), d, len);
++		}
++		if (tries == 0) {
++			(void)g_cmd(CMD_RX_INTENT_REQ, c->lcid, len);
++		}
++		g_sleep_ms(2);
++	}
++	printf("SWEET GLINK: %s: no ADSP buffer for %u bytes\n", c->name, len);
++	return EBUSY;
++}
++
++/* returns false when the command is not all in the fifo yet */
++static bool
++rx_one(void)
++{
++	uint32_t avail = rx_avail();
++	struct { uint16_t cmd, p1; uint32_t p2; } m;
++	if (avail < 8) {
++		return false;
++	}
++	rx_peek(&m, 0, 8);
++	struct gchan *c;
++	switch (m.cmd) {
++	case CMD_VERSION:
++		rx_advance(8);
++		printf("SWEET GLINK: ADSP speaks GLINK version %u, features %#x\n", m.p1, m.p2);
++		(void)g_cmd(CMD_VERSION_ACK, 1, 0);
++		g.version_done = true;
++		break;
++	case CMD_VERSION_ACK:
++		rx_advance(8);
++		g.version_done = true;
++		break;
++	case CMD_OPEN: {
++		uint32_t nl = m.p2 & 0xffff;
++		char name[33] = { 0 };
++		if (avail < 8 + nl) {
++			return false;
++		}
++		rx_peek(name, 8, MIN(nl, 32u));
++		rx_advance(8 + nl);
++		c = NULL;
++		for (int i = 0; i < 2; i++) {
++			if (strcmp(g.ch[i].name, name) == 0) {
++				c = &g.ch[i];
++			}
++		}
++		if (!c) {
++			printf("SWEET GLINK: the ADSP opens %s (not handled)\n", name);
++			struct { uint16_t cmd, p1; uint32_t p2; } ack = { CMD_OPEN_ACK, m.p1, 0 };
++			(void)g_tx(&ack, 8, NULL, 0);
++			break;
++		}
++		c->rcid = m.p1;
++		c->remote_open = true;
++		(void)g_cmd(CMD_OPEN_ACK, c->rcid, 0);
++		if (!c->open_sent) {
++			ch_open(c);
++		}
++		ch_ready(c);
++		break;
++	}
++	case CMD_OPEN_ACK:
++		rx_advance(8);
++		if ((c = ch_by_lcid(m.p1)) != NULL) {
++			c->open_acked = true;
++			ch_ready(c);
++		}
++		break;
++	case CMD_CLOSE:
++		rx_advance(8);
++		(void)g_cmd(CMD_CLOSE_ACK, m.p1, 0);
++		if ((c = ch_by_rcid(m.p1)) != NULL) {
++			printf("SWEET GLINK: the ADSP closes %s\n", c->name);
++			c->remote_open = false;
++		}
++		break;
++	case CMD_CLOSE_ACK:
++		rx_advance(8);
++		break;
++	case CMD_INTENT: {
++		uint32_t n = m.p2, len = 8 + 8 * n;
++		if (avail < len) {
++			return false;
++		}
++		c = ch_by_rcid(m.p1);
++		for (uint32_t k = 0; k < n; k++) {
++			uint32_t pair[2];
++			rx_peek(pair, 8 + 8 * k, 8);
++			if (!c) {
++				continue;
++			}
++			lck_mtx_lock(&sweet_glink_tx_lock);
++			for (int i = 0; i < NREMOTE; i++) {
++				if (c->remote[i].size == 0) {
++					c->remote[i].size = pair[0];
++					c->remote[i].id = pair[1];
++					c->remote[i].used = false;
++					break;
++				}
++			}
++			lck_mtx_unlock(&sweet_glink_tx_lock);
++		}
++		rx_advance(len);
++		break;
++	}
++	case CMD_RX_DONE:
++	case CMD_RX_DONE_W_REUSE:
++		rx_advance(8);
++		if ((c = ch_by_rcid(m.p1)) != NULL) {
++			lck_mtx_lock(&sweet_glink_tx_lock);
++			for (int i = 0; i < NREMOTE; i++) {
++				if (c->remote[i].size && c->remote[i].id == m.p2) {
++					if (m.cmd == CMD_RX_DONE) {
++						c->remote[i].size = 0;
++					}
++					c->remote[i].used = false;
++				}
++			}
++			lck_mtx_unlock(&sweet_glink_tx_lock);
++		}
++		break;
++	case CMD_RX_INTENT_REQ:
++		rx_advance(8);
++		printf("SWEET GLINK: the ADSP asks for a %u-byte buffer\n", m.p2);
++		if ((c = ch_by_rcid(m.p1)) != NULL) {
++			/* grow the smallest of ours to that size */
++			uint32_t s = 0;
++			for (uint32_t i = 1; i < c->nlocal; i++) {
++				if (c->local[i].size < c->local[s].size) {
++					s = i;
++				}
++			}
++			if (c->local[s].size < m.p2) {
++				kfree_data(c->local[s].buf, c->local[s].size);
++				c->local[s].size = m.p2;
++				c->local[s].buf = kalloc_data(m.p2, Z_WAITOK | Z_ZERO);
++			}
++			(void)g_cmd(CMD_RX_INTENT_REQ_ACK, c->lcid, 1);
++			ch_advertise(c, s);
++		}
++		break;
++	case CMD_TX_DATA:
++	case CMD_TX_DATA_CONT: {
++		struct { uint16_t cmd, p1; uint32_t liid, chunk, left; } h;
++		if (avail < 16) {
++			return false;
++		}
++		rx_peek(&h, 0, 16);
++		if (avail < 16 + h.chunk) {
++			return false;
++		}
++		c = ch_by_rcid(h.p1);
++		int li = -1;
++		if (c) {
++			for (uint32_t i = 0; i < c->nlocal; i++) {
++				if (c->local[i].id == h.liid) {
++					li = (int)i;
++				}
++			}
++		}
++		if (li < 0 || c->local[li].size - c->local[li].off < h.chunk) {
++			printf("SWEET GLINK: data for unknown buffer %u on channel %u, dropped\n", h.liid, h.p1);
++			rx_advance(16 + h.chunk);
++			break;
++		}
++		rx_peek(c->local[li].buf + c->local[li].off, 16, h.chunk);
++		c->local[li].off += h.chunk;
++		rx_advance(16 + h.chunk);
++		if (h.left == 0) {
++			if (*c->handler) {
++				(*c->handler)(c->local[li].buf, c->local[li].off);
++			}
++			(void)g_cmd(CMD_RX_DONE, c->lcid, c->local[li].id);
++			ch_advertise(c, (uint32_t)li);
++		}
++		break;
++	}
++	case CMD_READ_NOTIF:
++		rx_advance(8);
++		kick();
++		break;
++	case CMD_RX_INTENT_REQ_ACK:
++	case CMD_SIGNALS:
++		rx_advance(8);
++		break;
++	default:
++		printf("SWEET GLINK: unknown command %u (%u, %#x), fifo reset\n", m.cmd, m.p1, m.p2);
++		g.desc[2] = g.desc[3];
++		break;
++	}
++	return true;
++}
++
++/* ---- APR (audio) ---- */
++
++struct apr_hdr {
++	uint16_t hdr_field, pkt_size;
++	uint8_t src_svc, src_domain;
++	uint16_t src_port;
++	uint8_t dest_svc, dest_domain;
++	uint16_t dest_port;
++	uint32_t token, opcode;
++} __attribute__((packed));
++
++static volatile uint32_t apr_core_state = ~0u;
++
++static void apr_rx(const uint8_t *pkt, uint32_t len);
++static void (*apr_client)(const uint8_t *, uint32_t);
++
++static void
++apr_rx(const uint8_t *pkt, uint32_t len)
++{
++	const struct apr_hdr *h = (const struct apr_hdr *)pkt;
++	if (len < sizeof(*h)) {
++		return;
++	}
++	const uint32_t *pl = (const uint32_t *)(pkt + ((h->hdr_field >> 4) & 0xf) * 4);
++	if (h->opcode == 0x0001290D && len >= sizeof(*h) + 4) {   /* AVCS_CMDRSP_ADSP_EVENT_GET_STATE */
++		apr_core_state = pl[0];
++		return;
++	}
++	if (apr_client) {
++		apr_client(pkt, len);
++		return;
++	}
++	printf("SWEET APR: svc %u port %u opcode %#x token %u (%u bytes)%s%#x %#x\n", h->src_svc, h->src_port,
++	    h->opcode, h->token, len, len >= sizeof(*h) + 8 ? ": " : "", len >= sizeof(*h) + 8 ? pl[0] : 0,
++	    len >= sizeof(*h) + 8 ? pl[1] : 0);
++}
++
++int
++sweet_glink_apr_send(const void *pkt, uint32_t len)
++{
++	return ch_send(&g.ch[0], pkt, len);
++}
++
++/* ---- QRTR (QMI services) ---- */
++
++struct qrtr_hdr_v1 {
++	uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port;
++};
++#define QRTR_PORT_CTRL  0xfffffffeu
++#define QRTR_NODE_BCAST 0xffffffffu
++#define QRTR_LOCAL_NODE 1u
++static uint32_t qrtr_adsp_node = ~0u;
++static void (*qrtr_client)(const uint8_t *, uint32_t);
++
++static void
++qrtr_ctrl(uint32_t type, uint32_t dst_node, uint32_t dst_port, const uint32_t *args, uint32_t nargs)
++{
++	struct { struct qrtr_hdr_v1 h; uint32_t cmd, a[4]; } p;
++	bzero(&p, sizeof(p));
++	p.h.version = 1;
++	p.h.type = type;
++	p.h.src_node = QRTR_LOCAL_NODE;
++	p.h.src_port = QRTR_PORT_CTRL;
++	p.h.size = 20;
++	p.h.dst_node = dst_node;
++	p.h.dst_port = dst_port;
++	p.cmd = type;
++	for (uint32_t i = 0; i < nargs && i < 4; i++) {
++		p.a[i] = args[i];
++	}
++	(void)ch_send(&g.ch[1], &p, sizeof(p));
++}
++
++static void
++qrtr_rx(const uint8_t *pkt, uint32_t len)
++{
++	const struct qrtr_hdr_v1 *h = (const struct qrtr_hdr_v1 *)pkt;
++	if (len < sizeof(*h) || h->version != 1) {
++		printf("SWEET QRTR: %u bytes, version %u: not a v1 packet\n", len, len >= 4 ? h->version : 0);
++		return;
++	}
++	const uint32_t *c = (const uint32_t *)(pkt + sizeof(*h));
++	switch (h->type) {
++	case 2: /* HELLO */
++		qrtr_adsp_node = h->src_node;
++		printf("SWEET QRTR: hello from the ADSP (node %u)\n", h->src_node);
++		qrtr_ctrl(2, h->src_node, QRTR_PORT_CTRL, NULL, 0);
++		break;
++	case 4: /* NEW_SERVER */
++		if (h->size >= 20) {
++			printf("SWEET QRTR: ADSP service %u (%#x) version %u instance %u at node %u port %u\n",
++			    c[1], c[1], c[2] & 0xff, c[2] >> 8, c[3], c[4]);
++		}
++		break;
++	case 5: /* DEL_SERVER */
++		if (h->size >= 20) {
++			printf("SWEET QRTR: ADSP service %u gone\n", c[1]);
++		}
++		break;
++	case 1: /* DATA */
++		if (h->confirm_rx) {
++			uint32_t a[2] = { QRTR_LOCAL_NODE, h->dst_port };
++			struct { struct qrtr_hdr_v1 h; uint32_t cmd, node, port; } r;
++			bzero(&r, sizeof(r));
++			r.h.version = 1;
++			r.h.type = 7;   /* RESUME_TX */
++			r.h.src_node = QRTR_LOCAL_NODE;
++			r.h.src_port = h->dst_port;
++			r.h.size = 12;
++			r.h.dst_node = h->src_node;
++			r.h.dst_port = h->src_port;
++			r.cmd = 7;
++			r.node = a[0];
++			r.port = a[1];
++			(void)ch_send(&g.ch[1], &r, sizeof(r));
++		}
++		if (qrtr_client) {
++			qrtr_client(pkt, len);
++		} else {
++			printf("SWEET QRTR: data %u bytes from %u:%u to port %u\n", h->size, h->src_node, h->src_port, h->dst_port);
++		}
++		break;
++	case 7: /* RESUME_TX */
++	case 9: /* PING */
++		break;
++	default:
++		printf("SWEET QRTR: control %u from %u:%u\n", h->type, h->src_node, h->src_port);
++		break;
++	}
++}
++
++int
++sweet_glink_qrtr_send(const void *pkt, uint32_t len)
++{
++	return ch_send(&g.ch[1], pkt, len);
++}
++
++bool
++sweet_glink_up(void)
++{
++	return g.up;
++}
++
++/* ---- bring-up ---- */
++
++static void
++glink_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	g.smem = (volatile uint8_t *)ml_io_map_wcomb(SMEM_PA, SMEM_SZ);
++	g.mutex = (volatile uint8_t *)ml_io_map(TCSR_MUTEX_PA, 0x1000);
++	g.apcs = (volatile uint8_t *)ml_io_map(APCS_IPC_PA, 0x1000);
++	if (!g.smem || !g.mutex || !g.apcs || !smem_find_partition()) {
++		return;
++	}
++	uint32_t dsz = 0;
++	g.desc = (volatile uint32_t *)smem_alloc(ITEM_DESC, 32, &dsz);
++	g.txf = smem_alloc(ITEM_TX_FIFO, TX_FIFO_SZ, &g.txlen);
++	if (!g.desc || dsz != 32 || !g.txf) {
++		printf("SWEET GLINK: descriptor (%u bytes) or tx fifo missing\n", dsz);
++		return;
++	}
++	g.desc[2] = 0;  /* rx tail */
++	g.desc[1] = 0;  /* tx head */
++	printf("SWEET GLINK: descriptor and %u-byte tx fifo in SMEM, waiting for the ADSP\n", g.txlen);
++
++	/* APR: 20 buffers of 512 bytes; IPCRTR: 5 x 2 KB, 3 x 8 KB, 2 x 17 KB (DT intents) */
++	g.ch[0].name = "apr_audio_svc";
++	g.ch[0].lcid = 1;
++	g.ch[0].handler = &sweet_glink_apr_handler;
++	g.ch[0].nlocal = NLOCAL;
++	for (int i = 0; i < NLOCAL; i++) {
++		g.ch[0].isize[i] = 4096;
++	}
++	g.ch[1].name = "IPCRTR";
++	g.ch[1].lcid = 2;
++	g.ch[1].handler = &sweet_glink_qrtr_handler;
++	g.ch[1].nlocal = 10;
++	for (int i = 0; i < 10; i++) {
++		g.ch[1].isize[i] = i < 5 ? 0x800 : i < 8 ? 0x2000 : 0x4400;
++	}
++	sweet_glink_apr_handler = apr_rx;
++	sweet_glink_qrtr_handler = qrtr_rx;
++
++	struct { uint16_t cmd, p1; uint32_t p2; } ver = { CMD_VERSION, 1, 1 /* INTENT_REUSE */ };
++	(void)g_tx(&ver, 8, NULL, 0);
++
++	uint64_t start = mach_absolute_time(), last_ver = start, now;
++	bool opened = false, hello = false, said_up = false;
++	uint32_t idle = 0, core_asks = 0;
++	uint64_t ns;
++	for (;;) {
++		bool any = false;
++		while (rx_one()) {
++			any = true;
++		}
++		now = mach_absolute_time();
++		absolutetime_to_nanoseconds(now - start, &ns);
++		if (!g.version_done) {
++			uint64_t d;
++			absolutetime_to_nanoseconds(now - last_ver, &d);
++			if (d > 2000000000ull) {   /* the ADSP may come up after our first VERSION */
++				(void)g_tx(&ver, 8, NULL, 0);
++				last_ver = now;
++				if (ns > 30000000000ull && ns < 32100000000ull) {
++					printf("SWEET GLINK: no answer from the ADSP after 30 s (tx %u/%u rx %u/%u)\n",
++					    g.desc[0], g.desc[1], g.desc[2], g.desc[3]);
++				}
++			}
++		} else if (!opened) {
++			opened = true;
++			ch_open(&g.ch[0]);
++			ch_open(&g.ch[1]);
++		}
++		if (g.ch[1].intents_sent && !hello) {
++			hello = true;
++			qrtr_ctrl(2, QRTR_NODE_BCAST, QRTR_PORT_CTRL, NULL, 0);
++		}
++		if (g.ch[0].intents_sent && apr_core_state != 1 && core_asks < 100 && (core_asks == 0 || (ns / 100000000ull) > core_asks)) {
++			struct apr_hdr h;
++			bzero(&h, sizeof(h));
++			h.hdr_field = (2 << 8) | (5 << 4);       /* SEQ_CMD, 20-byte header */
++			h.pkt_size = sizeof(h);
++			h.src_svc = 3;
++			h.src_domain = 5;
++			h.dest_svc = 3;                         /* APR_SVC_ADSP_CORE */
++			h.dest_domain = 4;
++			h.opcode = 0x0001290C;                  /* AVCS_CMD_ADSP_EVENT_GET_STATE */
++			(void)sweet_glink_apr_send(&h, sizeof(h));
++			core_asks = (uint32_t)(ns / 100000000ull) + 1;
++		}
++		if (!said_up && apr_core_state == 1) {
++			said_up = true;
++			g.up = true;
++			printf("SWEET APR: the ADSP's audio core is ready (%llu ms after the link)\n", ns / 1000000ull);
++		}
++		idle = any ? 0 : idle + 1;
++		g_sleep_ms(idle > 8 ? 4 : 1);
++	}
++}
++
++void
++sweet_glink_init(void)
++{
++	thread_t t;
++	if (kernel_thread_start(glink_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
 +}
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
