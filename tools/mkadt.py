@@ -343,7 +343,13 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, kirin=False, boot_
         # cannot draw into: the dock / App Library backgrounds stayed white.
         product_props = [(k, cstr('sRGB') if k in ('artwork-display-gamut', 'display-gamut') else v)
                          for k, v in product_props]
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    # /product/haptics as in the iPhone X's own device tree (HackiOS's identity
+    # copies it too): closed-loop (MobileGestalt DeviceSupportsClosedLoopHaptics)
+    # makes iOS play its vibrations and feedbacks as waveforms on the audio
+    # plug-in's "Actuator" device (tools/sweetaudio -> /dev/sweet-haptic);
+    # without it iOS looks for an old vibration motor in IOKit and plays nothing.
+    haptics = [node('haptics', [ph(), ('closed-loop', u32(1)), ('supports-3rd-party-haptics', u32(1))])] if kirin else []
+    product = [node('product', [ph()] + product_props, haptics)] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product

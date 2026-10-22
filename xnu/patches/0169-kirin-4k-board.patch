@@ -1344,7 +1344,7 @@ index a9ad4f2..0b0f2a5 100644
  void
  sweet_touch_init(void)
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index b8c6bc7..17f436d 100644
+index b8c6bc7..7dc03da 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -17,6 +17,9 @@
@@ -1652,15 +1652,105 @@ index b8c6bc7..17f436d 100644
  static int
  ufs_find_partition(const char *want)
  {
-@@ -355,6 +624,7 @@ ufs_find_partition(const char *want)
+@@ -355,6 +624,97 @@ ufs_find_partition(const char *want)
  	return ENOENT;
  }
  
++#if defined(SWEET_KIRIN)
++/*
++ * Read-only access to another GPT partition (bsd/dev/sweet_usb.c's
++ * sweetdump: the firmware partitions, for the DSPs). The GPT is read again
++ * each time; su.first_block/nblocks (the root partition) are not touched.
++ * Reads count blocks at block off of the partition into out, at most
++ * BOUNCE_SIZE bytes; *total gets the partition's size in blocks.
++ */
++int sweet_emmc_read_partition(const char *want, uint64_t off, uint32_t count, void *out, uint64_t *total);
++int
++sweet_emmc_read_partition(const char *want, uint64_t off, uint32_t count, void *out, uint64_t *total)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint64_t first = 0, last = 0;
++	bool found = false;
++	if (su.dma == 0 || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	int error = ufs_read_blocks(1, 1);
++	uint64_t entry_lba = 0;
++	uint32_t nent = 0, esz = 0;
++	if (!error && memcmp(b, "EFI PART", 8) == 0) {
++		memcpy(&entry_lba, b + 72, 8);
++		memcpy(&nent, b + 80, 4);
++		memcpy(&esz, b + 84, 4);
++		error = esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE ? ENXIO :
++		    ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	} else if (!error) {
++		error = ENXIO;
++	}
++	for (uint32_t i = 0; !error && i < nent && !found; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) == 0) {
++			memcpy(&first, e + 32, 8);
++			memcpy(&last, e + 40, 8);
++			found = last >= first;
++		}
++	}
++	if (!error && !found) {
++		error = ENOENT;
++		static bool listed;
++		for (uint32_t i = 0; !listed && i < nent; i++) {
++			const uint8_t *e = b + i * esz;
++			char name[37];
++			unsigned c;
++			for (c = 0; c < 36; c++) {
++				uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++				if (ch == 0 || ch > 0x7f) {
++					break;
++				}
++				name[c] = (char)ch;
++			}
++			name[c] = 0;
++			if (name[0]) {
++				uint64_t f0, l0;
++				memcpy(&f0, e + 32, 8);
++				memcpy(&l0, e + 40, 8);
++				printf("SWEET UFS: GPT %u \"%s\" %llu MB\n", i, name, (l0 - f0 + 1) * UFS_BLOCK >> 20);
++			}
++		}
++		listed = true;
++	}
++	if (!error) {
++		*total = last - first + 1;
++		if (off >= *total) {
++			error = EINVAL;
++		} else {
++			count = (uint32_t)MIN((uint64_t)count, *total - off);
++			error = ufs_read_blocks(first + off, count);
++			if (!error) {
++				memcpy(out, b, (size_t)count * UFS_BLOCK);
++			}
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++#endif
++
 +#if !defined(SWEET_KIRIN)
  static int
  ufs_take_over_host(void)
  {
-@@ -388,6 +658,50 @@ ufs_take_over_host(void)
+@@ -388,6 +748,50 @@ ufs_take_over_host(void)
  	}
  	return 0;
  }
@@ -1711,7 +1801,7 @@ index b8c6bc7..17f436d 100644
  
  static int
  sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
-@@ -594,10 +908,15 @@ sweet_ufs_init(void)
+@@ -594,10 +998,15 @@ sweet_ufs_init(void)
  	char want[64] = "userdata";
  	int error;
  
@@ -1729,7 +1819,7 @@ index b8c6bc7..17f436d 100644
  		return ENXIO;
  	}
  	PE_parse_boot_argn("ufsroot", want, sizeof(want));
-@@ -625,12 +944,14 @@ sweet_ufs_init(void)
+@@ -625,12 +1034,14 @@ sweet_ufs_init(void)
  
  	lck_mtx_lock(&sweet_ufs_lock);
  	error = ufs_take_over_host();
@@ -1744,7 +1834,7 @@ index b8c6bc7..17f436d 100644
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
-@@ -660,6 +981,12 @@ sweet_ufs_init(void)
+@@ -660,6 +1071,12 @@ sweet_ufs_init(void)
  	sweet_sample_start();
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
  	sweet_keys_init();
@@ -1758,7 +1848,7 @@ index b8c6bc7..17f436d 100644
  	sweet_usb_probe();
  	sweet_perf_init();
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index 9c42e45..1a3b8bf 100644
+index 9c42e45..13dcabe 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -33,6 +33,21 @@
@@ -1925,6 +2015,106 @@ index 9c42e45..1a3b8bf 100644
  	}
  }
  
+@@ -812,6 +863,87 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ }
+ 
++#if defined(SWEET_KIRIN)
++/*
++ * Boot-arg sweetdump=NAME: the GPT partition NAME of the eMMC (read only,
++ * sweet_emmc_read_partition) sent to 192.168.7.1:5141 once the USB link
++ * works, for the DSP firmware it holds (tools/sweet-dump-recv.py on the PC
++ * puts it back together). Datagram: 'SWDP', u32 pass, u64 byte offset, then
++ * 1024 bytes; a last one at offset ~0 carries the size. Two passes, paced
++ * (the TX queue holds 32 frames), so a lost datagram is filled by the next.
++ */
++extern int sweet_emmc_read_partition(const char *want, uint64_t off, uint32_t count, void *out, uint64_t *total);
++
++static void
++ud_dump_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static char name[40];
++	static uint8_t chunk[64 << 10];
++	static uint8_t dgram[16 + 1024];
++	socket_t so = NULL;
++	struct sockaddr_in to;
++	if (!PE_parse_boot_argn("sweetdump", name, sizeof(name)) || name[0] == 0) {
++		return;
++	}
++	bzero(&to, sizeof(to));
++	to.sin_len = sizeof(to);
++	to.sin_family = AF_INET;
++	to.sin_port = htons(5141);
++	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
++	while (!ud.configured || sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
++		so = NULL;
++		ud_sleep_ms(500);
++	}
++	ud_sleep_ms(20000);     /* let DHCP, ARP and the boot settle */
++	uint64_t total = 0;
++	for (uint32_t pass = 0; pass < 2; pass++) {
++		uint64_t blk = 0;
++		int err = 0;
++		do {
++			uint32_t want = sizeof(chunk) / 512;
++			err = sweet_emmc_read_partition(name, blk, want, chunk, &total);
++			if (err) {
++				break;
++			}
++			uint32_t got = (uint32_t)MIN((uint64_t)want, total - blk);
++			for (uint32_t o = 0; o < got * 512; o += 1024) {
++				uint64_t off = blk * 512 + o;
++				memcpy(dgram, "SWDP", 4);
++				memcpy(dgram + 4, &pass, 4);
++				memcpy(dgram + 8, &off, 8);
++				memcpy(dgram + 16, chunk + o, 1024);
++				struct iovec iov = { .iov_base = dgram, .iov_len = sizeof(dgram) };
++				struct msghdr msg = { .msg_name = &to, .msg_namelen = sizeof(to), .msg_iov = &iov, .msg_iovlen = 1 };
++				size_t sent = 0;
++				for (int t = 0; t < 50 && sock_send(so, &msg, 0, &sent) != 0; t++) {
++					ud_sleep_ms(2);
++				}
++				if ((o / 1024) % 16 == 15) {
++					ud_sleep_ms(1);
++				}
++			}
++			blk += got;
++		} while (blk < total);
++		printf("SWEET DUMP: %s pass %u: %llu bytes sent (error %d)\n", name, pass, total * 512, err);
++		if (err) {
++			break;
++		}
++	}
++	uint64_t end = ~0ull, size = total * 512;
++	memcpy(dgram, "SWDP", 4);
++	memcpy(dgram + 8, &end, 8);
++	memcpy(dgram + 16, &size, 8);
++	struct iovec iov = { .iov_base = dgram, .iov_len = 24 };
++	struct msghdr msg = { .msg_name = &to, .msg_namelen = sizeof(to), .msg_iov = &iov, .msg_iovlen = 1 };
++	size_t sent = 0;
++	for (int i = 0; i < 5; i++) {
++		(void)sock_send(so, &msg, 0, &sent);
++		ud_sleep_ms(100);
++	}
++	sock_close(so);
++}
++#endif
++
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+@@ -886,6 +1018,11 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++#if defined(SWEET_KIRIN)
++	if (ud.ifp != NULL && kernel_thread_start(ud_dump_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++#endif
+ 	int livelog = 1;
+ 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
 index bb2a2bf..878fb4c 100644
 --- a/bsd/kern/bsd_init.c
