@@ -1401,10 +1401,60 @@ index 9c42e45..2d920c9 100644
  
  static void
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index bb2a2bf..df660a8 100644
+index bb2a2bf..1b1b406 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -490,9 +490,16 @@ bsd_init(void)
+@@ -324,6 +324,49 @@ static void process_name(const char *, proc_t);
+ 
+ static void setconf(void);
+ 
++#if defined(SWEET_KIRIN)
++#include <pexpert/device_tree.h>
++extern vm_map_address_t phystokv(uint64_t pa);
++/*
++ * Files carried in the boot payload (mkpayload --blob FILE:/path=local),
++ * written to the root volume before launchd starts: user-space pieces such
++ * as /usr/lib/sweetgl.dylib update with a `fastboot boot`, without
++ * rewriting the whole iOS image. Each /chosen/memory-map property named
++ * FILE:<absolute path> is {pa, length}; the file is created or truncated
++ * (mode 0755) and written. Failures are logged and skipped.
++ */
++static void
++sweet_file_drop(void)
++{
++	DTEntry mm;
++	OpaqueDTPropertyIterator it;
++	char const *name;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
++	    SecureDTInitPropertyIterator(mm, &it) != kSuccess) {
++		return;
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	while (SecureDTIterateProperties(&it, &name) == kSuccess) {
++		uint64_t const *v;
++		unsigned int size;
++		if (strncmp(name, "FILE:/", 6) != 0 ||
++		    SecureDTGetProperty(mm, name, (void const **)&v, &size) != kSuccess || size != 16) {
++			continue;
++		}
++		const char *path = name + 5;
++		vnode_t vp = NULLVP;
++		int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, 0755, 0, &vp, ctx);
++		if (err == 0) {
++			err = vn_rdwr(UIO_WRITE, vp, (caddr_t)phystokv(v[0]), (int)v[1], 0, UIO_SYSSPACE,
++			    IO_NOAUTH | IO_SYNC, vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx));
++			int cerr = vnode_close(vp, FWRITE, ctx);
++			err = err ? err : cerr;
++		}
++		printf("SWEET FILE: %s (%llu bytes) %s (error %d)\n", path, v[1], err ? "NOT written" : "written", err);
++	}
++}
++#endif
++
+ #if CONFIG_BASESYSTEMROOT
+ static int bsd_find_basesystem_dmg(char *bsdmgpath_out, bool *rooted_dmg, bool *skip_signature_check);
+ static boolean_t bsdmgroot_bootable(void);
+@@ -490,9 +533,16 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -1422,6 +1472,16 @@ index bb2a2bf..df660a8 100644
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
  #else
  #define bsd_init_kprintf(x, ...)
+@@ -1098,6 +1148,9 @@ bsdinit_task(void)
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++#if defined(SWEET_KIRIN)
++	sweet_file_drop();
++#endif
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
 index bec47e0..4f6eecb 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
