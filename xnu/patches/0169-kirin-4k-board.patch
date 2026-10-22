@@ -1848,7 +1848,7 @@ index b8c6bc7..7dc03da 100644
  	sweet_usb_probe();
  	sweet_perf_init();
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index 9c42e45..addd25f 100644
+index 9c42e45..a0860a4 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -33,6 +33,21 @@
@@ -2015,7 +2015,7 @@ index 9c42e45..addd25f 100644
  	}
  }
  
-@@ -812,6 +863,89 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -812,6 +863,95 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
  	}
  }
  
@@ -2051,10 +2051,15 @@ index 9c42e45..addd25f 100644
 +		so = NULL;
 +		ud_sleep_ms(500);
 +	}
-+	ud_sleep_ms(20000);     /* let DHCP, ARP and the boot settle */
++	/* sweetdump_from/sweetdump_kb (KB): only that part; sweetdump_delay (s, default 20) */
++	uint32_t from_kb = 0, len_kb = 0, delay_s = 20;
++	(void)PE_parse_boot_argn("sweetdump_from", &from_kb, sizeof(from_kb));
++	(void)PE_parse_boot_argn("sweetdump_kb", &len_kb, sizeof(len_kb));
++	(void)PE_parse_boot_argn("sweetdump_delay", &delay_s, sizeof(delay_s));
++	ud_sleep_ms(delay_s * 1000);    /* let DHCP, ARP and the boot settle */
 +	uint64_t total = 0;
 +	for (uint32_t pass = 0; pass < 3; pass++) {
-+		uint64_t blk = 0;
++		uint64_t blk = (uint64_t)from_kb * 2;
 +		int err = 0;
 +		do {
 +			uint32_t want = sizeof(chunk) / 512;
@@ -2062,7 +2067,8 @@ index 9c42e45..addd25f 100644
 +			if (err) {
 +				break;
 +			}
-+			uint32_t got = (uint32_t)MIN((uint64_t)want, total - blk);
++			uint64_t stop = len_kb ? MIN(total, (uint64_t)(from_kb + len_kb) * 2) : total;
++			uint32_t got = (uint32_t)MIN((uint64_t)want, stop - blk);
 +			for (uint32_t o = 0; o < got * 512; o += 1024) {
 +				uint64_t off = blk * 512 + o;
 +				memcpy(dgram, "SWDP", 4);
@@ -2081,7 +2087,7 @@ index 9c42e45..addd25f 100644
 +				}
 +			}
 +			blk += got;
-+		} while (blk < total);
++		} while (blk < (len_kb ? MIN(total, (uint64_t)(from_kb + len_kb) * 2) : total));
 +		printf("SWEET DUMP: %s pass %u: %llu bytes sent (error %d)\n", name, pass, total * 512, err);
 +		if (err) {
 +			break;
@@ -2105,7 +2111,7 @@ index 9c42e45..addd25f 100644
  static void
  sweet_usb_gadget_start(vm_offset_t dwc)
  {
-@@ -886,6 +1020,11 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -886,6 +1026,11 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
  		thread_deallocate(thread);
  	}
