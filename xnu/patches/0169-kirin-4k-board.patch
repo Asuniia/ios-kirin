@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index a8c7bde..7ef174a 100644
+index a8c7bde..1c6ada8 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -2224,6 +2224,64 @@ gpu_thread(void *arg, wait_result_t result)
+@@ -2224,6 +2224,146 @@ gpu_thread(void *arg, wait_result_t result)
  	}
  }
  
@@ -22,10 +22,89 @@ index a8c7bde..7ef174a 100644
 + *              VBIF_VERSION 0x3000 (a5xx.xml dwords)
 + * GPU CC and the LDO only when gpu_cfg_ahb runs. Nothing is written.
 + */
++/*
++ * Step 2 (sweetgpu=2): power-up, in Linux's order, at a low clock.
++ *   GFX LDO    the bootloader leaves it in BHS mode (power source BHS, BHS
++ *              under GDSC control): the GPU runs from the CX rail, which the
++ *              RPM keeps up. As msm_gfx_ldo probe: clear CLAMP_IO (bit 31),
++ *              set EN_LDOAP_CTRL_CPR (bit 29) of PWRSWITCH_CTRL 0x1c.
++ *   gpu_cx     GDSCR SW_COLLAPSE (bit 0) off, wait PWR_ON (bit 31)
++ *   clocks     GCC: GPLL0 for the GPU (vote bits 4, 3) and bimc_gfx;
++ *              gfx3d RCG = GPLL0 (source 5) / 4 = 150 MHz (cfg hid 7),
++ *              root forced on (CMD bit 1) as the GX GDSC needs its root clock
++ *   gpu_gx     GDSCR SW_COLLAPSE off, wait PWR_ON
++ *   branches   gfx3d, rbbmtimer (XO); then RBBM and VBIF are read.
++ * Any step that does not complete stops here, before the GPU is touched.
++ */
++static bool
++kirin_wait_bit(vm_offset_t b, uint32_t off, uint32_t bit, bool set)
++{
++	for (int i = 0; i < 1000; i++) {
++		if (!!(*(volatile uint32_t *)(b + off) & bit) == set) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static void
++kirin_gpu_power_up(vm_offset_t g71, vm_offset_t g52, vm_offset_t cc, vm_offset_t ldo)
++{
++#define RD(b, o) (*(volatile uint32_t *)((b) + (o)))
++#define WR(b, o, v) do { *(volatile uint32_t *)((b) + (o)) = (v); __builtin_arm_dsb(0xf); } while (0)
++	WR(ldo, 0x1c, (RD(ldo, 0x1c) & ~(1u << 31)) | (1u << 29));
++	printf("SWEET GPU: ldo ctl %#x status %#x %#x\n", RD(ldo, 0x1c), RD(ldo, 0x24), RD(ldo, 0x28));
++
++	WR(cc, 0x1004, RD(cc, 0x1004) & ~1u);
++	if (!kirin_wait_bit(cc, 0x1004, 1u << 31, true)) {
++		printf("SWEET GPU: gpu_cx GDSC did not power on (%#x)\n", RD(cc, 0x1004));
++		return;
++	}
++	printf("SWEET GPU: gpu_cx on (%#x)\n", RD(cc, 0x1004));
++
++	WR(g52, 0x00c, RD(g52, 0x00c) | 0x18);
++	WR(g71, 0x06c, RD(g71, 0x06c) | 1u);
++	(void)kirin_wait_bit(g71, 0x06c, 1u << 31, false);
++	WR(cc, 0x1074, (5u << 8) | 7u);
++	WR(cc, 0x1070, RD(cc, 0x1070) | 2u | 1u);
++	if (!kirin_wait_bit(cc, 0x1070, 1u, false)) {
++		printf("SWEET GPU: gfx3d RCG update stuck (cmd %#x cfg %#x)\n", RD(cc, 0x1070), RD(cc, 0x1074));
++		return;
++	}
++	printf("SWEET GPU: gfx3d RCG cmd %#x cfg %#x, gpll0 vote %#x bimc_gfx %#x\n",
++	    RD(cc, 0x1070), RD(cc, 0x1074), RD(g52, 0x00c), RD(g71, 0x06c));
++
++	WR(cc, 0x1094, RD(cc, 0x1094) & ~1u);
++	if (!kirin_wait_bit(cc, 0x1094, 1u << 31, true)) {
++		printf("SWEET GPU: gpu_gx GDSC did not power on (%#x), ldo %#x %#x\n",
++		    RD(cc, 0x1094), RD(ldo, 0x24), RD(ldo, 0x28));
++		return;
++	}
++	printf("SWEET GPU: gpu_gx on (%#x), ldo status %#x %#x\n", RD(cc, 0x1094), RD(ldo, 0x24), RD(ldo, 0x28));
++
++	WR(cc, 0x1098, RD(cc, 0x1098) | 1u);
++	WR(cc, 0x10d0, RD(cc, 0x10d0) | 1u);
++	bool gfx = kirin_wait_bit(cc, 0x1098, 1u << 31, false);
++	bool tmr = kirin_wait_bit(cc, 0x10d0, 1u << 31, false);
++	printf("SWEET GPU: gfx3d branch %#x (%s) rbbmtimer %#x (%s)\n", RD(cc, 0x1098), gfx ? "on" : "OFF",
++	    RD(cc, 0x10d0), tmr ? "on" : "OFF");
++	if (!gfx) {
++		return;
++	}
++	vm_offset_t gpu = ml_io_map(0x05000000u, 0x10000);
++	if (gpu != 0) {
++		printf("SWEET GPU: powered: RBBM_STATUS %#x VBIF_VERSION %#x RBBM_INT_0_STATUS %#x\n",
++		    RD(gpu, 0x4f5 * 4), RD(gpu, 0x3000 * 4), RD(gpu, 0x4e1 * 4));
++	}
++#undef WR
++#undef RD
++}
++
 +static void
 +kirin_gpu_probe(void *arg, wait_result_t wr)
 +{
-+	(void)arg;
++	int level = (int)(uintptr_t)arg;
 +	(void)wr;
 +	vm_offset_t g71 = ml_io_map(0x00171000u, 0x1000), g52 = ml_io_map(0x00152000u, 0x1000);
 +	vm_offset_t cc = ml_io_map(0x05065000u, 0x2000), ldo = ml_io_map(0x0506e000u, 0x1000);
@@ -54,6 +133,9 @@ index a8c7bde..7ef174a 100644
 +	bool on = (cx & (1u << 31)) && !(ahb & (1u << 31)) && !(gfx & (1u << 31));
 +	if (!on) {
 +		printf("SWEET GPU: GPU core off or unclocked; not read\n");
++		if (level >= 2) {
++			kirin_gpu_power_up(g71, g52, cc, ldo);
++		}
 +		return;
 +	}
 +	vm_offset_t gpu = ml_io_map(0x05000000u, 0x10000);
@@ -67,13 +149,13 @@ index a8c7bde..7ef174a 100644
  void
  sweet_gpu_init(void)
  {
-@@ -2232,6 +2290,13 @@ sweet_gpu_init(void)
+@@ -2232,6 +2372,13 @@ sweet_gpu_init(void)
  	if (!PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) || on == 0) {
  		return;
  	}
 +#if defined(SWEET_KIRIN)
 +	/* The MSM8996 code below has other addresses: probe only. */
-+	if (kernel_thread_start(kirin_gpu_probe, NULL, &thread) == KERN_SUCCESS) {
++	if (kernel_thread_start(kirin_gpu_probe, (void *)(uintptr_t)on, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	}
 +	return;
