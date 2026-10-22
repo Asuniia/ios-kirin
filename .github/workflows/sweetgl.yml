@@ -11,7 +11,6 @@ on:
   push:
     paths:
       - 'tools/sweetgl/**'
-      - 'tools/sweetaudio/**'
       - '.github/workflows/sweetgl.yml'
 
 jobs:
@@ -34,7 +33,19 @@ jobs:
           ln -s "$(brew --prefix bison)/bin/bison" research/tools/bin/bison
           ln -s "$(brew --prefix flex)/bin/flex" research/tools/bin/flex
 
+      # Mesa itself only changes with its patches and its configuration: a
+      # change to sweetgl's own files then only recompiles those.
+      - name: Mesa build cache
+        id: mesa-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            research/mesa
+            research/mesa-ios
+          key: mesa-26.2.5-${{ hashFiles('tools/sweetgl/mesa.patch', 'tools/sweetgl/mesa-kirin.patch', 'tools/sweetgl/mesa-setup.sh', 'tools/sweetgl/ios-cross.txt') }}
+
       - name: Mesa 26.2.5 + mesa.patch
+        if: steps.mesa-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch mesa-26.2.5 https://gitlab.freedesktop.org/mesa/mesa.git research/mesa
           git -C research/mesa apply "$GITHUB_WORKSPACE/tools/sweetgl/mesa.patch"
@@ -42,26 +53,16 @@ jobs:
           sed -i '' "s|/Volumes/SamsungSSD/ios-sailfish|$GITHUB_WORKSPACE|g" tools/sweetgl/ios-cross.txt
           cat tools/sweetgl/ios-cross.txt
 
+      - name: Cross file for this runner
+        if: steps.mesa-cache.outputs.cache-hit == 'true'
+        run: sed -i '' "s|/Volumes/SamsungSSD/ios-sailfish|$GITHUB_WORKSPACE|g" tools/sweetgl/ios-cross.txt
+
       - name: Configure Mesa
+        if: steps.mesa-cache.outputs.cache-hit != 'true'
         run: sh tools/sweetgl/mesa-setup.sh
 
       - name: Build sweetgl.dylib
         run: sh tools/sweetgl/build.sh
-
-      - name: Build SweetAudio.driver (tools/sweetaudio)
-        run: |
-          cd tools/sweetaudio
-          DEVELOPER_DIR=$GITHUB_WORKSPACE/research/xcode15/Xcode.app/Contents/Developer \
-            xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall \
-            -bundle -framework CoreFoundation -o SweetAudio sweetaudio.c
-          codesign -f -s - SweetAudio
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sweetaudio
-          path: |
-            tools/sweetaudio/SweetAudio
-            tools/sweetaudio/Info.plist
 
       - uses: actions/upload-artifact@v4
         with:
