@@ -1,0 +1,54 @@
+name: sweetgl
+
+# sweetgl.dylib (Mesa freedreno + GLES + the EAGL shim, tools/sweetgl) for
+# iOS 16 arm64. Mesa 26.2.5 is the version tools/sweetgl/mesa.patch was made
+# against (freedreno_bo.c blob 6eda810). The scripts expect Xcode under
+# research/xcode15 and absolute paths in ios-cross.txt: both are pointed at
+# this runner here.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/sweetgl/**'
+      - '.github/workflows/sweetgl.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          brew install ninja bison flex
+          python3 -m venv research/tools/venv
+          research/tools/venv/bin/pip install meson mako pyyaml packaging
+          XC=$(ls -d /Applications/Xcode_15.4*.app | head -1)
+          echo "Xcode: $XC"
+          mkdir -p research/xcode15
+          ln -s "$XC" research/xcode15/Xcode.app
+          ls research/xcode15/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/
+          mkdir -p research/tools/bin
+          ln -s "$(brew --prefix bison)/bin/bison" research/tools/bin/bison
+          ln -s "$(brew --prefix flex)/bin/flex" research/tools/bin/flex
+
+      - name: Mesa 26.2.5 + mesa.patch
+        run: |
+          git clone --depth 1 --branch mesa-26.2.5 https://gitlab.freedesktop.org/mesa/mesa.git research/mesa
+          git -C research/mesa apply "$GITHUB_WORKSPACE/tools/sweetgl/mesa.patch"
+          sed -i '' "s|/Volumes/SamsungSSD/ios-sailfish|$GITHUB_WORKSPACE|g" tools/sweetgl/ios-cross.txt
+          cat tools/sweetgl/ios-cross.txt
+
+      - name: Configure Mesa
+        run: sh tools/sweetgl/mesa-setup.sh
+
+      - name: Build sweetgl.dylib
+        run: sh tools/sweetgl/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetgl
+          path: |
+            tools/sweetgl/out/sweetgl-unpadded.dylib
+            tools/sweetgl/out/dispatch.c
