@@ -637,6 +637,28 @@ index 93d6318..3fc5bce 100644
  	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
  		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
  	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 26b4001..290c611 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -366,7 +366,17 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
++#if defined(SWEET_KIRIN)
++	/*
++	 * kirin's 1080x2520 panel is taller than the iPhone X: still present
++	 * 1125x2436 (no iPhone has 1080x2520, backboardd then waits forever for
++	 * AppleM2ScalerCSCDriver). 22 columns are cut on each side and the
++	 * picture sits 42 rows down (fOffY < 0), as the swap code already allows.
++	 */
++	if (!native && !fScaled && fWidth <= SWEET_FB_LOGICAL_W) {
++#else
+ 	if (!native && !fScaled && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++#endif
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 index 0631685..5b40f66 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
@@ -686,6 +708,65 @@ index 0631685..5b40f66 100644
  	return true;
  }
  
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index defe307..3f9f3da 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -357,7 +357,11 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
+ #define SWEET_TOUCH_PANEL_W 1080
++#if defined(SWEET_KIRIN)
++#define SWEET_TOUCH_PANEL_H 2520
++#else
+ #define SWEET_TOUCH_PANEL_H 1920
++#endif
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -439,14 +443,32 @@ SweetHIDTouch::start(IOService *provider)
+ 	 * whole presented 750x1334 display scaled (SweetFramebuffer.cpp), so
+ 	 * normalized panel coordinates are display coordinates.
+ 	 */
++#if defined(SWEET_KIRIN)
++	/*
++	 * kirin: the 1080x2520 panel shows the presented 1125x2436 display with
++	 * 22 columns cut on each side and 42 black rows above and below
++	 * (SweetFramebuffer.cpp): panel pixel + (22, -42) = display pixel.
++	 */
++	fLogicalW = 1125;
++	fLogicalH = 2436;
++	fOffX = 22;
++	fOffY = -42;
++#else
+ 	fLogicalW = SWEET_TOUCH_PANEL_W;
+ 	fLogicalH = SWEET_TOUCH_PANEL_H;
+ 	fOffX = 0;
+ 	fOffY = 0;
++#endif
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
++#if defined(SWEET_KIRIN)
++	/* Xperia 10: 65 x 151 mm panel, the presented part of it (mm, 16.16) */
++	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);
++	setProperty("SurfaceHeight", (unsigned long long)(146 << 16), 32);
++#else
+ 	setProperty("SurfaceWidth", (unsigned long long)(62 << 16), 32);	/* mm, 16.16 */
+ 	setProperty("SurfaceHeight", (unsigned long long)(111 << 16), 32);
++#endif
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
+@@ -471,6 +493,9 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	/* Panel pixels -> normalized display coordinates. */
+ 	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+ 	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	/* kirin: touches on the black bands land on the display's edge */
++	nx = nx < 0 ? 0 : (nx > 0xffff ? 0xffff : nx);
++	ny = ny < 0 ? 0 : (ny > 0xffff ? 0xffff : ny);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
 index a8809d1..ea4c75a 100644
 --- a/makedefs/MakeInc.def
