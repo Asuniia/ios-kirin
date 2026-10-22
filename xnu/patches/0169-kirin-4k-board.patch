@@ -711,10 +711,10 @@ index 0c548d1..78b1a46 100644
  		printf("SWEET KEYS: power key unreadable; volume keys only\n");
  		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
-index a0a9ae1..11f3801 100644
+index a0a9ae1..2a8d40c 100644
 --- a/bsd/dev/sweet_perf.c
 +++ b/bsd/dev/sweet_perf.c
-@@ -563,6 +563,127 @@ fastboot_thread(void *arg, wait_result_t result)
+@@ -563,6 +563,200 @@ fastboot_thread(void *arg, wait_result_t result)
  	printf("SWEET FASTBOOT: still running after PS_HOLD\n");
  }
  
@@ -726,6 +726,75 @@ index a0a9ae1..11f3801 100644
 + * L x 19.2 MHz), the cluster muxes (apcs cmd/cfg rcgr 0x17911050/54,
 + * 0x17811050/54), the OSM block (0x179c0000) and each CPU's measured clock.
 + */
++static unsigned kirin_rail_mv[3];      /* PM660 S1-S3 (CPU rails) as read by the probe, 0 if unknown */
++
++/*
++ * Little cluster (pwrcl, CPUs 4-7) off GPLL0: the bootloader leaves its
++ * mux on GPLL0 (cfg 0x401, GPLL_SEL: 600 MHz) with the cluster PLL
++ * running unused at L 32. The PLL is set up for L (Linux
++ * clk_osm_setup_cluster_pll: MODE 0, L, MODE 2, lock wait, MODE 6, MODE 7)
++ * and the mux moved to its early output (cfg 0x501, PLL_EARLY_SEL, as the
++ * big cluster's), with CMD_RCGR update. Only at 1094.4 MHz (L 57), the
++ * pwrcl corner 4 of the DT OSM table whose CPR ceiling is 790 mV, and only
++ * if the three CPU rails read at least 800 mV: no voltage is changed.
++ * Boot-arg sweetpwrcl=0 leaves the cluster on GPLL0.
++ */
++static void
++kirin_pwrcl_raise(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("sweetpwrcl", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	for (unsigned n = 0; n < 3; n++) {
++		if (kirin_rail_mv[n] < 800) {
++			printf("SWEET CLK: pwrcl stays on GPLL0 (rail s%u %u mV)\n", n + 1, kirin_rail_mv[n]);
++			return;
++		}
++	}
++	vm_offset_t pll = ml_io_map(0x17916000u, 0x1000), rcg = ml_io_map(0x17911000u, 0x1000);
++	if (pll == 0 || rcg == 0) {
++		return;
++	}
++	uint32_t cfg = clk_rd(rcg, 0x54);
++	if ((cfg & 0x700) != 0x400) {
++		printf("SWEET CLK: pwrcl mux cfg %#x is not GPLL0, left alone\n", cfg);
++		return;
++	}
++	const uint32_t l = 57;  /* 57 x 19.2 = 1094.4 MHz */
++	clk_wr(pll, 0x00, 0x0);
++	clk_wr(pll, 0x04, l);
++	clk_wr(pll, 0x00, 0x2);
++	delay(50);
++	clk_wr(pll, 0x00, 0x6);
++	delay(75);
++	clk_wr(pll, 0x00, 0x7);
++	bool locked = false;
++	for (int i = 0; i < 100 && !locked; i++) {
++		locked = (clk_rd(pll, 0x2c) & (1u << 16)) != 0;   /* PLL_STATUS lock detect */
++		if (!locked) {
++			delay(10);
++		}
++	}
++	if (!locked) {
++		printf("SWEET CLK: pwrcl PLL did not lock at L %u (mode %#x status %#x), stays on GPLL0\n", l,
++		    clk_rd(pll, 0x00), clk_rd(pll, 0x2c));
++		return;
++	}
++	clk_wr(rcg, 0x54, (cfg & ~0x7ffu) | 0x501);
++	clk_wr(rcg, 0x50, clk_rd(rcg, 0x50) | 1u);
++	bool upd = false;
++	for (int i = 0; i < 100 && !upd; i++) {
++		upd = (clk_rd(rcg, 0x50) & 1u) == 0;
++		if (!upd) {
++			delay(10);
++		}
++	}
++	printf("SWEET CLK: pwrcl -> PLL L %u (%u MHz): mode %#x cfg %#x cmd %#x%s\n", l, l * 192 / 10,
++	    clk_rd(pll, 0x00), clk_rd(rcg, 0x54), clk_rd(rcg, 0x50), upd ? "" : " (update stuck)");
++}
++
 +static void
 +kirin_clk_probe(void)
 +{
@@ -739,8 +808,8 @@ index a0a9ae1..11f3801 100644
 +			continue;
 +		}
 +		uint32_t mode = clk_rd(pll, 0x00), l = clk_rd(pll, 0x04), user = clk_rd(pll, 0x0c);
-+		printf("SWEET CLK: %s PLL mode %#x L %u (%u MHz) user %#x rcg cmd %#x cfg %#x\n",
-+		    cl[i].name, mode, l & 0xffu, (l & 0xffu) * 192u / 10u, user,
++		printf("SWEET CLK: %s PLL mode %#x status %#x L %u (%u MHz) user %#x rcg cmd %#x cfg %#x\n",
++		    cl[i].name, mode, clk_rd(pll, 0x2c), l & 0xffu, (l & 0xffu) * 192u / 10u, user,
 +		    clk_rd(rcg, 0x50), clk_rd(rcg, 0x54));
 +	}
 +	/*
@@ -755,6 +824,9 @@ index a0a9ae1..11f3801 100644
 +		bool ok = sweet_pmic_read(ppid, 0x04, &t) && sweet_pmic_read(ppid, 0x05, &st) &&
 +		    sweet_pmic_read(ppid, 0x40, &lo) && sweet_pmic_read(ppid, 0x41, &hi) &&
 +		    sweet_pmic_read(ppid, 0x45, &mode) && sweet_pmic_read(ppid, 0x46, &en);
++		if (n < 3) {
++			kirin_rail_mv[n] = ok && (en & 0x80) ? ((unsigned)hi << 8 | lo) : 0;
++		}
 +		printf("SWEET CLK: pm660 s%u type %#x/%#x vctl %#x %#x (%u mV) mode %#x en %#x%s\n", n + 1,
 +		    t, st, lo, hi, (unsigned)hi << 8 | lo, mode, en, ok ? "" : " (read failed)");
 +	}
@@ -793,6 +865,7 @@ index a0a9ae1..11f3801 100644
 +		    clk_rd(osm, 0x0), clk_rd(osm, 0x4), clk_rd(osm, 0x1000), clk_rd(osm, 0x1004),
 +		    clk_rd(osm, 0x1100), clk_rd(osm, 0x3000));
 +	}
++	kirin_pwrcl_raise();
 +	for (int c = 0; c < (int)ml_get_cpu_count(); c++) {
 +		struct processor *p = cpu_to_processor(c);
 +		if (p == NULL) {
@@ -842,7 +915,7 @@ index a0a9ae1..11f3801 100644
  void
  sweet_perf_init(void)
  {
-@@ -577,6 +698,15 @@ sweet_perf_init(void)
+@@ -577,6 +771,15 @@ sweet_perf_init(void)
  	int enabled = 1;
  	thread_t thread;
  	(void)PE_parse_boot_argn("sweetperf", &enabled, sizeof(enabled));
