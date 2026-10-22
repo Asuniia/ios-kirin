@@ -1,8 +1,97 @@
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index a8c7bde..9251e55 100644
+index a8c7bde..a91f048 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -2224,6 +2224,159 @@ gpu_thread(void *arg, wait_result_t result)
+@@ -113,10 +113,22 @@ void sweet_gpu_init(void);
+ #define GPU_PA          0x00b00000u
+ #define MEMACC_PA       0x007af000u     /* gfx_mem_acc corner at +0x004 */
+ #define GFX_S2          0x317u
++#if defined(SWEET_KIRIN)
++/*
++ * SDM630: no fixed zap carveout (DT kgsl-hyp has no memory-region; Linux
++ * allocates it), so 1 MB of DRAM below the iOS range (which starts at
++ * 0x9f800000) and outside every DT reserved-memory node. GPU SMMU: DT
++ * kgsl-iommu at 0x5040000, gfx3d_user = stream 0, gfx3d_secure = 2 (as
++ * on MSM8996).
++ */
++#define ZAP_PA          0x95000000u
++#define SMMU_PA         0x05040000u
++#else
+ #define ZAP_PA          0x90f00000u     /* msm8996.dtsi gpu_mem, 1 MB */
++#define SMMU_PA         0x00b40000u
++#endif
+ #define ZAP_SIZE        0x00100000u
+ #define GPU_PAS_ID      13
+-#define SMMU_PA         0x00b40000u
+ 
+ /* a5xx.xml dword offsets */
+ #define R_CP_RB_BASE            0x0800
+@@ -1944,12 +1956,14 @@ cp_test(vm_offset_t gpu, int level)
+ 	 * a5xx_pm_resume (A530): power the RB/CCU and SP islands; without them
+ 	 * the CP hung on the first 2D blit (0126a, RBBM_STATUS c00001c3).
+ 	 */
++#if !defined(SWEET_KIRIN)        /* A508: no GPMU power islands (mainline a5xx_power_init) */
+ 	gw(gpu, R_GPMU_RBCCU_POWER_CNTL, 0x778000);
+ 	bool rbccu = poll(gpu, R_GPMU_RBCCU_PWR_CLK_STATUS * 4, 1u << 20, 1u << 20, 1);
+ 	gw(gpu, R_GPMU_SP_POWER_CNTL, 0x778000);
+ 	bool sp = poll(gpu, R_GPMU_SP_PWR_CLK_STATUS * 4, 1u << 20, 1u << 20, 1);
+ 	printf("SWEET GPU: RBCCU power %s (%08x), SP power %s (%08x)\n", rbccu ? "on" : "TIMEOUT",
+ 	    gr(gpu, R_GPMU_RBCCU_PWR_CLK_STATUS), sp ? "on" : "TIMEOUT", gr(gpu, R_GPMU_SP_PWR_CLK_STATUS));
++#endif
+ 
+ 	/* Subset of a5xx_hw_init (A530 values; HWCG, GPMU firmware, CP_PROTECT left out). */
+ 	gw(gpu, R_VBIF_RR_QOS_ARB, 3);
+@@ -1959,19 +1973,37 @@ cp_test(vm_offset_t gpu, int level)
+ 	gw64(gpu, R_UCHE_TRAP_BASE, 0x0001ffffffff0000ull);
+ 	gw64(gpu, R_UCHE_WRITE_THRU_BASE, 0x0001ffffffff0000ull);
+ 	gw64(gpu, R_UCHE_GMEM_RANGE_MIN, 0x00100000);
++#if defined(SWEET_KIRIN)
++	/* A508 values of mainline a5xx_hw_init; GMEM 136 KB (a5xx_catalog.c) */
++	gw64(gpu, R_UCHE_GMEM_RANGE_MAX, 0x00100000 + 0x22000 - 1);
++	gw(gpu, R_CP_MEQ_THRESHOLDS, 0x20);
++	gw(gpu, R_CP_MERCIU_SIZE, 0x400);
++	gw(gpu, R_CP_ROQ_THRESHOLDS_2, 0x40000030);
++	gw(gpu, R_CP_ROQ_THRESHOLDS_1, 0x20100d0a);
++	gw(gpu, R_PC_DBG_ECO_CNTL, (0x100u << 11) | (0x100u << 22));
++	gw(gpu, R_RB_DBG_ECO_CNTL, gr(gpu, R_RB_DBG_ECO_CNTL) | (1u << 9));    /* 1-SP GPU */
++#else
+ 	gw64(gpu, R_UCHE_GMEM_RANGE_MAX, 0x00100000 + 0x100000 - 1);   /* 1 MB GMEM */
+ 	gw(gpu, R_CP_MEQ_THRESHOLDS, 0x40);
+ 	gw(gpu, R_CP_MERCIU_SIZE, 0x40);
+ 	gw(gpu, R_CP_ROQ_THRESHOLDS_2, 0x80000060);
+ 	gw(gpu, R_CP_ROQ_THRESHOLDS_1, 0x40201b16);
+ 	gw(gpu, R_PC_DBG_ECO_CNTL, (0x400u << 11) | (0x300u << 22));
++#endif
+ 	gw(gpu, R_UCHE_MODE_CNTL, 1u << 29);
+ 	gw(gpu, R_CP_CHICKEN_DBG, 0x02000000);
+ 	gw(gpu, R_RBBM_AHB_CNTL1, 0xa6ffffff);
+ 	gw(gpu, R_RBBM_AHB_CNTL2, 0x3f);
++#if defined(SWEET_KIRIN)
++	gw(gpu, R_TPL1_MODE_CNTL, 1u << 7);     /* highest bank bit 14 (SDM630, ubwc_config.c) */
++	gw(gpu, R_RB_MODE_CNTL, 1u << 1);
++	gw(gpu, R_VPC_DBG_ECO_CNTL, gr(gpu, R_VPC_DBG_ECO_CNTL) | (1u << 10) | (1u << 23));
++	gw(gpu, 0x0e04 /* HLSQ_DBG_ECO_CNTL */, gr(gpu, 0x0e04) & ~(1u << 18));  /* LMLOADKILL_DISABLE quirk */
++#else
+ 	gw(gpu, R_TPL1_MODE_CNTL, 2u << 7);     /* highest bank bit 15 */
+ 	gw(gpu, R_RB_MODE_CNTL, 2u << 1);
+ 	gw(gpu, R_VPC_DBG_ECO_CNTL, gr(gpu, R_VPC_DBG_ECO_CNTL) | (1u << 10));
++#endif
+ 	gw(gpu, R_SECVID_TSB_CNTL, 0);
+ 	gw64(gpu, R_SECVID_TSB_BASE, 0);
+ 	gw(gpu, R_SECVID_TSB_SIZE, 0);
+@@ -2001,7 +2033,11 @@ cp_test(vm_offset_t gpu, int level)
+ 	emit(0x20000000);
+ 	emit(0);
+ 	emit(0);
++#if defined(SWEET_KIRIN)
++	emit(0);                /* A508: no microcode workaround */
++#else
+ 	emit(0xb);              /* A530 token-end-sync workaround */
++#endif
+ 	emit(0);
+ 	emit(0);
+ 	emit(pkt7(CP_MEM_WRITE, 3));
+@@ -2224,6 +2260,164 @@ gpu_thread(void *arg, wait_result_t result)
  	}
  }
  
@@ -52,7 +141,7 @@ index a8c7bde..9251e55 100644
 +	return false;
 +}
 +
-+static void
++static vm_offset_t
 +kirin_gpu_power_up(vm_offset_t g71, vm_offset_t g52, vm_offset_t cc, vm_offset_t ldo)
 +{
 +#define RD(b, o) (*(volatile uint32_t *)((b) + (o)))
@@ -63,7 +152,7 @@ index a8c7bde..9251e55 100644
 +	WR(cc, 0x1004, RD(cc, 0x1004) & ~1u);
 +	if (!kirin_wait_bit(cc, 0x1004, 1u << 31, true)) {
 +		printf("SWEET GPU: gpu_cx GDSC did not power on (%#x)\n", RD(cc, 0x1004));
-+		return;
++		return 0;
 +	}
 +	printf("SWEET GPU: gpu_cx on (%#x)\n", RD(cc, 0x1004));
 +
@@ -74,7 +163,7 @@ index a8c7bde..9251e55 100644
 +	WR(cc, 0x1070, RD(cc, 0x1070) | 2u | 1u);
 +	if (!kirin_wait_bit(cc, 0x1070, 1u, false)) {
 +		printf("SWEET GPU: gfx3d RCG update stuck (cmd %#x cfg %#x)\n", RD(cc, 0x1070), RD(cc, 0x1074));
-+		return;
++		return 0;
 +	}
 +	printf("SWEET GPU: gfx3d RCG cmd %#x cfg %#x, gpll0 vote %#x bimc_gfx %#x\n",
 +	    RD(cc, 0x1070), RD(cc, 0x1074), RD(g52, 0x00c), RD(g71, 0x06c));
@@ -92,7 +181,7 @@ index a8c7bde..9251e55 100644
 +	if (!kirin_wait_bit(cc, 0x1094, 1u << 31, true)) {
 +		printf("SWEET GPU: gpu_gx GDSC did not power on (%#x), ldo %#x %#x\n",
 +		    RD(cc, 0x1094), RD(ldo, 0x24), RD(ldo, 0x28));
-+		return;
++		return 0;
 +	}
 +	printf("SWEET GPU: gpu_gx on (%#x), ldo status %#x %#x\n", RD(cc, 0x1094), RD(ldo, 0x24), RD(ldo, 0x28));
 +
@@ -103,13 +192,14 @@ index a8c7bde..9251e55 100644
 +	printf("SWEET GPU: gfx3d branch %#x (%s) rbbmtimer %#x (%s)\n", RD(cc, 0x1098), gfx ? "on" : "OFF",
 +	    RD(cc, 0x10d0), tmr ? "on" : "OFF");
 +	if (!gfx) {
-+		return;
++		return 0;
 +	}
-+	vm_offset_t gpu = ml_io_map(0x05000000u, 0x10000);
++	vm_offset_t gpu = ml_io_map(0x05000000u, 0x40000);
 +	if (gpu != 0) {
 +		printf("SWEET GPU: powered: RBBM_STATUS %#x VBIF_VERSION %#x RBBM_INT_0_STATUS %#x\n",
 +		    RD(gpu, 0x4f5 * 4), RD(gpu, 0x3000 * 4), RD(gpu, 0x4e1 * 4));
 +	}
++	return gpu;
 +#undef WR
 +#undef RD
 +}
@@ -147,7 +237,11 @@ index a8c7bde..9251e55 100644
 +	if (!on) {
 +		printf("SWEET GPU: GPU core off or unclocked; not read\n");
 +		if (level >= 2) {
-+			kirin_gpu_power_up(g71, g52, cc, ldo);
++			vm_offset_t gpu = kirin_gpu_power_up(g71, g52, cc, ldo);
++			/* Step 3+ (sweetgpu=3..): the MSM8996 CP / zap / blit path with A508 values */
++			if (gpu != 0 && level >= 3) {
++				cp_test(gpu, level);
++			}
 +		}
 +		return;
 +	}
@@ -162,7 +256,7 @@ index a8c7bde..9251e55 100644
  void
  sweet_gpu_init(void)
  {
-@@ -2232,6 +2385,13 @@ sweet_gpu_init(void)
+@@ -2232,6 +2426,13 @@ sweet_gpu_init(void)
  	if (!PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) || on == 0) {
  		return;
  	}
