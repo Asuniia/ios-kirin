@@ -1960,7 +1960,7 @@ index 93d6318..3fc5bce 100644
  		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
  	}
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 26b4001..8be9e9d 100644
+index 26b4001..f419397 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -42,6 +42,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
@@ -2408,7 +2408,7 @@ index 26b4001..8be9e9d 100644
 +			zw = MIN(zw, MIN((int32_t)s->width - zsx, (int32_t)fWidth - zdx));
 +			zh = MIN(zh, MIN((int32_t)s->height - zsy, (int32_t)fHeight - zdy));
 +			if (zw > 0 && zh > 0) {
-+				flush_dcache64((addr64_t)(s->contigPa + s->offset), s->allocSize - s->offset, TRUE);
++				/* splash-region slot: outside the RAM, write-combined for users, nothing to clean */
 +				kirinScanout(s->contigPa + s->offset, s->bytesPerRow, zsx, zsy, zdx, zdy, zw, zh,
 +				    s->width, s->height);
 +				scanned = true;
@@ -2483,6 +2483,69 @@ index 26b4001..8be9e9d 100644
  	if (fGpu && !fGpuTest) {
  		static uint32_t flips;
  		if (flips++ < 3) {
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 93377c0..1f5ee70 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -54,6 +54,22 @@ extern "C" void proc_selfname(char *buf, int size);
+ #define SWEET_GPU_CLIENT_BYTES  (768ull << 20)     /* own buffers per client */
+ 
+ extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
++extern "C" boolean_t pmap_valid_page(ppnum_t pn);
++
++/*
++ * Clean+invalidate one page by physical address, RAM only: flush_dcache64
++ * reaches the page through the physical aperture, which has no mapping for
++ * memory outside the kernel's RAM (kirin's scan-out surfaces in the splash
++ * region; a GPU import of one panicked). That memory is mapped uncached or
++ * write-combined anyway.
++ */
++static void
++sweet_flush_page(uint64_t pa, unsigned len)
++{
++	if (pmap_valid_page((ppnum_t)atop_64(pa))) {
++		flush_dcache64((addr64_t)pa, len, TRUE);
++	}
++}
+ 
+ struct sweet_gpu_submit {
+ 	uint32_t nr_ibs, nr_bos;
+@@ -82,7 +98,7 @@ SweetGPU::start(IOService *provider)
+ 		IOByteCount seg = 0;
+ 		uint64_t pa = gFencePage->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
+ 		bzero(gFencePage->getBytesNoCopy(), page_size);
+-		flush_dcache64((addr64_t)pa, (unsigned)page_size, TRUE);
++		sweet_flush_page(pa, (unsigned)page_size);
+ 		sweet_gpu_set_fence_page((uintptr_t)gFencePage->getBytesNoCopy(), pa);
+ 	}
+ 	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
+@@ -356,7 +372,7 @@ SweetGPUUserClient::boNew(uint64_t size, uint64_t *out)
+ 		ok = pa[p] != 0 && (pa[p] & PAGE_MASK) == 0 && seg >= PAGE_SIZE;
+ 		if (ok) {
+ 			/* zeroed through the cached kernel alias: push it out, drop the lines */
+-			flush_dcache64((addr64_t)pa[p], PAGE_SIZE, TRUE);
++			sweet_flush_page(pa[p], PAGE_SIZE);
+ 		}
+ 	}
+ 	uint64_t gva = ok ? sweet_gpu_vm_map(pa, npages, false) : 0;
+@@ -449,7 +465,7 @@ SweetGPUUserClient::submit(const void *in, size_t len, uint64_t *seqOut)
+ 		/* CPU-cached: its CPU writes to memory, no stale lines over GPU writes */
+ 		/* ponytail: whole bo every submit; track CPU-dirty bos if this shows in profiles */
+ 		for (uint32_t p = 0; p < b->npages; p++) {
+-			flush_dcache64((addr64_t)b->pa[p], PAGE_SIZE, TRUE);
++			sweet_flush_page(b->pa[p], PAGE_SIZE);
+ 		}
+ 	}
+ 	uint32_t seq = 0;
+@@ -548,7 +564,7 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 			ret = b == NULL ? kIOReturnNotFound :
+ 			    b->used && sweet_gpu_wait(b->last_seq, 0) != 0 ? kIOReturnBusy : kIOReturnSuccess;
+ 			for (uint32_t p = 0; ret == kIOReturnSuccess && p < b->npages; p++) {
+-				flush_dcache64((addr64_t)b->pa[p], PAGE_SIZE, TRUE);
++				sweet_flush_page(b->pa[p], PAGE_SIZE);
+ 			}
+ 		}
+ 		break;
 diff --git a/iokit/Kernel/arm/SweetNetwork.cpp b/iokit/Kernel/arm/SweetNetwork.cpp
 new file mode 100644
 index 0000000..d08a9f1
