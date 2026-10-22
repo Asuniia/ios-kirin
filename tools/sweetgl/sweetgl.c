@@ -109,6 +109,22 @@ sweetgl_init(void)
 			 */
 			setenv("FD_MESA_DEBUG", "sysmem,nofp16", 0);
 			/*
+			 * SWEETGL_FD=flag+flag+...: replaces FD_MESA_DEBUG, '+' standing for
+			 * ',' since boot-args (sweetenv) cannot carry commas or spaces.
+			 */
+			const char *fdd = getenv("SWEETGL_FD");
+			if (fdd != NULL && *fdd) {
+				char buf[256];
+				strlcpy(buf, fdd, sizeof(buf));
+				for (char *c = buf; *c; c++) {
+					if (*c == '+') {
+						*c = ',';
+					}
+				}
+				setenv("FD_MESA_DEBUG", buf, 1);
+				sweet_drm_log("sweetgl: FD_MESA_DEBUG=%s", buf);
+			}
+			/*
 			 * nofp16: CA's shaders count on Apple's mediump/lowp being enough for
 			 * texture coordinates and corner shapes; fp16 is not (App
 			 * Library pod corners/backdrops, the wallpaper "+").
