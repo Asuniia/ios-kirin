@@ -2756,44 +2756,124 @@ index 0631685..8ba18b8 100644
  }
  
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 0715ee4..e729760 100644
+index 0715ee4..b0d04e5 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -760,6 +760,25 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -84,9 +84,64 @@ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++#if defined(SWEET_KIRIN)
++/*
++ * CoreAnimation's display-sized swap surfaces (1125x2436 BGRA) go into two
++ * fixed slots of the bootloader's splash region (DT splash_region@9d400000,
++ * 35 MB below the iOS RAM; the panel memory takes its first 11 MB), which
++ * the display controller can scan out with no copy (AppleCLCD::present).
++ * The allocator found no 11 MB physically contiguous block. The slots are
++ * not mapped in the kernel (its I/O map is too small for them); user
++ * mappings are write-combined.
++ */
++static const uint64_t sweet_scan_pa[2] = {0x9de80000ull, 0x9e940000ull};
++#define SWEET_SCAN_SLOT_SIZE    0xac0000u       /* to the next slot; the 2nd ends before 0x9f700000 */
++static bool sweet_scan_used[2];
++
++static bool
++sweet_scan_take(SweetSurface *s)
++{
++	if (s->width != 1125 || s->height != 2436 || s->bytesPerElement != 4 || s->planeCount != 0 ||
++	    s->allocSize > SWEET_SCAN_SLOT_SIZE) {
++		return false;
++	}
++	int slot = -1;
++	IOLockLock(sweet_surface_lock);
++	for (int i = 0; i < 2 && slot < 0; i++) {
++		if (!sweet_scan_used[i]) {
++			sweet_scan_used[i] = true;
++			slot = i;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	if (slot < 0) {
++		return false;
++	}
++	s->memory = IOMemoryDescriptor::withPhysicalAddress(sweet_scan_pa[slot], s->allocSize, kIODirectionInOut);
++	if (s->memory == NULL) {
++		IOLockLock(sweet_surface_lock);
++		sweet_scan_used[slot] = false;
++		IOLockUnlock(sweet_surface_lock);
++		return false;
++	}
++	s->contigPa = sweet_scan_pa[slot];
++	s->scanSlot = (uint8_t)(slot + 1);
++	s->mapCache = kIOMapWriteCombineCache;
++	IOLog("SWEET SURF: id %u in scan-out slot %d at 0x%llx\n", s->id, slot, s->contigPa);
++	return true;
++}
++#endif
++
+ void
+ SweetSurface::free()
+ {
++#if defined(SWEET_KIRIN)
++	if (scanSlot != 0) {
++		IOLockLock(sweet_surface_lock);
++		sweet_scan_used[scanSlot - 1] = false;
++		IOLockUnlock(sweet_surface_lock);
++	}
++#endif
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+@@ -106,6 +161,11 @@ SweetSurface::kernelAddress()
+ 	if (buffer != NULL) {
+ 		return (uintptr_t)buffer->getBytesNoCopy();
+ 	}
++#if defined(SWEET_KIRIN)
++	if (scanSlot != 0) {
++		return 0;       /* scan-out slots are not mapped in the kernel */
++	}
++#endif
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+ 		/* the surface's own mode: write-combining managed (client) pages froze 0150a */
+@@ -760,6 +820,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  		IOBufferMemoryDescriptor *mem = NULL;
  		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
  		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
 +#if defined(SWEET_KIRIN)
-+			/*
-+			 * Display-sized BGRA surfaces (CoreAnimation's swap buffers) in one
-+			 * physical block below 4 GB, so that the display controller can
-+			 * scan them out with no copy (AppleCLCD::present). Any other size,
-+			 * or no contiguous block left, gets the normal allocation.
-+			 */
-+			if (s->width == 1125 && s->height == 2436 && s->bytesPerElement == 4 && s->planeCount == 0) {
-+				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-+				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
-+				    s->allocSize, 0x00000000fffff000ULL);
-+				if (mem != NULL) {
-+					s->contigPa = mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
-+				}
-+				IOLog("SWEET SURF: id %u contiguous for scan-out: %s at 0x%llx\n", s->id,
-+				    mem ? "ok" : "no block", s->contigPa);
++			if (sweet_scan_take(s)) {
++				OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++				goto scan_slot;
 +			}
-+			if (mem == NULL)
 +#endif
  			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
  			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
  		}
+@@ -774,6 +840,14 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				ret = kIOReturnNoResources;
+ 			}
+ 		}
++		if (false) {
++#if defined(SWEET_KIRIN)
++scan_slot:
++			if (!sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++#endif
++		}
+ 	}
+ 	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
+ 		char name[32];
 diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
-index 41be9ea..0e96682 100644
+index 41be9ea..7f5c717 100644
 --- a/iokit/Kernel/arm/SweetSurface.h
 +++ b/iokit/Kernel/arm/SweetSurface.h
-@@ -41,6 +41,7 @@ public:
+@@ -41,6 +41,8 @@ public:
  	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
  	bool                      clientMemory; /* the creator's pages (IOSurfaceAddress), prepared */
  	bool                      readOnly;     /* ...from a read-only mapping: mapped read-only */
 +	uint64_t                  contigPa;     /* kirin: physically contiguous pixels (scan-out), else 0 */
++	uint8_t                   scanSlot;     /* kirin: 1 + splash-region slot holding the pixels, or 0 */
  
  	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
  	void free() APPLE_KEXT_OVERRIDE;
