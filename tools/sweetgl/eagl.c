@@ -26,7 +26,6 @@
 #include <mach/vm_page_size.h>
 #include <mach/mach_time.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <libkern/OSCacheControl.h>
 
 #include "eagl.h"
@@ -1286,7 +1285,7 @@ pixel_bytes(GLenum format, GLenum type)
 	case GL_UNSIGNED_SHORT_5_6_5: case GL_UNSIGNED_SHORT_4_4_4_4: case GL_UNSIGNED_SHORT_5_5_5_1: return 2;
 	case GL_UNSIGNED_INT_2_10_10_10_REV: case GL_UNSIGNED_INT_10F_11F_11F_REV: case GL_UNSIGNED_INT_5_9_9_9_REV:
 	case GL_UNSIGNED_INT_24_8: return 4;
-	case GL_SHORT: case GL_UNSIGNED_SHORT: case GL_HALF_FLOAT: case GL_HALF_FLOAT_OES: return 2 * c;
+	case GL_SHORT: case GL_UNSIGNED_SHORT: case GL_HALF_FLOAT: return 2 * c;
 	case GL_INT: case GL_UNSIGNED_INT: case GL_FLOAT: return 4 * c;
 	default: return c;
 	}
@@ -1295,15 +1294,15 @@ pixel_bytes(GLenum format, GLenum type)
 static size_t
 readable_from(const void *p, size_t want)
 {
-	mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)p, start = a;
+	vm_address_t a = (vm_address_t)(uintptr_t)p, start = a;
 	size_t got = 0;
 	while (got < want) {
-		mach_vm_address_t addr = a;
-		mach_vm_size_t size = 0;
+		vm_address_t addr = a;
+		vm_size_t size = 0;
 		vm_region_basic_info_data_64_t info;
 		mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
 		mach_port_t obj = MACH_PORT_NULL;
-		if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+		if (vm_region_64(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
 		    (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS || addr > a ||
 		    !(info.protection & VM_PROT_READ)) {
 			break;
