@@ -1129,7 +1129,7 @@ index 54edb01..f702842 100644
  		end = start + sp.kc_size;
  		/*
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index b8f1807..88cd8b9 100644
+index b8f1807..66c70d1 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -11,6 +11,9 @@
@@ -1137,7 +1137,7 @@ index b8f1807..88cd8b9 100644
  #include <pexpert/device_tree.h>
  #include <pexpert/arm64/board_config.h>
 +#if defined(SWEET_KIRIN)
-+#include <kern/misc_protos.h>             /* printf */
++#include <pexpert/protos.h>               /* printf */
 +#endif
  
  
