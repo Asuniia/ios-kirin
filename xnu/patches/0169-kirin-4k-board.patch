@@ -755,6 +755,142 @@ index bb2a2bf..df660a8 100644
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
  #else
  #define bsd_init_kprintf(x, ...)
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index bec47e0..a2b8a14 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -28,7 +28,24 @@
+ extern "C" bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+ extern "C" bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
+ 
++#if defined(SWEET_KIRIN)
++/*
++ * Xperia 10: PM660 (SID 0), Linux qpnp-fg-gen3.c / qpnp-smb2.c, read-only:
++ *   percent   FG_BATT_SOC 0x4009 MONOTONIC_SOC (0x400a copy), same scale
++ *   voltage   FG_BATT_INFO VBATT 0x41a0 (copy 0x41a6), 122.07 uV per bit
++ *   current   FG_BATT_INFO IBATT 0x41a2 (copy 0x41a8), signed, 488.281 uA
++ *             per bit, positive = discharging (iOS wants the opposite)
++ *   plugged   USBIN INT_RT_STS 0x1310 bit 4 (USBIN_PLUGIN)
++ *   charging  BATTERY_CHARGER_STATUS_1 0x1006 bits 2:0: trickle, pre, fast,
++ *             full-on, taper = charging; terminate = full
++ * No charger writes: the bootloader and the PMIC defaults charge as is.
++ */
++#define SWEET_BATTERY_MAH       2870    /* Xperia 10 */
++#define SWEET_BATTERY_GAUGE     "PM660 fuel gauge"
++#else
+ #define SWEET_BATTERY_MAH       2770    /* Pixel 1 */
++#define SWEET_BATTERY_GAUGE     "PMI8994 fuel gauge"
++#endif
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -52,6 +69,9 @@ private:
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++#if defined(SWEET_KIRIN)
++	bool reg16(uint16_t address, uint16_t copy, uint16_t *value);
++#endif
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool reg(uint16_t address, uint8_t *value);
+@@ -173,7 +193,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PMI8994 fuel gauge" : "static fallback",
++		    measured ? SWEET_BATTERY_GAUGE : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -182,7 +202,11 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ bool
+ SweetBattery::reg(uint16_t address, uint8_t *value)
+ {
++#if defined(SWEET_KIRIN)
++	return sweet_pmic_read((uint16_t)(address >> 8), (uint8_t)address, value);
++#else
+ 	return sweet_pmic_read((uint16_t)(0x200 | (address >> 8)), (uint8_t)address, value);
++#endif
+ }
+ 
+ /* Masked write; secure registers (0xf0+) get the SEC_ACCESS unlock first. */
+@@ -226,6 +250,67 @@ SweetBattery::setupCharger(void)
+ 	    ok ? "ok" : "FAILED", ma[icl], ma[fcc], cmd, il, fc, s1, s2);
+ }
+ 
++#if defined(SWEET_KIRIN)
++/* Linux fg_get_battery_voltage/current: LSB, MSB and their copies must match. */
++bool
++SweetBattery::reg16(uint16_t address, uint16_t copy, uint16_t *value)
++{
++	for (int i = 0; i < 5; i++) {
++		uint8_t l, m, cl, cm;
++		if (!(reg(address, &l) && reg(address + 1, &m) && reg(copy, &cl) && reg(copy + 1, &cm))) {
++			return false;
++		}
++		if (l == cl && m == cm) {
++			*value = (uint16_t)(m << 8 | l);
++			return true;
++		}
++	}
++	return false;
++}
++
++void
++SweetBattery::poll(void)
++{
++	uint8_t soc, shadow, usb, chgr;
++	uint16_t vraw = 0, iraw = 0;
++	bool valid = fReal;
++	for (int i = 0; valid && i < 5; i++) {
++		valid = reg(0x4009, &soc) && reg(0x400a, &shadow);
++		if (valid && soc == shadow) {
++			break;
++		}
++		valid = valid && i < 4;
++	}
++	int step = !valid ? 1 : !reg(0x1310, &usb) ? 2 : !reg(0x1006, &chgr) ? 3 : 0;
++	valid = step == 0;
++	static int logged;
++	if (fReal && !valid && logged < 10) {
++		logged++;
++		IOLog("SWEET BATTERY: PMIC read failed at step %d\n", step);
++	}
++	if (!valid) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	bool vok = reg16(0x41a0, 0x41a6, &vraw);
++	bool iok = reg16(0x41a2, 0x41a8, &iraw);
++	unsigned mv = vok ? (unsigned)((uint64_t)vraw * 122070u / 1000000u) : 3700;
++	int ma = iok ? -(int)((int64_t)(int16_t)iraw * 488281 / 1000000) : 0;
++	unsigned percent = soc == 0xff ? 100 : soc == 0 ? 0 :
++	    ((unsigned)(soc - 1) * 98 + 126) / 253 + 1;
++	bool external = (usb & 0x10u) != 0;
++	unsigned st = chgr & 7u;
++	bool full = external && st == 5;
++	bool charging = external && st <= 4;
++	uint8_t regs[6] = {soc, usb, chgr, 0, 0, 0};
++	if (memcmp(regs, fLastRegs, sizeof(regs)) != 0) {
++		IOLog("SWEET BATTERY: soc 0x%02x = %u%% %u mV %d mA usb rt 0x%02x chgr sts 0x%02x -> external %d charging %d full %d\n",
++		    soc, percent, mv, ma, usb, chgr, external, charging, full);
++		memcpy(fLastRegs, regs, sizeof(regs));
++	}
++	publish(percent, mv, ma, external, external, charging, full, true, iok);
++}
++#else /* !SWEET_KIRIN */
+ void
+ SweetBattery::poll(void)
+ {
+@@ -282,6 +367,7 @@ SweetBattery::poll(void)
+ 	/* The 3.7 V nominal: the real voltage is in FG SRAM. */
+ 	publish(percent, 3700, 0, external, external, charging, full, true, false);
+ }
++#endif /* SWEET_KIRIN */
+ 
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
 index 93d6318..3fc5bce 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
@@ -799,10 +935,78 @@ index 93d6318..3fc5bce 100644
  		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
  	}
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 26b4001..290c611 100644
+index 26b4001..3463952 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -366,7 +366,17 @@ AppleCLCD::start(IOService *provider)
+@@ -196,6 +196,49 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ #define SWEET_BL_MAX            255
+ #define SWEET_BL_STEP_MS        16
+ 
++#if defined(SWEET_KIRIN)
++/*
++ * Xperia 10: LCD lit by the PM660L WLED (SID 3, Linux qcom-spmi-wled.c,
++ * WLED4): ctrl 0xd800 (MOD_ENABLE 0x46 bit 7), sink 0xd900, strings 0 and 2
++ * (DT qcom,string-cfg = 5), 12-bit level in BRIGHT_LSB/MSB 0x57/0x58 +
++ * 0x10 * string, latched by toggling SYNC 0x47 bits 3:0. Levels 0..255 are
++ * scaled to 0..4095, with the 0.4% floor of WLED4 for any non-zero level.
++ * Display sleep switches the module off: the LCD goes dark.
++ */
++extern "C" bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++extern "C" bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
++#define KIRIN_WLED_CTRL         0x3d8
++#define KIRIN_WLED_SINK         0x3d9
++
++static bool
++kirin_wled_level(uint32_t level)
++{
++	static const uint8_t strings[] = {0, 2};
++	uint32_t v = level * 4095u / SWEET_BL_MAX;
++	if (level != 0 && v < 17) {
++		v = 17;
++	}
++	bool ok = true;
++	for (unsigned i = 0; ok && i < sizeof(strings); i++) {
++		uint8_t r = (uint8_t)(0x57 + 0x10 * strings[i]);
++		ok = sweet_pmic_write(KIRIN_WLED_SINK, r, (uint8_t)(v & 0xff)) &&
++		    sweet_pmic_write(KIRIN_WLED_SINK, (uint8_t)(r + 1), (uint8_t)(v >> 8));
++	}
++	/* Both edge orders seen in Linux versions: clear, set, clear. */
++	return ok && sweet_pmic_write(KIRIN_WLED_SINK, 0x47, 0x00) &&
++	       sweet_pmic_write(KIRIN_WLED_SINK, 0x47, 0x0f) &&
++	       sweet_pmic_write(KIRIN_WLED_SINK, 0x47, 0x00);
++}
++
++static bool
++kirin_wled_enable(bool on)
++{
++	uint8_t mod = 0;
++	return sweet_pmic_read(KIRIN_WLED_CTRL, 0x46, &mod) &&
++	       sweet_pmic_write(KIRIN_WLED_CTRL, 0x46, on ? (uint8_t)(mod | 0x80) : (uint8_t)(mod & ~0x80));
++}
++#endif
++
+ class AppleARMBacklight : public IOService {
+ 	OSDeclareDefaultStructors(AppleARMBacklight);
+ 
+@@ -256,10 +299,17 @@ AppleARMBacklight::apply(uint32_t level)
+ 	if (fKnown && level == fLevel) {
+ 		return;
+ 	}
++#if defined(SWEET_KIRIN)
++	bool ok = kirin_wled_level(level);
++	if (!ok || !fKnown) {
++		IOLog("SWEET BL: WLED level %u %s\n", level, ok ? "set" : "FAILED (PMIC write)");
++	}
++#else
+ 	bool ok = sweet_fbcon_dcs(0x51, (uint8_t)level);
+ 	if (!ok || !fKnown) {
+ 		IOLog("SWEET BL: panel level %u %s\n", level, ok ? "set" : "FAILED (no DSI command done)");
+ 	}
++#endif
+ 	fKnown = true;
+ 	fLevel = level;
+ }
+@@ -366,7 +416,17 @@ AppleCLCD::start(IOService *provider)
  	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
  	fLogicalW = fWidth;
  	fLogicalH = fHeight;
@@ -819,6 +1023,20 @@ index 26b4001..290c611 100644
 +#endif
  		fLogicalW = SWEET_FB_LOGICAL_W;
  		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+@@ -766,7 +826,13 @@ AppleCLCD::setPower(bool on)
+ 		return;
+ 	}
+ 	fBlanked = !on;
++#if defined(SWEET_KIRIN)
++	if (!kirin_wled_enable(on)) {
++		IOLog("SWEET FB: WLED %s FAILED\n", on ? "on" : "off");
++	}
++#else
+ 	sweet_fbcon_blank(!on);
++#endif
+ 	if (on && fDirty) {
+ 		presentPending();
  	}
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 index 0631685..3642fa5 100644
