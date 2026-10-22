@@ -1216,7 +1216,7 @@ index 93d6318..3fc5bce 100644
  		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
  	}
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 26b4001..dc30d47 100644
+index 26b4001..b9f6c0c 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -42,6 +42,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
@@ -1227,15 +1227,16 @@ index 26b4001..dc30d47 100644
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOKitKeys.h>
  #include <IOKit/IOLib.h>
-@@ -196,6 +197,71 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+@@ -196,6 +197,80 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
  #define SWEET_BL_MAX            255
  #define SWEET_BL_STEP_MS        16
  
 +#if defined(SWEET_KIRIN)
 +/*
 + * Xperia 10: LCD lit by the PM660L WLED (SID 3, Linux qcom-spmi-wled.c,
-+ * WLED4): ctrl 0xd800 (MOD_ENABLE 0x46 bit 7), sink 0xd900, strings 0 and 2
-+ * (DT qcom,string-cfg = 5), 12-bit level in BRIGHT_LSB/MSB 0x57/0x58 +
++ * WLED4): ctrl 0xd800 (MOD_ENABLE 0x46 bit 7), sink 0xd900, the strings the
++ * bootloader enabled in CURR_SINK 0x46 [7:4] (1 and 2 on this phone, not
++ * what DT qcom,string-cfg = 5 suggests), 12-bit level in BRIGHT_LSB/MSB 0x57/0x58 +
 + * 0x10 * string, latched by toggling SYNC 0x47 bits 3:0. Levels 0..255 are
 + * scaled to 0..4095, with the 0.4% floor of WLED4 for any non-zero level.
 + * Display sleep switches the module off: the LCD goes dark.
@@ -1248,14 +1249,22 @@ index 26b4001..dc30d47 100644
 +static bool
 +kirin_wled_level(uint32_t level)
 +{
-+	static const uint8_t strings[] = {0, 2};
++	static uint8_t sinks;
++	if (sinks == 0) {
++		uint8_t cs = 0;
++		sinks = sweet_pmic_read(KIRIN_WLED_SINK, 0x46, &cs) && (cs >> 4) != 0 ? (uint8_t)(cs >> 4) : 0x6;
++		IOLog("SWEET BL: WLED strings mask %#x\n", sinks);
++	}
 +	uint32_t v = level * 4095u / SWEET_BL_MAX;
 +	if (level != 0 && v < 17) {
 +		v = 17;
 +	}
 +	bool ok = true;
-+	for (unsigned i = 0; ok && i < sizeof(strings); i++) {
-+		uint8_t r = (uint8_t)(0x57 + 0x10 * strings[i]);
++	for (unsigned i = 0; ok && i < 4; i++) {
++		if (!(sinks & (1u << i))) {
++			continue;
++		}
++		uint8_t r = (uint8_t)(0x57 + 0x10 * i);
 +		ok = sweet_pmic_write(KIRIN_WLED_SINK, r, (uint8_t)(v & 0xff)) &&
 +		    sweet_pmic_write(KIRIN_WLED_SINK, (uint8_t)(r + 1), (uint8_t)(v >> 8));
 +	}
@@ -1299,7 +1308,7 @@ index 26b4001..dc30d47 100644
  class AppleARMBacklight : public IOService {
  	OSDeclareDefaultStructors(AppleARMBacklight);
  
-@@ -256,10 +322,20 @@ AppleARMBacklight::apply(uint32_t level)
+@@ -256,10 +331,20 @@ AppleARMBacklight::apply(uint32_t level)
  	if (fKnown && level == fLevel) {
  		return;
  	}
@@ -1320,7 +1329,7 @@ index 26b4001..dc30d47 100644
  	fKnown = true;
  	fLevel = level;
  }
-@@ -298,6 +374,28 @@ AppleARMBacklight::setProperties(OSObject *properties)
+@@ -298,6 +383,28 @@ AppleARMBacklight::setProperties(OSObject *properties)
  		    d->getCount(), b ? (int)b->unsigned32BitValue() : -1, f ? (int)f->unsigned32BitValue() : -1,
  		    l ? (int)l->unsigned32BitValue() : -1);
  	}
@@ -1349,7 +1358,7 @@ index 26b4001..dc30d47 100644
  	if (b == NULL) {
  		return kIOReturnSuccess;
  	}
-@@ -366,7 +464,17 @@ AppleCLCD::start(IOService *provider)
+@@ -366,7 +473,17 @@ AppleCLCD::start(IOService *provider)
  	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
  	fLogicalW = fWidth;
  	fLogicalH = fHeight;
@@ -1367,7 +1376,7 @@ index 26b4001..dc30d47 100644
  		fLogicalW = SWEET_FB_LOGICAL_W;
  		fLogicalH = SWEET_FB_LOGICAL_H;
  	}
-@@ -766,7 +874,13 @@ AppleCLCD::setPower(bool on)
+@@ -766,7 +883,13 @@ AppleCLCD::setPower(bool on)
  		return;
  	}
  	fBlanked = !on;
