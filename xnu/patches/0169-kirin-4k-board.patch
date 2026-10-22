@@ -1956,7 +1956,7 @@ index 93d6318..3fc5bce 100644
  		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
  	}
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 26b4001..8bb370b 100644
+index 26b4001..1df0cc6 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -42,6 +42,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
@@ -1967,7 +1967,38 @@ index 26b4001..8bb370b 100644
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOKitKeys.h>
  #include <IOKit/IOLib.h>
-@@ -196,6 +197,80 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+@@ -93,6 +94,7 @@ extern "C" void sweet_fbcon_blank(bool blank);
+ extern "C" bool sweet_fbcon_dcs(uint8_t cmd, uint8_t param);
+ #include "../../../bsd/dev/sweet_gpu.h"
+ extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ /* Read by bsd/dev/sweet_perf.c. */
+ extern "C" uint64_t sweet_fb_stat_swaps, sweet_fb_stat_presents, sweet_fb_stat_present_abs;
+ uint64_t sweet_fb_stat_swaps, sweet_fb_stat_presents, sweet_fb_stat_present_abs;
+@@ -151,6 +153,10 @@ public:
+ 		uint64_t      va;
+ 	}             fGmap[4];         /* swap surfaces mapped for the GPU */
+ 	uint32_t      fGmapNext;
++#if defined(SWEET_KIRIN)
++	volatile uint32_t *fVig, *fCtl;   /* MDP VIG0 pipe, CTL0 */
++	uint64_t      fFrontPa;
++#endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -163,6 +169,11 @@ public:
+ 	bool gpuStart(void);
+ 	uint64_t gpuMap(SweetSurface *s);
+ 	bool gpuLayer(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h);
++#if defined(SWEET_KIRIN)
++	bool gpuLayerKirin(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h);
++	void kirinFlip(uint64_t pa, uint32_t stride);
++	void kirinWaitFlip(void);
++#endif
+ 	void blitScaled(uintptr_t src, uint32_t bpr, int32_t sx, int32_t sy,
+ 	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ };
+@@ -196,6 +207,80 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
  #define SWEET_BL_MAX            255
  #define SWEET_BL_STEP_MS        16
  
@@ -2048,7 +2079,7 @@ index 26b4001..8bb370b 100644
  class AppleARMBacklight : public IOService {
  	OSDeclareDefaultStructors(AppleARMBacklight);
  
-@@ -256,10 +331,20 @@ AppleARMBacklight::apply(uint32_t level)
+@@ -256,10 +341,20 @@ AppleARMBacklight::apply(uint32_t level)
  	if (fKnown && level == fLevel) {
  		return;
  	}
@@ -2069,7 +2100,7 @@ index 26b4001..8bb370b 100644
  	fKnown = true;
  	fLevel = level;
  }
-@@ -298,6 +383,28 @@ AppleARMBacklight::setProperties(OSObject *properties)
+@@ -298,6 +393,28 @@ AppleARMBacklight::setProperties(OSObject *properties)
  		    d->getCount(), b ? (int)b->unsigned32BitValue() : -1, f ? (int)f->unsigned32BitValue() : -1,
  		    l ? (int)l->unsigned32BitValue() : -1);
  	}
@@ -2098,7 +2129,7 @@ index 26b4001..8bb370b 100644
  	if (b == NULL) {
  		return kIOReturnSuccess;
  	}
-@@ -366,7 +473,17 @@ AppleCLCD::start(IOService *provider)
+@@ -366,7 +483,17 @@ AppleCLCD::start(IOService *provider)
  	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
  	fLogicalW = fWidth;
  	fLogicalH = fHeight;
@@ -2116,18 +2147,124 @@ index 26b4001..8bb370b 100644
  		fLogicalW = SWEET_FB_LOGICAL_W;
  		fLogicalH = SWEET_FB_LOGICAL_H;
  	}
-@@ -538,6 +655,10 @@ AppleCLCD::gpuStart(void)
- {
- 	int on = 1;
- 	PE_parse_boot_argn("sweetfb_gpu", &on, sizeof(on));
+@@ -529,6 +656,9 @@ fbits(int64_t num, uint32_t den)
+  * the kernel text console (24 bpp in the old buffer) no longer shows.
+  * Boot-arg sweetfb_gpu=0 keeps the CPU copy.
+  */
++#define SWEET_FB_KIRIN_PA0      0x9de80000ull
++#define SWEET_FB_KIRIN_PA1      0x9e900000ull
++#define SWEET_FB_KIRIN_END      0x9f700000ull   /* end of splash_region */
+ #define SWEET_FB_GPU_PA0        0xc0800000ull
+ #define SWEET_FB_GPU_PA1        0xc1000000ull
+ #define SWEET_FB_GPU_SLOT       0x00800000ull
+@@ -549,8 +679,34 @@ AppleCLCD::gpuStart(void)
+ 	if (pa == NULL) {
+ 		return false;
+ 	}
 +#if defined(SWEET_KIRIN)
-+	/* Its panel buffers are fixed Pixel addresses, inside kirin's iOS RAM. */
-+	on = 0;
++	/*
++	 * kirin: two buffers in the bootloader's splash region (DT
++	 * splash_region@9d400000, 35 MB, below the iOS RAM at 0x9f800000),
++	 * after the 1080x2520 panel memory the default surface keeps; the
++	 * MDP scans them through VIG0 (SRC0_ADDR 0x14, SRC_YSTRIDE0 0x24),
++	 * CTL0 FLUSH (VIG0 bit 0, CTL bit 17) latches a change at the next
++	 * frame (video mode).
++	 */
++	if ((uint64_t)fGpuStride * fPanelH > SWEET_FB_KIRIN_PA1 - SWEET_FB_KIRIN_PA0 ||
++	    SWEET_FB_KIRIN_PA1 + (uint64_t)fGpuStride * fPanelH > SWEET_FB_KIRIN_END) {
++		on = 0;
++	}
++	vm_offset_t vig = on ? ml_io_map(0x0c905000u, 0x1000) : 0, ctl = on ? ml_io_map(0x0c902000u, 0x1000) : 0;
++	if (vig == 0 || ctl == 0) {
++		IOFreeData(pa, npages * sizeof(uint64_t));
++		return false;
++	}
++	fVig = (volatile uint32_t *)vig;
++	fCtl = (volatile uint32_t *)ctl;
++	fFrontPa = fPhys;
 +#endif
- 	fGpuStride = (fPanelW * 4 + 63) & ~63u;
- 	uint64_t bytes = round_page((uint64_t)fGpuStride * fPanelH);
- 	fGpuTest = on == 2;
-@@ -766,7 +887,13 @@ AppleCLCD::setPower(bool on)
+ 	for (int b = 0; b < 2; b++) {
++#if defined(SWEET_KIRIN)
++		fGpuPa[b] = b ? SWEET_FB_KIRIN_PA1 : SWEET_FB_KIRIN_PA0;
++#else
+ 		fGpuPa[b] = b ? SWEET_FB_GPU_PA1 : SWEET_FB_GPU_PA0;
++#endif
+ 		for (uint32_t p = 0; p < npages; p++) {
+ 			pa[p] = fGpuPa[b] + (uint64_t)p * PAGE_SIZE;
+ 		}
+@@ -653,6 +809,71 @@ AppleCLCD::gpuLayer(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t
+ 	return sweet_gpu_quad(&q) == 0;
+ }
+ 
++#if defined(SWEET_KIRIN)
++/*
++ * Panel rect (dx,dy,w,h) of the back buffer from (sx,sy) of a BGRA source,
++ * 1:1 (kirin crops the logical display, it does not scale).
++ */
++bool
++AppleCLCD::gpuLayerKirin(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	if ((s->offset & 63) || (s->bytesPerRow & 63)) {
++		return false;
++	}
++	uint64_t va = gpuMap(s);
++	if (va == 0) {
++		return false;
++	}
++	struct sweet_gpu_quad q = {
++		.src_va = va + s->offset, .dst_va = fGpuVa[fGpuBack],
++		.src_w = s->width, .src_h = s->height, .src_pitch = s->bytesPerRow,
++		.dst_w = fPanelW, .dst_h = fPanelH, .dst_pitch = fGpuStride,
++		.x0 = (uint32_t)dx, .y0 = (uint32_t)dy, .w = (uint32_t)w, .h = (uint32_t)h,
++		/* u = X + .5 + sx - dx, v likewise */
++		.m = {fbits(1, 1), 0, 0, fbits(1, 1), fbits(sx - dx, 1), fbits(sy - dy, 1)},
++		.flags = SWEET_GPU_QUAD_COPY,
++		.color = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u},
++		.src_fmt = SWEET_GPU_FMT_RGBA8,
++		.src_swiz = 0x688,
++	};
++	if (!fGpuClean[fGpuBack]) {
++		struct sweet_gpu_quad c = q;    /* the whole panel, colour 0 */
++		c.x0 = c.y0 = 0;
++		c.w = fPanelW;
++		c.h = fPanelH;
++		memset(c.color, 0, sizeof(c.color));
++		if (sweet_gpu_quad(&c) != 0) {
++			return false;
++		}
++		fGpuClean[fGpuBack] = true;
++	}
++	return sweet_gpu_quad(&q) == 0;
++}
++
++/* The flip of the previous present has to latch before its old front buffer is drawn into. */
++void
++AppleCLCD::kirinWaitFlip(void)
++{
++	for (int i = 0; i < 400 && (fCtl[0x18 / 4] & 0x20001u); i++) {
++		delay(50);
++	}
++}
++
++void
++AppleCLCD::kirinFlip(uint64_t pa, uint32_t stride)
++{
++	if (pa == fFrontPa) {
++		return;
++	}
++	fVig[0x14 / 4] = (uint32_t)pa;
++	fVig[0x24 / 4] = stride;
++	__builtin_arm_dsb(0xf);
++	fCtl[0x18 / 4] = 0x20001u;
++	__builtin_arm_dsb(0xf);
++	fFrontPa = pa;
++}
++#endif
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -766,7 +987,13 @@ AppleCLCD::setPower(bool on)
  		return;
  	}
  	fBlanked = !on;
@@ -2141,6 +2278,90 @@ index 26b4001..8bb370b 100644
  	if (on && fDirty) {
  		presentPending();
  	}
+@@ -779,10 +1006,22 @@ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
+-	if (fScaled && !fGpuTried && sweet_gpu_ready()) {
++#if defined(SWEET_KIRIN)
++	bool kirin = true;
++	bool panelShown = false;        /* a layer is the panel memory itself */
++	bool gpuFailed = false;
++#else
++	bool kirin = false;
++#endif
++	if ((fScaled || kirin) && !fGpuTried && sweet_gpu_ready()) {
+ 		fGpuTried = true;
+ 		fGpu = gpuStart();
+ 	}
++#if defined(SWEET_KIRIN)
++	if (fGpu) {
++		kirinWaitFlip();
++	}
++#endif
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -827,6 +1066,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+ 		if (s == NULL || (s == fSurface && !fScaled)) {
++#if defined(SWEET_KIRIN)
++			panelShown = panelShown || s != NULL;
++#endif
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+@@ -876,7 +1118,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (src != 0 && bpe == 4 && fGpu) {
+ 			static uint32_t marks;
+ 			uint64_t t0 = mach_absolute_time();
++#if defined(SWEET_KIRIN)
++			bool ok = gpuLayerKirin(s, sx, sy, dx, dy, w, h);
++#else
+ 			bool ok = gpuLayer(s, sx, sy, dx, dy, w, h);
++#endif
+ 			if (marks < 6) {
+ 				uint64_t ns;
+ 				absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+@@ -886,6 +1132,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 				blitScaled(src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
+ 			}
+ 			if (!ok) {
++#if defined(SWEET_KIRIN)
++				gpuFailed = true;
++#endif
+ 				static uint32_t failed;
+ 				if (failed++ < 20) {
+ 					IOLog("SWEET FB: GPU present of surface %u (bpr %u offset %u) failed\n",
+@@ -903,6 +1152,27 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++#if defined(SWEET_KIRIN)
++	if (fGpu && gpuFailed) {
++		/* back to the CPU copy into the panel memory for good */
++		IOLog("SWEET FB: GPU present failed, CPU copy from now on\n");
++		kirinFlip(fPhys, fRowBytes);
++		fGpu = false;
++		return;
++	}
++	if (fGpu) {
++		static uint32_t flips;
++		uint64_t pa = panelShown ? fPhys : fGpuPa[fGpuBack];
++		if (flips++ < 3) {
++			IOLog("SWEET FB: flip %u to 0x%llx\n", flips, pa);
++		}
++		kirinFlip(pa, panelShown ? fRowBytes : fGpuStride);
++		if (!panelShown) {
++			fGpuBack ^= 1;
++		}
++		return;
++	}
++#endif
+ 	if (fGpu && !fGpuTest) {
+ 		static uint32_t flips;
+ 		if (flips++ < 3) {
 diff --git a/iokit/Kernel/arm/SweetNetwork.cpp b/iokit/Kernel/arm/SweetNetwork.cpp
 new file mode 100644
 index 0000000..d08a9f1
