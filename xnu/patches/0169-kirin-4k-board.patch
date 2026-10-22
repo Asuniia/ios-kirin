@@ -603,6 +603,25 @@ index a8809d1..ea4c75a 100644
  
  CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
  			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..58cb620 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10892,6 +10892,14 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 
+ 	do {
+ 		int text_leaf_index = random() % num_ptes;
++		/*
++		 * SWEET_KIRIN: 16K VM pages on 4K hardware pages. The page is
++		 * entered as a whole VM page (write_pte_fast writes PAGE_RATIO
++		 * PTEs and panics unless the first one is the first of a page),
++		 * so only every PAGE_RATIO-th leaf index is usable. A no-op when
++		 * the leaf size is the VM page size.
++		 */
++		text_leaf_index &= ~((int)(PAGE_SIZE >> pt_attr_leaf_shift(pt_attr)) - 1);
+ 
+ 		// Generate a VA for the commpage text with the same root and twig index as data
+ 		// comm page, but with new leaf index we've just generated.
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 index 7ed7d29..ed61fdd 100644
 --- a/osfmk/arm64/arm_vm_init.c
