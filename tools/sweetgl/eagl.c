@@ -25,6 +25,8 @@
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/vm_page_size.h>
 #include <mach/mach_time.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <libkern/OSCacheControl.h>
 
 #include "eagl.h"
@@ -1261,6 +1263,93 @@ unpack_row(void)
 	return row;
 }
 
+/*
+ * CoreAnimation sometimes hands TexImage2D a source that ends before what
+ * Mesa reads for it (backboardd died in util_copy_rect reading past the end
+ * of a read-only mapping). Bytes Mesa reads: (height - 1) rows of the
+ * unpack stride (GL_UNPACK_ROW_LENGTH or width, aligned to
+ * GL_UNPACK_ALIGNMENT), plus one row of width. If the readable memory from
+ * pixels (consecutive readable VM regions) is shorter, the upload gets a
+ * zero-padded copy instead; the first few cases are logged.
+ */
+static unsigned
+pixel_bytes(GLenum format, GLenum type)
+{
+	unsigned c;
+	switch (format) {
+	case GL_RGBA: case GL_BGRA_EXT: case GL_RGBA_INTEGER: c = 4; break;
+	case GL_RGB: case GL_RGB_INTEGER: c = 3; break;
+	case GL_RG: case GL_RG_INTEGER: case GL_LUMINANCE_ALPHA: c = 2; break;
+	default: c = 1; break;
+	}
+	switch (type) {
+	case GL_UNSIGNED_SHORT_5_6_5: case GL_UNSIGNED_SHORT_4_4_4_4: case GL_UNSIGNED_SHORT_5_5_5_1: return 2;
+	case GL_UNSIGNED_INT_2_10_10_10_REV: case GL_UNSIGNED_INT_10F_11F_11F_REV: case GL_UNSIGNED_INT_5_9_9_9_REV:
+	case GL_UNSIGNED_INT_24_8: return 4;
+	case GL_SHORT: case GL_UNSIGNED_SHORT: case GL_HALF_FLOAT: case GL_HALF_FLOAT_OES: return 2 * c;
+	case GL_INT: case GL_UNSIGNED_INT: case GL_FLOAT: return 4 * c;
+	default: return c;
+	}
+}
+
+static size_t
+readable_from(const void *p, size_t want)
+{
+	mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)p, start = a;
+	size_t got = 0;
+	while (got < want) {
+		mach_vm_address_t addr = a;
+		mach_vm_size_t size = 0;
+		vm_region_basic_info_data_64_t info;
+		mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t obj = MACH_PORT_NULL;
+		if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+		    (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS || addr > a ||
+		    !(info.protection & VM_PROT_READ)) {
+			break;
+		}
+		a = addr + size;
+		got = (size_t)(a - start);
+	}
+	return got < want ? got : want;
+}
+
+static const void *
+safe_pixels(const char *what, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels,
+    void **tmp)
+{
+	*tmp = NULL;
+	GLint pbo = 0;
+	glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
+	if (pixels == NULL || pbo != 0 || width <= 0 || height <= 0) {
+		return pixels;
+	}
+	GLint row = 0, align = 4, skip_r = 0, skip_p = 0;
+	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row);
+	glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
+	glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_r);
+	glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_p);
+	size_t bpp = pixel_bytes(format, type);
+	size_t stride = (size_t)(row > 0 ? row : width) * bpp;
+	stride = align > 1 ? (stride + (size_t)align - 1) / (size_t)align * (size_t)align : stride;
+	size_t need = stride * ((size_t)height - 1 + (size_t)skip_r) + ((size_t)width + (size_t)skip_p) * bpp;
+	size_t have = readable_from(pixels, need);
+	if (have >= need) {
+		return pixels;
+	}
+	static int logged;
+	if (logged++ < 8) {
+		sweet_drm_log("sweetgl: %s %dx%d fmt %#x type %#x row %d align %d: source has %zu of %zu bytes, zero-padded",
+		    what, width, height, format, type, row, align, have, need);
+	}
+	*tmp = calloc(1, need);
+	if (*tmp == NULL) {
+		return NULL;
+	}
+	memcpy(*tmp, pixels, have);
+	return *tmp;
+}
+
 void
 sgl_TexSubImage2D(void *rctx, GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height,
     GLenum format, GLenum type, const void *pixels)
@@ -1269,7 +1358,12 @@ sgl_TexSubImage2D(void *rctx, GLenum target, GLint level, GLint x, GLint y, GLsi
 	target = SGL_TGT(target);
 	TRACE("TexSubImage2D tex %u level %d at %d,%d %dx%d fmt %#x type %#x row %d", unit_held[active_unit()],
 	    level, x, y, width, height, format, type, unpack_row());
-	glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
+	void *tmp;
+	const void *src = safe_pixels("TexSubImage2D", width, height, format, type, pixels, &tmp);
+	if (pixels == NULL || src != NULL) {
+		glTexSubImage2D(target, level, x, y, width, height, format, type, src);
+	}
+	free(tmp);
 	SGL_POST(307);
 }
 
@@ -1288,7 +1382,10 @@ sgl_TexImage2D(void *rctx, GLenum target, GLint level, GLint internalformat, GLs
 	if (format == GL_BGRA_EXT && (internalformat == GL_RGBA || internalformat == GL_RGBA8)) {
 		internalformat = GL_BGRA_EXT;
 	}
-	glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+	void *tmp;
+	const void *src = safe_pixels("TexImage2D", width, height, format, type, pixels, &tmp);
+	glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels == NULL ? NULL : src);
+	free(tmp);
 	SGL_POST(301);
 	tex_size_bound(target, level, width, height);
 }
