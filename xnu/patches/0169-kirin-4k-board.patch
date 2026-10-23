@@ -2396,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..3f5e8e3
+index 0000000..edc71b3
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,905 @@
+@@ -0,0 +1,906 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2649,6 +2649,7 @@ index 0000000..3f5e8e3
 + * from the ADSP). Registers are a byte each at sdw_base + offset. This reads a few top
 + * registers to see whether the codec is reachable, before the full bring-up.
 + */
++static int afe_clock(const char *what, uint32_t id, uint32_t hz, uint32_t enable);
 +#define SDW_CDC_PA      0x152c1000ull
 +
 +static void
