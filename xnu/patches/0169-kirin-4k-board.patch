@@ -3082,7 +3082,7 @@ index a9ad4f2..41f8d34 100644
  void
  sweet_touch_init(void)
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index b8c6bc7..289d5b1 100644
+index b8c6bc7..610f5d2 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -17,6 +17,9 @@
@@ -3572,7 +3572,7 @@ index b8c6bc7..289d5b1 100644
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
-@@ -660,10 +1071,22 @@ sweet_ufs_init(void)
+@@ -660,10 +1071,24 @@ sweet_ufs_init(void)
  	sweet_sample_start();
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
  	sweet_keys_init();
@@ -3590,6 +3590,8 @@ index b8c6bc7..289d5b1 100644
 +	{
 +		extern void sweet_adsp_init(void);
 +		sweet_adsp_init();
++		extern void sweet_hfs_growfs_init(void);
++		sweet_hfs_growfs_init();
 +	}
 +#endif
  	return 0;
@@ -4076,6 +4078,89 @@ index 01e674f..5a3f0d0 100644
  	error = sweet_exec_env(imgp, new_ptr_size);
  	if (error) {
  		goto bad;
+diff --git a/bsd/sweet_hfs/core/hfs_resize.c b/bsd/sweet_hfs/core/hfs_resize.c
+index c91adb7..422d6f2 100644
+--- a/bsd/sweet_hfs/core/hfs_resize.c
++++ b/bsd/sweet_hfs/core/hfs_resize.c
+@@ -3430,3 +3430,78 @@ hfs_resize_progress(struct hfsmount *hfsmp, u_int32_t *progress)
+     
+ 	return (0);
+ }
++
++#if defined(SWEET_KIRIN)
++/*
++ * kirin, boot-arg sweetgrowfs=1: the root volume made as big as its partition. The iOS root
++ * was built as a 16 GB image and written into a 51 GB userdata partition: iOS shows 16 GB.
++ * Once the system has settled, hfs_extendfs() (diskutil resizeVolume's grow) takes the volume
++ * to the device's end; a volume that already fills it is left alone, so it runs once.
++ */
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <sys/disk.h>
++
++void sweet_hfs_growfs_init(void);
++
++static void
++sweet_hfs_growfs_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	int chan;
++	uint64_t deadline;
++	clock_interval_to_deadline(60, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++
++	vnode_t root = vfs_rootvnode();
++	if (root == NULLVP) {
++		printf("SWEET GROWFS: no root vnode\n");
++		return;
++	}
++	mount_t mp = vnode_mount(root);
++	if (strcmp(vfs_statfs(mp)->f_fstypename, "hfs") != 0 || vfs_isrdonly(mp)) {
++		printf("SWEET GROWFS: the root is %s%s: nothing done\n", vfs_statfs(mp)->f_fstypename,
++		    vfs_isrdonly(mp) ? ", read-only" : "");
++		vnode_put(root);
++		return;
++	}
++	struct hfsmount *hfsmp = VFSTOHFS(mp);
++	vfs_context_t ctx = vfs_context_kernel();
++	u_int32_t ss = 0;
++	u_int64_t sc = 0;
++	if (VNOP_IOCTL(hfsmp->hfs_devvp, DKIOCGETBLOCKSIZE, (caddr_t)&ss, 0, ctx) ||
++	    VNOP_IOCTL(hfsmp->hfs_devvp, DKIOCGETBLOCKCOUNT, (caddr_t)&sc, 0, ctx) || ss == 0) {
++		printf("SWEET GROWFS: the device does not say its size\n");
++		vnode_put(root);
++		return;
++	}
++	u_int64_t dev = (u_int64_t)ss * sc;
++	u_int64_t cur = (u_int64_t)hfsmp->totalBlocks * hfsmp->blockSize;
++	u_int64_t want = dev - dev % hfsmp->blockSize;
++	printf("SWEET GROWFS: volume %llu MB, partition %llu MB (blocks of %u bytes)\n",
++	    cur >> 20, dev >> 20, hfsmp->blockSize);
++	if (want <= cur + (64ull << 20)) {
++		printf("SWEET GROWFS: the volume already fills the partition\n");
++		vnode_put(root);
++		return;
++	}
++	int err = hfs_extendfs(hfsmp, want, ctx);
++	printf("SWEET GROWFS: grown to %llu MB: %s (%d)\n",
++	    ((u_int64_t)hfsmp->totalBlocks * hfsmp->blockSize) >> 20, err ? "FAILED" : "ok", err);
++	vnode_put(root);
++}
++
++void
++sweet_hfs_growfs_init(void)
++{
++	int on = 0;
++	thread_t t;
++	if (!PE_parse_boot_argn("sweetgrowfs", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	if (kernel_thread_start(sweet_hfs_growfs_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif /* SWEET_KIRIN */
 diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 index 90e68bb..0c0879e 100644
 --- a/bsd/vfs/vfs_syscalls.c
