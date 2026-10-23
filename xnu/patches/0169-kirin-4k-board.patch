@@ -2396,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..66e705a
+index 0000000..cee6af1
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,703 @@
+@@ -0,0 +1,707 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2740,25 +2740,29 @@ index 0000000..66e705a
 +		((uint64_t *)ptva)[i] = (i << 30) | (1ull << 11) | (1ull << 10) | (3ull << 8) | (1ull << 6) | 1ull;
 +	}
 +	flush_dcache64((addr64_t)pt, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)ptva, PAGE_SIZE, FALSE);
++	__builtin_arm_dsb(0xf);
 +
 +	volatile uint32_t *gr1 = s + pg / 4;
 +	volatile uint32_t *cbr = s + (SMMU_SZ / 2 + (uint32_t)cb * pg) / 4;
 +	cbr[0] = 0;                                     /* SCTLR: off while it is set up */
 +	gr1[cb] = (1u << 16) | (3u << 8) | (0xfu << 12); /* CBAR: S1 trans S2 bypass, NSH, WB */
 +	gr1[(0x800 / 4) + cb] = 1;                      /* CBA2R: AArch64 */
-+	cbr[0x10 / 4] = 2;                              /* TCR2: PASize 40 bits */
++	cbr[0x10 / 4] = (s[0x28 / 4] >> 4) & 0xf;      /* TCR2: PASize = IDR2.OAS (36 bits here) */
 +	cbr[0x20 / 4] = (uint32_t)pt;                   /* TTBR0, ASID 0 */
 +	cbr[0x24 / 4] = (uint32_t)(pt >> 32);
 +	cbr[0x28 / 4] = 0;                              /* TTBR1 */
 +	cbr[0x2c / 4] = 0;
 +	/*
-+	 * TCR: T0SZ 32, IRGN0/ORGN0 write-back, SH0 inner, TG0 4K, EPD1, and bit 31: EAE if
++	 * TCR: T0SZ 32, TG0 4K, EPD1; IRGN0/ORGN0/SH0 0, non-cacheable walks as Linux's
++	 * io-pgtable-arm for an SMMU without coherent walks (the LPASS one: write-back walks
++	 * gave a translation fault at the first buffer, FSR 0x402). Bit 31: EAE if
 +	 * the context bank stays in the AArch32 format (CBA2R.VA64 not taken; DT
 +	 * qcom,use-3-lvl-tables), where without it the walker read our table as short
 +	 * descriptors (translation fault at the first buffer, FSR 0x402); in the AArch64
 +	 * format it is TG1's top bit, unused with EPD1. The LPAE 1 GB blocks are the same.
 +	 */
-+	cbr[0x30 / 4] = 32u | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23) | (1u << 31);
++	cbr[0x30 / 4] = 32u | (1u << 23) | (1u << 31);   /* walks non-cacheable: this SMMU is not coherent */
 +	cbr[0x38 / 4] = 0xff;                           /* MAIR0: attr 0 normal write-back */
 +	cbr[0x3c / 4] = 0;
 +	cbr[0x58 / 4] = 0xffffffffu;                    /* FSR: clear */
