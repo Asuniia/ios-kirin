@@ -2396,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..cee6af1
+index 0000000..fabebdb
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,707 @@
+@@ -0,0 +1,868 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2459,6 +2459,166 @@ index 0000000..cee6af1
 + */
 +#define CDC_DIG_PPID    0x3f0
 +#define CDC_ANA_PPID    0x3f1
++
++extern bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
++
++/*
++ * The earpiece path, Linux's "handset" route of sdm660-internal (mixer_paths: RX1 MIX1
++ * INP1 = RX1, RDAC2 MUX = RX1, EAR_S = Switch, EAR PA Boost = ENABLE) on the DRAX codec,
++ * in the order DAPM powers its widgets (msm-digital-cdc, msm-analog-cdc):
++ *   PDM pins     LPI TLMM 0x15070000: gpio 18, 19, 21, 23, 25 func1 8 mA output-high,
++ *                gpio 20 func1 8 mA (DT cdc_pdm_gpios_active, cdc_pdm_2_gpios_active)
++ *   digital      the LPASS codec at 0x152c0000 (DT msm-dig-codec): RX I2S 48 kHz 16-bit,
++ *                RX1 interpolator at 48 kHz fed by I2S RX1, PDM and MCLK clocks (9.6 MHz)
++ *   analog       PM660L: bring-up reset, CAJON 2.0/DRAX defaults, clock block, RX1 clock,
++ *                RX bias, EAR charge pump in bypass (BOOST_SWITCH with EAR PA Boost),
++ *                RDAC2 = RX1, both DACs, EAR PA, then RX1 unmuted
++ */
++#define LPASS_DIG_CDC_PA        0x152c0000ull
++#define LPI_TLMM_PA             0x15070000ull
++
++static volatile uint32_t *dig_cdc;
++
++static void
++cdc_upd(uint16_t ppid, uint8_t reg, uint8_t mask, uint8_t val)
++{
++	uint8_t v = 0;
++	(void)sweet_pmic_read(ppid, reg, &v);
++	(void)sweet_pmic_write(ppid, reg, (uint8_t)((v & ~mask) | (val & mask)));
++}
++
++static void
++cdc_w(uint16_t ppid, uint8_t reg, uint8_t val)
++{
++	(void)sweet_pmic_write(ppid, reg, val);
++}
++
++static void
++dig_upd(uint32_t reg, uint32_t mask, uint32_t val)
++{
++	dig_cdc[reg / 4] = (dig_cdc[reg / 4] & ~mask) | (val & mask);
++}
++
++static void
++cdc_pdm_pins(void)
++{
++	volatile uint32_t *lpi = (volatile uint32_t *)ml_io_map(LPI_TLMM_PA + 0x8000, 0x1000);
++	static const struct { uint32_t off; bool out; } pin[] = {
++		{ 0x000, true }, { 0x010, true }, { 0x020, false }, { 0x030, true }, { 0x050, true }, { 0x070, true },
++	};
++	if (lpi == NULL) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(pin) / sizeof(pin[0]); i++) {
++		volatile uint32_t *r = lpi + pin[i].off / 4;
++		uint32_t v = r[0] & ~(0x3cu | 0x1c0u | 0x200u);
++		v |= (1u << 2) | (3u << 6) | (pin[i].out ? 1u << 9 : 0);     /* func1, 8 mA, value high */
++		r[0] = v;
++		r[1] = pin[i].out ? 1u << 1 : 0;                        /* output enable */
++	}
++	__builtin_arm_dsb(0xf);
++}
++
++static void
++cdc_earpiece_on(void)
++{
++	dig_cdc = (volatile uint32_t *)ml_io_map(LPASS_DIG_CDC_PA, 0x1000);
++	if (dig_cdc == NULL) {
++		printf("SWEET CDC: the digital codec cannot be mapped\n");
++		return;
++	}
++	cdc_pdm_pins();
++
++	/* analog bring-up (msm_anlg_cdc_bringup), OCP init, CAJON 2.0/DRAX defaults */
++	cdc_w(CDC_DIG_PPID, 0xd0, 0xa5);
++	cdc_w(CDC_DIG_PPID, 0xdb, 0x01);
++	cdc_w(CDC_ANA_PPID, 0xd0, 0xa5);
++	cdc_w(CDC_ANA_PPID, 0xdb, 0x01);
++	cdc_w(CDC_DIG_PPID, 0xd0, 0xa5);
++	cdc_w(CDC_DIG_PPID, 0xdb, 0x00);
++	cdc_w(CDC_ANA_PPID, 0xd0, 0xa5);
++	cdc_w(CDC_ANA_PPID, 0xdb, 0x00);
++	cdc_upd(CDC_ANA_PPID, 0x91, 0xff, 0x12);        /* RX_COM_OCP_CTL */
++	cdc_upd(CDC_ANA_PPID, 0x92, 0xff, 0xff);        /* RX_COM_OCP_COUNT */
++	static const struct { uint16_t ppid; uint8_t reg, val; } defaults[] = {
++		{ CDC_DIG_PPID, 0xd0, 0xa5 }, { CDC_DIG_PPID, 0xda, 0x0f },     /* PERPH_RESET_CTL3 */
++		{ CDC_ANA_PPID, 0xd0, 0xa5 }, { CDC_ANA_PPID, 0xda, 0x0f },
++		{ CDC_ANA_PPID, 0x65, 0x4c },   /* TX_1_2_OPAMP_BIAS */
++		{ CDC_ANA_PPID, 0xc0, 0xa2 },   /* CURRENT_LIMIT */
++		{ CDC_ANA_PPID, 0x83, 0xa8 },   /* NCP_FBCTRL */
++		{ CDC_ANA_PPID, 0x85, 0xa4 },   /* NCP_VCTRL */
++		{ CDC_ANA_PPID, 0xb3, 0x41 },   /* SPKR_ANA_BIAS_SET */
++		{ CDC_ANA_PPID, 0xb2, 0x69 },   /* SPKR_DRV_CTL */
++		{ CDC_ANA_PPID, 0xb7, 0x01 },   /* SPKR_DRV_DBG */
++		{ CDC_ANA_PPID, 0xb4, 0xe1 },   /* SPKR_OCP_CTL */
++		{ CDC_ANA_PPID, 0xb0, 0x03 },   /* SPKR_DAC_CTL */
++		{ CDC_ANA_PPID, 0xa1, 0x10 },   /* RX_EAR_STATUS */
++		{ CDC_ANA_PPID, 0xc2, 0x18 },   /* BYPASS_MODE */
++		{ CDC_ANA_PPID, 0x94, 0xfa },   /* RX_HPH_BIAS_PA */
++		{ CDC_DIG_PPID, 0x46, 0x80 },   /* CDC_RST_CTL */
++	};
++	for (unsigned i = 0; i < sizeof(defaults) / sizeof(defaults[0]); i++) {
++		cdc_w(defaults[i].ppid, defaults[i].reg, defaults[i].val);
++	}
++
++	/* digital codec: RX I2S 48 kHz 16-bit and its clock, RX1 interpolator fed by I2S RX1 */
++	dig_upd(0x0c, 0x0f, 0x03);              /* CLK_RX_I2S_CTL: 48 kHz */
++	dig_upd(0x0c, 0x20, 0x20);              /* 16-bit */
++	dig_upd(0x0c, 0x10, 0x10);              /* RX_I2S_CLK */
++	dig_upd(0x50, 0xf0, 0x60);              /* RX1_B5_CTL: interpolator at 48 kHz */
++	dig_upd(0x180, 0x07, 0x03);             /* CONN_RX1_B1_CTL: RX1 MIX1 INP1 = RX1 */
++
++	/* analog clock block, with the digital codec's CLK_ON (PDM, 9.6 MHz MCLK) inside */
++	cdc_upd(CDC_ANA_PPID, 0x46, 0x30, 0x30);        /* MASTER_BIAS_CTL */
++	dig_upd(0x28, 0x03, 0x03);                      /* CLK_PDM_CTL */
++	dig_upd(0xa4, 0x01, 0x01);                      /* TOP_CTL: 9.6 MHz MCLK */
++	dig_upd(0x24, 0x01, 0x01);                      /* CLK_MCLK_CTL */
++	cdc_upd(CDC_DIG_PPID, 0x46, 0x80, 0x80);        /* CDC_RST_CTL */
++	cdc_upd(CDC_DIG_PPID, 0x48, 0x0c, 0x0c);        /* CDC_TOP_CLK_CTL */
++	cdc_upd(CDC_DIG_PPID, 0x4a, 0x01, 0x01);        /* RX1 CLK (CDC_DIG_CLK_CTL) */
++	dig_upd(0x20, 0x01, 0x01);                      /* RX1 MIX2: CLK_RX_B1_CTL */
++
++	/* RX bias */
++	cdc_upd(CDC_ANA_PPID, 0x93, 0x80, 0x80);        /* RX_COM_BIAS_DAC */
++	cdc_upd(CDC_ANA_PPID, 0x93, 0x01, 0x01);
++	/* EAR charge pump: EAR PA Boost with BOOST_SWITCH is bypass (CAJON 2.0 and later) */
++	cdc_upd(CDC_DIG_PPID, 0x4a, 0x80, 0x80);
++	cdc_upd(CDC_DIG_PPID, 0x4a, 0x20, 0x20);
++	cdc_upd(CDC_ANA_PPID, 0xc2, 0x20, 0x20);        /* BYPASS_MODE */
++	cdc_upd(CDC_ANA_PPID, 0x80, 0x10, 0x10);        /* NCP_EN: EAR CP */
++	delay(1100);
++	/* RDAC2 MUX = RX1 */
++	cdc_upd(CDC_DIG_PPID, 0x52, 0x03, 0x02);        /* CDC_CONN_HPHR_DAC_CTL */
++	/* HPHL DAC (DRAX: later than CAJON) */
++	cdc_upd(CDC_ANA_PPID, 0x97, 0x08, 0x08);        /* RX_HPH_CNP_EN */
++	cdc_upd(CDC_ANA_PPID, 0x97, 0x08, 0x00);
++	cdc_upd(CDC_ANA_PPID, 0x9b, 0x02, 0x02);        /* RX_HPH_L_PA_DAC_CTL */
++	cdc_upd(CDC_DIG_PPID, 0x4a, 0x01, 0x01);
++	cdc_upd(CDC_DIG_PPID, 0x49, 0x02, 0x02);        /* CDC_ANA_CLK_CTL */
++	cdc_upd(CDC_ANA_PPID, 0x9b, 0x08, 0x08);        /* the DAC itself */
++	cdc_upd(CDC_ANA_PPID, 0x9b, 0x02, 0x00);
++	/* HPHR DAC */
++	cdc_upd(CDC_ANA_PPID, 0x9d, 0x02, 0x02);        /* RX_HPH_R_PA_DAC_CTL */
++	cdc_upd(CDC_DIG_PPID, 0x4a, 0x02, 0x02);
++	cdc_upd(CDC_DIG_PPID, 0x49, 0x01, 0x01);
++	cdc_upd(CDC_ANA_PPID, 0x9d, 0x08, 0x08);
++	cdc_upd(CDC_ANA_PPID, 0x9d, 0x02, 0x00);
++	/* EAR PA (DIANGU and later) */
++	cdc_upd(CDC_ANA_PPID, 0x9e, 0x80, 0x80);        /* RX_EAR_CTL: EAR selected */
++	cdc_upd(CDC_ANA_PPID, 0x93, 0x08, 0x00);
++	cdc_upd(CDC_ANA_PPID, 0x9a, 0x04, 0x04);        /* RX_HPH_L_TEST */
++	cdc_upd(CDC_ANA_PPID, 0x9c, 0x04, 0x04);        /* RX_HPH_R_TEST */
++	cdc_upd(CDC_ANA_PPID, 0x9e, 0x40, 0x40);        /* the PA on */
++	delay(7100);
++	dig_upd(0x5c, 0xff, 0x00);                      /* RX1 digital gain: 0 dB */
++	dig_upd(0x54, 0x01, 0x00);                      /* RX1_B6_CTL: unmuted */
++	__builtin_arm_dsb(0xf);
++	uint8_t ear = 0, ncp = 0;
++	(void)sweet_pmic_read(CDC_ANA_PPID, 0x9e, &ear);
++	(void)sweet_pmic_read(CDC_ANA_PPID, 0x80, &ncp);
++	printf("SWEET CDC: earpiece on (EAR_CTL %#x NCP_EN %#x; digital RX_I2S %#x RX1_B6 %#x MCLK %#x)\n", ear, ncp,
++	    dig_cdc[0x0c / 4], dig_cdc[0x54 / 4], dig_cdc[0x24 / 4]);
++}
 +
 +static void
 +cdc_probe(void)
@@ -2890,6 +3050,7 @@ index 0000000..cee6af1
 +			return;
 +		}
 +	}
++	cdc_earpiece_on();
 +	uint16_t copp;
 +	{
 +		struct {
