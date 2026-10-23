@@ -1,0 +1,92 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -52,6 +52,46 @@
+ 	return err;
+ }
+ 
++/*
++ * Op 5, extension issue: libsystem_sandbox's __sandbox_extension_issue builds
++ *   {u64 class; u32; u64 path; u32 flags; char *token; s32; u32} (7 u64, the
++ * token buffer at +0x20 is 2048 bytes it malloc'd) and calls
++ * __mac_syscall("Sandbox", 5, &it), returning that buffer on success. tccd
++ * issues an extension to grant a client a TCC service; ENOENT made it log
++ * "Failed to issue sandbox extension for kTCCServicePhotos / MediaLibrary"
++ * and the app abort (MobileSlideShow, Music, Podcasts). SWEET enforces no
++ * sandbox: mint an opaque token (not the literal "invalid", on which
++ * userspace sandbox_extension_consume short-circuits) and accept it below.
++ */
++static int
++sweet_sandbox_extension_issue(user_addr_t arg)
++{
++	uint64_t a[7];
++	static const char token[] = "sweet";
++
++	if (copyin(arg, a, sizeof(a)) != 0 || a[4] == 0) {
++		return EINVAL;
++	}
++	return copyout(token, (user_addr_t)a[4], sizeof(token));
++}
++
++/*
++ * Op 6, extension consume: arg -> {const char *token; u64 len; u64 *handle}.
++ * The client (assetsd, Music) consumes the token tccd issued it. Nothing to
++ * enforce; hand back a non-zero handle (0 or -1 reads as failure) and succeed.
++ */
++static int
++sweet_sandbox_extension_consume(user_addr_t arg)
++{
++	uint64_t a[3];
++	uint64_t handle = 1;
++
++	if (copyin(arg, a, sizeof(a)) != 0 || a[2] == 0) {
++		return EINVAL;
++	}
++	return copyout(&handle, (user_addr_t)a[2], sizeof(handle));
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -62,13 +102,38 @@
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (pid) */
++	/*
++	 * Status/check calls (names from libsystem_sandbox): the real Sandbox
++	 * weighs the caller's profile, but for the platform binaries that run
++	 * under SWEET that verdict is always allow/ok, which is what 0 means
++	 * to each of these; none returns data through arg.
++	 */
++	case 1:         /* sandbox_init_with_parameters: profile applied */
++	case 2:         /* sandbox_check: operation allowed */
++	case 7:         /* sandbox_extension_release: best-effort */
++	case 12:        /* sandbox_passthrough_access: access granted */
++	case 15:        /* sandbox user-state item (containermanagerd) */
++	case 16:        /* sandbox_set_user_state_item: accepted */
++	case 17:        /* user-state item buffer send: accepted */
++	case 22:        /* sandbox_note: notification */
++	case 28:        /* sandbox_reference_retain_by_audit_token: retained */
++		return 0;
++	/* Data calls: copy the real thing out through arg or the caller fails. */
++	case 4:         /* sandbox_container_path_for_pid / _for_audit_token */
+ 		return sweet_sandbox_container_path(arg);
+-	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
+-	case 0x43:      /* container expected */
++	case 5:         /* sandbox_extension_issue */
++		return sweet_sandbox_extension_issue(arg);
++	case 6:         /* sandbox_extension_consume */
++		return sweet_sandbox_extension_consume(arg);
++	case 0x43:      /* container expected: none, like an uncontainerized proc */
+ 		return ENOENT;
+ 	default:
++		/*
++		 * Unknown op: 0 = allow/success, the right permissive answer for
++		 * the checks that dominate. The first use of each op is logged
++		 * above, so a future op that must return real data is caught here
++		 * before it breaks a client.
++		 */
+ 		return 0;
+ 	}
+ }
