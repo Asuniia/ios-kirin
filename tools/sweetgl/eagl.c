@@ -27,6 +27,9 @@
 #include <mach/mach_time.h>
 #include <mach/mach.h>
 #include <libkern/OSCacheControl.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
 
 #include "eagl.h"
 
@@ -2298,6 +2301,54 @@ sgl_install_texfns(void)
 	}
 }
 
+/*
+ * Core Image: this shim is EAGL as Core Animation uses it, not as Core Image does
+ * (initWithOptions: asks a GL context for its sharegroup, whose private part our
+ * contexts do not have: Settings' storage page crashed there). Every CIContext is
+ * made with kCIContextUseSoftwareRenderer, so Core Image renders on the CPU and makes
+ * no GL context at all. CoreImage may come after this library: the method is replaced
+ * when its image arrives.
+ */
+static IMP orig_ci_init;
+static CFStringRef ci_software_key;
+
+static id
+m_ci_init(id self, SEL cmd, CFDictionaryRef options)
+{
+	CFMutableDictionaryRef o = options ? CFDictionaryCreateMutableCopy(NULL, 0, options) :
+	    CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFDictionarySetValue(o, ci_software_key, kCFBooleanTrue);
+	id r = ((id(*)(id, SEL, CFDictionaryRef))orig_ci_init)(self, cmd, o);
+	CFRelease(o);
+	return r;
+}
+
+static void
+ci_try_install(void)
+{
+	if (orig_ci_init != NULL) {
+		return;
+	}
+	Class cls = objc_getClass("CIContext");
+	CFStringRef *key = dlsym(RTLD_DEFAULT, "kCIContextUseSoftwareRenderer");
+	if (cls == Nil || key == NULL || *key == NULL) {
+		return;
+	}
+	Method m = class_getInstanceMethod(cls, sel_registerName("initWithOptions:"));
+	if (m == NULL) {
+		return;
+	}
+	ci_software_key = *key;
+	orig_ci_init = method_setImplementation(m, (IMP)m_ci_init);
+	sweet_drm_log("sweetgl: Core Image set to its software renderer");
+}
+
+static void
+ci_image_added(__unused const struct mach_header *mh, __unused intptr_t slide)
+{
+	ci_try_install();
+}
+
 /* Called at load. CA picks its GLES renderer by itself once initWithAPI:3 succeeds. */
 void
 sweetgl_eagl_install(void)
@@ -2328,4 +2379,5 @@ sweetgl_eagl_install(void)
 	orig_set_current = swap(meta, "setCurrentContext:", m_set_current);
 	orig_current = swap(meta, "currentContext", m_current);
 	sweet_drm_log("sweetgl: EAGL shim installed%s", sgl_check_errors ? " (GL error checks on)" : "");
+	_dyld_register_func_for_add_image(ci_image_added);       /* also runs for the images already there */
 }

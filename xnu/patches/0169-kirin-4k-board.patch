@@ -4073,7 +4073,7 @@ index bb2a2bf..878fb4c 100644
  	lock_trace = 1;
  }
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 01e674f..47d4621 100644
+index 01e674f..9a9d77a 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -453,13 +453,23 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
@@ -4103,7 +4103,7 @@ index 01e674f..47d4621 100644
  	}
  	if (state != 2) {
  		return 0;
-@@ -470,6 +480,66 @@ sweet_exec_env(struct image_params *imgp, int ptr_size)
+@@ -470,6 +480,69 @@ sweet_exec_env(struct image_params *imgp, int ptr_size)
  			base = c + 1;
  		}
  	}
@@ -4148,12 +4148,15 @@ index 01e674f..47d4621 100644
 +	/*
 +	 * The processes of boot-arg sweetoslog (bsd/dev/mem.c: their /dev/null goes to the
 +	 * console) get OS_ACTIVITY_DT_MODE=YES, with which libtrace writes each os_log line to
-+	 * stderr as well (what Xcode sets): their own logs, which logd keeps out of reach here.
++	 * stderr as well (what Xcode sets), and CFLOG_FORCE_STDERR=YES, with which CFLog does
++	 * (an uncaught exception's reason among them): their own logs, which logd keeps out of
++	 * reach here.
 +	 */
 +	{
 +		extern bool sweet_oslog_listed(const char *name);
-+		if (sweet_oslog_listed(base)) {
-+			int error = exec_add_user_string(imgp, CAST_USER_ADDR_T("OS_ACTIVITY_DT_MODE=YES"), UIO_SYSSPACE, TRUE);
++		static const char *const vars[] = { "OS_ACTIVITY_DT_MODE=YES", "CFLOG_FORCE_STDERR=YES" };
++		for (unsigned i = 0; sweet_oslog_listed(base) && i < sizeof(vars) / sizeof(vars[0]); i++) {
++			int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(vars[i]), UIO_SYSSPACE, TRUE);
 +			if (error) {
 +				return error;
 +			}
@@ -4170,7 +4173,7 @@ index 01e674f..47d4621 100644
  	const char *entry = spec;
  	for (;;) {
  		size_t n = 0;
-@@ -5814,6 +5884,10 @@ exec_extract_strings(struct image_params *imgp)
+@@ -5814,6 +5887,10 @@ exec_extract_strings(struct image_params *imgp)
  	}
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
