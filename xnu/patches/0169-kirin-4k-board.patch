@@ -2396,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..4575f40
+index 0000000..f1ae050
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,691 @@
+@@ -0,0 +1,697 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2731,8 +2731,13 @@ index 0000000..4575f40
 +	}
 +	uint64_t pt = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)ptva));
 +	for (uint64_t i = 0; i < 4; i++) {
-+		/* block, AttrIndx 0 (normal write-back), inner shareable, access flag */
-+		((uint64_t *)ptva)[i] = (i << 30) | (1ull << 10) | (3ull << 8) | 1ull;
++		/*
++		 * block, AttrIndx 0 (normal write-back), inner shareable, access flag, nG, and
++		 * AP_UNPRIV as Linux's io-pgtable-arm sets on every mapping: the DSP's reads are
++		 * not privileged, and without it the decoder took a permission fault on the
++		 * first buffer ("EX:AUDIO_660.adsp.:2:ADec9").
++		 */
++		((uint64_t *)ptva)[i] = (i << 30) | (1ull << 11) | (1ull << 10) | (3ull << 8) | (1ull << 6) | 1ull;
 +	}
 +	flush_dcache64((addr64_t)pt, PAGE_SIZE, TRUE);
 +
@@ -3040,6 +3045,7 @@ index 0000000..4575f40
 +			if (ns > 300000000ull) {
 +				diagnosed = true;
 +				q6_diagnose("no buffer back after 300 ms");
++				q6_diagnose("and again");     /* the log may drop a line */
 +			}
 +		}
 +		while (running && inflight < INFLIGHT) {
