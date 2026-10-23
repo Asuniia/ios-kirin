@@ -4073,7 +4073,7 @@ index bb2a2bf..878fb4c 100644
  	lock_trace = 1;
  }
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 01e674f..9a9d77a 100644
+index 01e674f..d403f30 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -453,13 +453,23 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
@@ -4103,7 +4103,7 @@ index 01e674f..9a9d77a 100644
  	}
  	if (state != 2) {
  		return 0;
-@@ -470,6 +480,69 @@ sweet_exec_env(struct image_params *imgp, int ptr_size)
+@@ -470,6 +480,71 @@ sweet_exec_env(struct image_params *imgp, int ptr_size)
  			base = c + 1;
  		}
  	}
@@ -4154,7 +4154,9 @@ index 01e674f..9a9d77a 100644
 +	 */
 +	{
 +		extern bool sweet_oslog_listed(const char *name);
-+		static const char *const vars[] = { "OS_ACTIVITY_DT_MODE=YES", "CFLOG_FORCE_STDERR=YES" };
++		/* and sweetgl, whose uncaught exception handler says an exception's reason */
++		static const char *const vars[] = { "OS_ACTIVITY_DT_MODE=YES", "CFLOG_FORCE_STDERR=YES",
++			"DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib" };
 +		for (unsigned i = 0; sweet_oslog_listed(base) && i < sizeof(vars) / sizeof(vars[0]); i++) {
 +			int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(vars[i]), UIO_SYSSPACE, TRUE);
 +			if (error) {
@@ -4173,7 +4175,7 @@ index 01e674f..9a9d77a 100644
  	const char *entry = spec;
  	for (;;) {
  		size_t n = 0;
-@@ -5814,6 +5887,10 @@ exec_extract_strings(struct image_params *imgp)
+@@ -5814,6 +5889,10 @@ exec_extract_strings(struct image_params *imgp)
  	}
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)

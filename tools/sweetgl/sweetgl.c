@@ -18,6 +18,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <objc/message.h>
+#include <objc/objc-exception.h>
+#include <objc/runtime.h>
 
 #include "pipe/p_screen.h"
 #include "pipe/p_context.h"
@@ -410,9 +414,42 @@ selftest_thread(void *arg)
 void sweetgl_layerdump_start(void);
 void sweetgl_vibrant_fill_install(void);
 
+/*
+ * An uncaught exception's name, reason and call stack, in the log (their /dev/null is teed
+ * for the processes of boot-arg sweetoslog): CoreFoundation's own handler says it through
+ * os_log, which does not reach us. Then CoreFoundation's handler, as before.
+ */
+static objc_uncaught_exception_handler prev_uncaught;
+
+static const char *
+cstr(CFStringRef s, char *buf, size_t len)
+{
+	if (s == NULL || CFGetTypeID(s) != CFStringGetTypeID() || !CFStringGetCString(s, buf, (CFIndex)len, kCFStringEncodingUTF8)) {
+		return "?";
+	}
+	return buf;
+}
+
+static void
+uncaught(id exc)
+{
+	char name[128], reason[400], frame[200];
+	CFStringRef n = (CFStringRef)((id(*)(id, SEL))objc_msgSend)(exc, sel_registerName("name"));
+	CFStringRef r = (CFStringRef)((id(*)(id, SEL))objc_msgSend)(exc, sel_registerName("reason"));
+	sweet_drm_log("sweetgl: uncaught exception %s: %s", cstr(n, name, sizeof(name)), cstr(r, reason, sizeof(reason)));
+	CFArrayRef st = (CFArrayRef)((id(*)(id, SEL))objc_msgSend)(exc, sel_registerName("callStackSymbols"));
+	for (CFIndex i = 0; st && i < CFArrayGetCount(st) && i < 25; i++) {
+		sweet_drm_log("sweetgl:   %s", cstr((CFStringRef)CFArrayGetValueAtIndex(st, i), frame, sizeof(frame)));
+	}
+	if (prev_uncaught) {
+		prev_uncaught(exc);
+	}
+}
+
 __attribute__((constructor)) static void
 sweetgl_load(void)
 {
+	prev_uncaught = objc_setUncaughtExceptionHandler(uncaught);
 	if (strcmp(getprogname(), "SpringBoard") == 0) {
 		sweetgl_vibrant_fill_install();
 		const char *d = getenv("SWEETGL_LAYERDUMP");
