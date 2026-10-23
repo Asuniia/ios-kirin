@@ -2396,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..cd19286
+index 0000000..09f1d0f
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,1048 @@
+@@ -0,0 +1,1057 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2743,11 +2743,20 @@ index 0000000..cd19286
 +	 * INT0: the codec MCLK (INT_MCLK_1 0x306), the INT4 bit clock (0x113), the SoundWire
 +	 * NPL clock (0x307), then an I2S config and a device start on port 0x1036 (mono).
 +	 */
-+	if (afe_port_clock("INT_MCLK_1 (9.6 MHz)", PORT_INT4_RX, 0x306, 9600000) ||
-+	    afe_port_clock("INT4_MI2S bit clock (1.536 MHz)", PORT_INT4_RX, 0x113, 1536000) ||
-+	    afe_port_clock("SoundWire NPL clock (153.6 MHz)", PORT_INT4_RX, 0x307, 153600000)) {
++	/* the ADSP refuses the port-level clock set (error 0x2); the service level works */
++	if (afe_clock("INT_MCLK_1 (9.6 MHz)", 0x306, 9600000, 1) ||
++	    afe_clock("INT4_MI2S bit clock (1.536 MHz)", 0x113, 1536000, 1) ||
++	    afe_clock("SoundWire NPL clock (153.6 MHz)", 0x307, 153600000, 1)) {
 +		printf("SWEET SDW: clocks refused, codec not brought up\n");
 +		return;
++	}
++	/* which is alive: the earpiece digital codec (0x152c0000, known good) vs the sdw (0x152c1000) */
++	{
++		volatile uint32_t *dig = (volatile uint32_t *)ml_io_map(0x152c0000ull, 0x1000);
++		volatile uint32_t *sw = (volatile uint32_t *)ml_io_map(SDW_CDC_PA, 0x1000);
++		printf("SWEET SDW: compare: dig(0x152c0000) CLK_RX_I2S=%02x TOP_CTL=%02x ; sdw(0x152c1000) 0x104=%02x 0x204=%02x\n",
++		    dig ? (uint8_t)dig[0x0c / 4] : 0xff, dig ? (uint8_t)dig[0xa4 / 4] : 0xff,
++		    sw ? (uint8_t)sw[0x104 / 4] : 0xff, sw ? (uint8_t)sw[0x204 / 4] : 0xff);
 +	}
 +	{
 +		struct {
