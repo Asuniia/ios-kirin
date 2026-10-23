@@ -2396,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..9ea77d5
+index 0000000..3f5e8e3
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,870 @@
+@@ -0,0 +1,905 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2638,6 +2638,40 @@ index 0000000..9ea77d5
 +	for (unsigned i = 0; i < sizeof(ana); i++) {
 +		n += sweet_pmic_read(CDC_ANA_PPID, ana[i], &v) ? snprintf(line + n, sizeof(line) - n, " %02x=%02x", ana[i], v) :
 +		    snprintf(line + n, sizeof(line) - n, " %02x=?", ana[i]);
++	}
++	printf("%s\n", line);
++}
++
++/*
++ * The speaker's codec, read only: the LPASS SoundWire codec (msm-sdw-codec, 0x152c1000),
++ * which drives the WSA881x amplifiers over SoundWire for the main speaker (port INT4). It
++ * only answers once its clocks run (INT_MCLK_1 9.6 MHz = 0x306, SWR NPL 153.6 MHz = 0x307,
++ * from the ADSP). Registers are a byte each at sdw_base + offset. This reads a few top
++ * registers to see whether the codec is reachable, before the full bring-up.
++ */
++#define SDW_CDC_PA      0x152c1000ull
++
++static void
++sdw_probe(void)
++{
++	if (afe_clock("SoundWire codec clock (INT_MCLK_1 9.6 MHz)", 0x306, 9600000, 1) ||
++	    afe_clock("SoundWire NPL clock (153.6 MHz)", 0x307, 153600000, 1)) {
++		printf("SWEET SDW: clocks refused, codec not probed\n");
++		return;
++	}
++	volatile uint32_t *sdw = (volatile uint32_t *)ml_io_map(SDW_CDC_PA, 0x1000);
++	if (sdw == NULL) {
++		printf("SWEET SDW: codec cannot be mapped\n");
++		return;
++	}
++	static const struct { uint16_t off; const char *name; } regs[] = {
++		{ 0x104, "CLK_MCLK" }, { 0x10c, "CLK_SWR" }, { 0x204, "TOP_CFG0" }, { 0x208, "TOP_CFG1" },
++		{ 0x214, "I2S_CLK" }, { 0x228, "FREQ_MCLK" }, { 0x238, "BLOCKS_RESET" },
++	};
++	char line[200];
++	int n = snprintf(line, sizeof(line), "SWEET SDW: codec");
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		n += snprintf(line + n, sizeof(line) - n, " %s=%02x", regs[i].name, (uint8_t)sdw[regs[i].off / 4]);
 +	}
 +	printf("%s\n", line);
 +}
@@ -3053,6 +3087,7 @@ index 0000000..9ea77d5
 +		}
 +	}
 +	cdc_earpiece_on();
++	sdw_probe();
 +	uint16_t copp;
 +	{
 +		struct {
