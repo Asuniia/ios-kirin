@@ -2396,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..09f1d0f
+index 0000000..3c3c896
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,1057 @@
+@@ -0,0 +1,1058 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2664,7 +2664,7 @@ index 0000000..09f1d0f
 +#define SVC_ADM         8
 +#define BASIC_RSP       0x000110E8
 +
-+static int afe_clock(const char *what, uint32_t id, uint32_t hz, uint32_t enable);
++static int afe_clock(const char *what, uint32_t id, uint32_t hz, uint32_t enable, uint32_t token);
 +static int q6_cmd(const char *what, void *pkt, uint32_t len, uint8_t svc, uint16_t port, uint32_t token, uint32_t rsp);
 +#define PORT_INT4_RX    0x1036
 +#define SDW_CDC_PA      0x152c1000ull
@@ -2744,9 +2744,9 @@ index 0000000..09f1d0f
 +	 * NPL clock (0x307), then an I2S config and a device start on port 0x1036 (mono).
 +	 */
 +	/* the ADSP refuses the port-level clock set (error 0x2); the service level works */
-+	if (afe_clock("INT_MCLK_1 (9.6 MHz)", 0x306, 9600000, 1) ||
-+	    afe_clock("INT4_MI2S bit clock (1.536 MHz)", 0x113, 1536000, 1) ||
-+	    afe_clock("SoundWire NPL clock (153.6 MHz)", 0x307, 153600000, 1)) {
++	if (afe_clock("INT_MCLK_1 (9.6 MHz)", 0x306, 9600000, 1, 90) ||
++	    afe_clock("INT4_MI2S bit clock (1.536 MHz)", 0x113, 1536000, 1, 90) ||
++	    afe_clock("SoundWire NPL clock (153.6 MHz)", 0x307, 153600000, 1, 90)) {
 +		printf("SWEET SDW: clocks refused, codec not brought up\n");
 +		return;
 +	}
@@ -2966,7 +2966,7 @@ index 0000000..09f1d0f
 +
 +/* AFE_SVC_CMD_SET_PARAM (v1 header) with one clock */
 +static int
-+afe_clock(const char *what, uint32_t id, uint32_t hz, uint32_t enable)
++afe_clock(const char *what, uint32_t id, uint32_t hz, uint32_t enable, uint32_t token)
 +{
 +	struct {
 +		struct apr_hdr h;
@@ -2989,7 +2989,8 @@ index 0000000..09f1d0f
 +	c.freq = hz;
 +	c.attri = 1;                            /* COUPLE_NO */
 +	c.enable = enable;
-+	return q6_cmd(what, &c, sizeof(c), SVC_AFE, 0, 0, 0);
++	/* token = the port index, as Linux's afe_set_lpass_clk_cfg: it routes the clock to the port */
++	return q6_cmd(what, &c, sizeof(c), SVC_AFE, 0, token, 0);
 +}
 +
 +static uint64_t
@@ -3195,8 +3196,8 @@ index 0000000..09f1d0f
 +	uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
 +	uint8_t *buf = (uint8_t *)va;
 +
-+	if (afe_clock("codec core clock (INT_MCLK_0 9.6 MHz)", 0x305, 9600000, 1) ||
-+	    afe_clock("INT0_MI2S bit clock (1.536 MHz)", 0x10F, 1536000, 1)) {
++	if (afe_clock("codec core clock (INT_MCLK_0 9.6 MHz)", 0x305, 9600000, 1, 0) ||
++	    afe_clock("INT0_MI2S bit clock (1.536 MHz)", 0x10F, 1536000, 1, 0)) {
 +		return;
 +	}
 +	cdc_probe();
