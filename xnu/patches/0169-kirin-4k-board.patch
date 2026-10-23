@@ -2396,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..f1ae050
+index 0000000..66e705a
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,697 @@
+@@ -0,0 +1,703 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2751,8 +2751,14 @@ index 0000000..f1ae050
 +	cbr[0x24 / 4] = (uint32_t)(pt >> 32);
 +	cbr[0x28 / 4] = 0;                              /* TTBR1 */
 +	cbr[0x2c / 4] = 0;
-+	/* TCR: T0SZ 32, IRGN0/ORGN0 write-back, SH0 inner, TG0 4K, EPD1 */
-+	cbr[0x30 / 4] = 32u | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23);
++	/*
++	 * TCR: T0SZ 32, IRGN0/ORGN0 write-back, SH0 inner, TG0 4K, EPD1, and bit 31: EAE if
++	 * the context bank stays in the AArch32 format (CBA2R.VA64 not taken; DT
++	 * qcom,use-3-lvl-tables), where without it the walker read our table as short
++	 * descriptors (translation fault at the first buffer, FSR 0x402); in the AArch64
++	 * format it is TG1's top bit, unused with EPD1. The LPAE 1 GB blocks are the same.
++	 */
++	cbr[0x30 / 4] = 32u | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23) | (1u << 31);
 +	cbr[0x38 / 4] = 0xff;                           /* MAIR0: attr 0 normal write-back */
 +	cbr[0x3c / 4] = 0;
 +	cbr[0x58 / 4] = 0xffffffffu;                    /* FSR: clear */
@@ -2774,9 +2780,9 @@ index 0000000..f1ae050
 +	uint32_t smr = s[(0x800 + 4 * grp) / 4], s2 = s[(0xc00 + 4 * grp) / 4];
 +	bool ok = smr == ((1u << 31) | AUDIO_SID) && ((s2 >> 16) & 3) == 0 && (s2 & 0xff) == (uint32_t)cb &&
 +	    (cbr[0] & 1) && cbr[0x20 / 4] == (uint32_t)pt;
-+	printf("SWEET Q6: SMMU context %d (identity, tables at %#llx: SCTLR %#x TCR %#x TTBR0 %#x CBAR %#x) "
-+	    "and group %d (SMR %#x S2CR %#x) for stream %u: %s\n", cb, pt, cbr[0], cbr[0x30 / 4], cbr[0x20 / 4],
-+	    gr1[cb], grp, smr, s2, AUDIO_SID, ok ? "taken" : "NOT taken, no playback");
++	printf("SWEET Q6: SMMU context %d (identity, tables at %#llx: SCTLR %#x TCR %#x TTBR0 %#x CBAR %#x CBA2R %#x, "
++	    "IDR2 %#x) and group %d (SMR %#x S2CR %#x) for stream %u: %s\n", cb, pt, cbr[0], cbr[0x30 / 4], cbr[0x20 / 4],
++	    gr1[cb], gr1[(0x800 / 4) + cb], s[0x28 / 4], grp, smr, s2, AUDIO_SID, ok ? "taken" : "NOT taken, no playback");
 +	if (!ok) {
 +		s[(0x800 + 4 * grp) / 4] = 0;          /* give the group back */
 +	}
