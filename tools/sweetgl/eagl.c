@@ -10,6 +10,13 @@
  * table generated into out/dispatch.c). Those methods are replaced here for
  * contexts we create; the original EAGL code still runs for everything else.
  *
+ * Everyone else (Core Image, GLKit, applications) gets the whole of EAGLContext
+ * (the 32 methods of the iOS 16.7 class) and EAGLSharegroup: contexts in a
+ * sharegroup share their Mesa objects; OpenGLES's own gl* entry points reach the
+ * same table through TSD slot 30 (struct sgl_context); a CAEAGLLayer drawable is
+ * two BGRA IOSurfaces in turn as the renderbuffer's storage, shown as the layer's
+ * contents at presentRenderbuffer:.
+ *
  * IOSurfaces become texture storage the EGL way: imported as a GEM bo
  * (SweetGPU selector 12), wrapped in a pipe_resource, handed to
  * glEGLImageTargetTexture2DOES through the frontend's get_egl_image.
@@ -28,6 +35,8 @@
 #include <mach/mach.h>
 #include <libkern/OSCacheControl.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CGGeometry.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 
@@ -45,14 +54,34 @@
 
 /* not in the GL bridge (ES-only): Mesa's implementation */
 void _mesa_EGLImageTargetTexture2DOES(GLenum target, GLeglImageOES image);
+void _mesa_EGLImageTargetRenderbufferStorageOES(GLenum target, GLeglImageOES image);
+id objc_retain(id obj);
+void objc_release(id obj);
 
+/*
+ * What getMacroContextPrivate returns is {rctx, disp[]} (CA reads it); what OpenGLES's own
+ * gl* entry points read is the thread's TSD slot 30 (tpidrro_el0 + 0xf0), a context whose
+ * rctx is at +0x20 and dispatch at +0x28 (glClear: [x8+0x78] = slot 10, glBindTexture
+ * 0x50 = 5, glFlush 0x2f8 = 90, glGetError 0x358 = 102: the same table). hdr makes both
+ * one structure: the TSD slot holds the context itself, the macro is &rctx.
+ */
 struct sgl_context {
-	void *rctx;                     /* = this; CA reads {rctx, disp[]} from macro */
+	void *hdr[4];
+	void *rctx;                     /* = this */
 	void *disp[SGL_SLOTS];
 	id eagl;
 	unsigned api;
 	struct sweetgl_ctx *ctx;
+	id sharegroup;                  /* ours (sgl_new_sharegroup), retained */
+	bool multithreaded;
+	/* a CAEAGLLayer's drawable (renderbufferStorage:fromDrawable:): two surfaces in turn */
+	id layer;
+	IOSurfaceRef surf[2];
+	unsigned cur;
+	GLuint rb;
 };
+_Static_assert(__builtin_offsetof(struct sgl_context, rctx) == 0x20, "TSD context: rctx at +0x20");
+_Static_assert(__builtin_offsetof(struct sgl_context, disp) == 0x28, "TSD context: dispatch at +0x28");
 
 struct sgl_image {
 	struct pipe_resource *res;
@@ -1816,10 +1845,15 @@ bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t
 
 /* ---- EAGLContext ---- */
 
-static id
-m_init(id self, SEL cmd, NSUInteger api, id props)
+static id sgl_new_sharegroup(void);
+static struct sweetgl_ctx *sgl_group_member(id sharegroup);
+
+/* a Mesa context for self, sharing objects with the other contexts of sharegroup (nil: a new group) */
+static struct sgl_context *
+sgl_new_context(id self, NSUInteger api, id sharegroup)
 {
-	struct sweetgl_ctx *ctx = api >= 2 && sweetgl_init() ? sweetgl_create((int)api, NULL) : NULL;
+	struct sweetgl_ctx *share = sharegroup ? sgl_group_member(sharegroup) : NULL;
+	struct sweetgl_ctx *ctx = api >= 2 && sweetgl_init() ? sweetgl_create((int)api, share) : NULL;
 	struct sgl_context *c = ctx ? calloc(1, sizeof(*c)) : NULL;
 	int slot = -1;
 	pthread_mutex_lock(&ctx_lock);
@@ -1841,9 +1875,20 @@ m_init(id self, SEL cmd, NSUInteger api, id props)
 		free(c);
 		sweetgl_destroy(ctx);
 		sweet_drm_log("sweetgl: EAGLContext API %lu: no Mesa context, Apple's EAGL instead", (unsigned long)api);
+		return NULL;
+	}
+	c->sharegroup = sharegroup ? objc_retain(sharegroup) : sgl_new_sharegroup();
+	sweet_drm_log("sweetgl: EAGLContext %p API %lu on Mesa (GLI %p)%s", self, (unsigned long)api, c,
+	    share ? ", sharing" : "");
+	return c;
+}
+
+static id
+m_init(id self, SEL cmd, NSUInteger api, id props)
+{
+	if (sgl_new_context(self, api, nil) == NULL) {
 		return ((id(*)(id, SEL, NSUInteger, id))orig_init)(self, cmd, api, props);
 	}
-	sweet_drm_log("sweetgl: EAGLContext %p API %lu on Mesa (GLI %p)", self, (unsigned long)api, c);
 	return self;
 }
 
@@ -1864,6 +1909,17 @@ m_dealloc(id self, SEL cmd)
 	pthread_mutex_unlock(&ctx_lock);
 	if (sgl_current == c) {
 		sgl_bind(NULL);
+	}
+	for (int i = 0; i < 2; i++) {
+		if (c->surf[i]) {
+			CFRelease(c->surf[i]);
+		}
+	}
+	if (c->layer) {
+		objc_release(c->layer);
+	}
+	if (c->sharegroup) {
+		objc_release(c->sharegroup);
 	}
 	sweetgl_destroy(c->ctx);
 	free(c);
@@ -1893,7 +1949,7 @@ static void *
 m_macro(id self, SEL cmd)
 {
 	struct sgl_context *c = lookup(self);
-	return c ? (void *)c : ((void *(*)(id, SEL))orig_macro)(self, cmd);
+	return c ? (void *)&c->rctx : ((void *(*)(id, SEL))orig_macro)(self, cmd);
 }
 
 static BOOL
@@ -1923,19 +1979,47 @@ m_attach(id self, SEL cmd, NSUInteger target, IOSurfaceRef s, BOOL inverted)
 
 static __thread id current_eagl;
 
+static void **
+tsd(void)
+{
+	void **t;
+	__asm__ volatile("mrs %0, tpidrro_el0" : "=r"(t));
+	return t;
+}
+
+/* what Apple's EAGL had in the slot when one of ours went there: given back before it runs */
+static __thread void *apple_slot;
+static __thread bool ours_in_slot;
+
 static BOOL
 m_set_current(id cls, SEL cmd, id eagl)
 {
 	struct sgl_context *c = lookup(eagl);
+	id old = current_eagl;
 	if (c) {
 		sgl_bind(c);
-		current_eagl = eagl;
+		if (!ours_in_slot) {
+			apple_slot = tsd()[30];
+			ours_in_slot = true;
+		}
+		tsd()[30] = c;
+		current_eagl = objc_retain(eagl);
+		if (old) {
+			objc_release(old);
+		}
 		return YES;
 	}
 	if (sgl_current) {
 		sgl_bind(NULL);
 	}
+	if (ours_in_slot) {
+		tsd()[30] = apple_slot;
+		ours_in_slot = false;
+	}
 	current_eagl = nil;
+	if (old) {
+		objc_release(old);
+	}
 	return ((BOOL(*)(id, SEL, id))orig_set_current)(cls, cmd, eagl);
 }
 
@@ -1943,6 +2027,373 @@ static id
 m_current(id cls, SEL cmd)
 {
 	return current_eagl ? current_eagl : ((id(*)(id, SEL))orig_current)(cls, cmd);
+}
+
+
+/* ---- the rest of EAGLContext and EAGLSharegroup: Core Image, GLKit, applications ---- */
+
+static IMP orig_init_api, orig_init_sg, orig_init_compute, orig_sharegroup, orig_label, orig_set_label, orig_is_mt,
+    orig_set_mt, orig_get_param, orig_macro2, orig_tex_iosurface8, orig_storage, orig_present, orig_present_at,
+    orig_present_after, orig_fence;
+static IMP orig_sg_dealloc, orig_sg_label, orig_sg_set_label, orig_sg_apis, orig_sg_gli;
+static char label_key;
+
+/* our sharegroups: EAGLSharegroup objects without Apple's init (which loads its GLI plugin) */
+#define MAX_SG 64
+static id sgs[MAX_SG];
+
+static bool
+our_sharegroup(id sg)
+{
+	bool r = false;
+	pthread_mutex_lock(&ctx_lock);
+	for (int i = 0; i < MAX_SG && !r && sg; i++) {
+		r = sgs[i] == sg;
+	}
+	pthread_mutex_unlock(&ctx_lock);
+	return r;
+}
+
+static id
+sgl_new_sharegroup(void)
+{
+	id sg = class_createInstance(objc_getClass("EAGLSharegroup"), 0);
+	pthread_mutex_lock(&ctx_lock);
+	for (int i = 0; i < MAX_SG; i++) {
+		if (sgs[i] == nil) {
+			sgs[i] = sg;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&ctx_lock);
+	return sg;
+}
+
+/* a live Mesa context of the group, to share objects with */
+static struct sweetgl_ctx *
+sgl_group_member(id sg)
+{
+	struct sweetgl_ctx *r = NULL;
+	pthread_mutex_lock(&ctx_lock);
+	for (int i = 0; i < MAX_CTX && r == NULL; i++) {
+		if (ctxs[i] && ctxs[i]->sharegroup == sg) {
+			r = ctxs[i]->ctx;
+		}
+	}
+	pthread_mutex_unlock(&ctx_lock);
+	return r;
+}
+
+static void
+m_sg_dealloc(id self, SEL cmd)
+{
+	if (!our_sharegroup(self)) {
+		((void (*)(id, SEL))orig_sg_dealloc)(self, cmd);
+		return;
+	}
+	pthread_mutex_lock(&ctx_lock);
+	for (int i = 0; i < MAX_SG; i++) {
+		if (sgs[i] == self) {
+			sgs[i] = nil;
+		}
+	}
+	pthread_mutex_unlock(&ctx_lock);
+	struct objc_super sup = {self, class_getSuperclass(objc_getClass("EAGLSharegroup"))};
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, cmd);
+}
+
+static id
+m_sg_label(id self, SEL cmd)
+{
+	return our_sharegroup(self) ? objc_getAssociatedObject(self, &label_key) :
+	    ((id(*)(id, SEL))orig_sg_label)(self, cmd);
+}
+
+static void
+m_sg_set_label(id self, SEL cmd, id label)
+{
+	if (our_sharegroup(self)) {
+		objc_setAssociatedObject(self, &label_key, label, OBJC_ASSOCIATION_COPY);
+	} else {
+		((void (*)(id, SEL, id))orig_sg_set_label)(self, cmd, label);
+	}
+}
+
+static NSUInteger
+m_sg_apis(id self, SEL cmd)
+{
+	return our_sharegroup(self) ? (1u << 2) | (1u << 3) : ((NSUInteger(*)(id, SEL))orig_sg_apis)(self, cmd);
+}
+
+static void *
+m_sg_gli(id self, SEL cmd)
+{
+	return our_sharegroup(self) ? NULL : ((void *(*)(id, SEL))orig_sg_gli)(self, cmd);
+}
+
+static id
+m_init_api(id self, SEL cmd, NSUInteger api)
+{
+	return sgl_new_context(self, api, nil) ? self : ((id(*)(id, SEL, NSUInteger))orig_init_api)(self, cmd, api);
+}
+
+static id
+m_init_sg(id self, SEL cmd, NSUInteger api, id sg)
+{
+	if (sg && !our_sharegroup(sg)) {
+		return ((id(*)(id, SEL, NSUInteger, id))orig_init_sg)(self, cmd, api, sg);
+	}
+	return sgl_new_context(self, api, sg) ? self : ((id(*)(id, SEL, NSUInteger, id))orig_init_sg)(self, cmd, api, sg);
+}
+
+static id
+m_init_compute(id self, SEL cmd, NSUInteger api, BOOL compute)
+{
+	return sgl_new_context(self, api, nil) ? self :
+	    ((id(*)(id, SEL, NSUInteger, BOOL))orig_init_compute)(self, cmd, api, compute);
+}
+
+static id
+m_sharegroup(id self, SEL cmd)
+{
+	struct sgl_context *c = lookup(self);
+	return c ? c->sharegroup : ((id(*)(id, SEL))orig_sharegroup)(self, cmd);
+}
+
+static id
+m_label(id self, SEL cmd)
+{
+	return lookup(self) ? objc_getAssociatedObject(self, &label_key) : ((id(*)(id, SEL))orig_label)(self, cmd);
+}
+
+static void
+m_set_label(id self, SEL cmd, id label)
+{
+	if (lookup(self)) {
+		objc_setAssociatedObject(self, &label_key, label, OBJC_ASSOCIATION_COPY);
+	} else {
+		((void (*)(id, SEL, id))orig_set_label)(self, cmd, label);
+	}
+}
+
+static BOOL
+m_is_mt(id self, SEL cmd)
+{
+	struct sgl_context *c = lookup(self);
+	return c ? c->multithreaded : ((BOOL(*)(id, SEL))orig_is_mt)(self, cmd);
+}
+
+static void
+m_set_mt(id self, SEL cmd, BOOL mt)
+{
+	struct sgl_context *c = lookup(self);
+	if (c) {
+		c->multithreaded = mt;      /* Mesa serializes per context anyway */
+	} else {
+		((void (*)(id, SEL, BOOL))orig_set_mt)(self, cmd, mt);
+	}
+}
+
+static NSUInteger
+m_get_param(id self, SEL cmd, uint32_t pname, int32_t *value)
+{
+	if (lookup(self) == NULL) {
+		return ((NSUInteger(*)(id, SEL, uint32_t, int32_t *))orig_get_param)(self, cmd, pname, value);
+	}
+	if (value) {
+		*value = 0;
+	}
+	return YES;
+}
+
+static void *
+m_macro2(id self, SEL cmd)
+{
+	struct sgl_context *c = lookup(self);
+	return c ? (void *)&c->rctx : ((void *(*)(id, SEL))orig_macro2)(self, cmd);
+}
+
+static BOOL
+m_tex_iosurface8(id self, SEL cmd, IOSurfaceRef s, NSUInteger target, NSUInteger internalformat, uint32_t width,
+    uint32_t height, NSUInteger format, NSUInteger type, uint32_t plane)
+{
+	struct sgl_context *c = lookup(self);
+	if (c == NULL) {
+		return ((BOOL(*)(id, SEL, IOSurfaceRef, NSUInteger, NSUInteger, uint32_t, uint32_t, NSUInteger,
+		    NSUInteger, uint32_t))orig_tex_iosurface8)(self, cmd, s, target, internalformat, width, height,
+		    format, type, plane);
+	}
+	SGL_CUR(c);
+	return bind_surface(s, SGL_TGT((GLenum)target), (GLenum)format, (GLenum)type, plane, "texImageIOSurface");
+}
+
+/* a BGRA surface whose rows suit the GPU (64-byte pitch) */
+static IOSurfaceRef
+new_surface(uint32_t w, uint32_t h)
+{
+	int32_t v[5] = { (int32_t)w, (int32_t)h, 4, (int32_t)((w * 4 + 63) & ~63u), (int32_t)'BGRA' };
+	CFStringRef k[5] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow,
+		kIOSurfacePixelFormat };
+	CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 5, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	for (int i = 0; i < 5; i++) {
+		CFNumberRef n = CFNumberCreate(NULL, kCFNumberSInt32Type, &v[i]);
+		CFDictionarySetValue(d, k[i], n);
+		CFRelease(n);
+	}
+	IOSurfaceRef s = IOSurfaceCreate(d);
+	CFRelease(d);
+	return s;
+}
+
+/* the surface's pages as the storage of the renderbuffer bound now (as bind_surface for textures) */
+static bool
+rb_from_surface(IOSurfaceRef s)
+{
+	size_t w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s), pitch = IOSurfaceGetBytesPerRow(s);
+	struct sgl_image img = {0};
+	img.format = surface_format(IOSurfaceGetPixelFormat(s), 4, &img.internalformat);
+	struct surf_res key = {
+		.id = IOSurfaceGetID(s),
+		.format = img.format,
+		.w = (uint32_t)w,
+		.h = (uint32_t)h,
+		.pitch = (uint32_t)pitch,
+		.base = (uintptr_t)IOSurfaceGetBaseAddress(s),
+	};
+	img.res = surf_res_get(&key);
+	uint32_t handle = 0;
+	uint64_t size = 0;
+	if (img.res == NULL && sweet_drm_import_iosurface(IOSurfaceGetID(s), (uint64_t)(uintptr_t)IOSurfaceGetBaseAddress(s),
+	    &handle, &size) == 0) {
+		struct pipe_screen *screen = sweetgl_screen();
+		struct pipe_resource templ = {
+			.target = PIPE_TEXTURE_2D,
+			.format = img.format,
+			.width0 = (uint32_t)w,
+			.height0 = (uint16_t)h,
+			.depth0 = 1,
+			.array_size = 1,
+			.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET | PIPE_BIND_SHARED,
+		};
+		struct winsys_handle wh = {
+			.type = WINSYS_HANDLE_TYPE_KMS,
+			.handle = handle,
+			.stride = (unsigned)pitch,
+			.offset = (unsigned)((uintptr_t)IOSurfaceGetBaseAddress(s) & vm_page_mask),
+			.format = img.format,
+			.modifier = DRM_FORMAT_MOD_LINEAR,
+		};
+		img.res = screen->resource_from_handle(screen, &templ, &wh, PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+		surf_res_put(&key, img.res);
+	}
+	if (img.res == NULL) {
+		sweet_drm_log("sweetgl: drawable surface %u %zux%zu: import failed", IOSurfaceGetID(s), w, h);
+		return false;
+	}
+	_mesa_EGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, (GLeglImageOES)&img);
+	pipe_resource_reference(&img.res, NULL);
+	GLenum e = glGetError();
+	if (e != GL_NO_ERROR) {
+		sweet_drm_log("sweetgl: drawable surface %u: EGLImageTargetRenderbufferStorage error %#x", IOSurfaceGetID(s), e);
+	}
+	return e == GL_NO_ERROR;
+}
+
+/* renderbufferStorage:fromDrawable: a CAEAGLLayer, at its size in pixels */
+static BOOL
+m_storage(id self, SEL cmd, NSUInteger target, id drawable)
+{
+	struct sgl_context *c = lookup(self);
+	if (c == NULL) {
+		return ((BOOL(*)(id, SEL, NSUInteger, id))orig_storage)(self, cmd, target, drawable);
+	}
+	SGL_CUR(c);
+	CGRect b = drawable ? ((CGRect(*)(id, SEL))objc_msgSend)(drawable, sel_registerName("bounds")) : CGRectZero;
+	CGFloat scale = drawable ? ((CGFloat(*)(id, SEL))objc_msgSend)(drawable, sel_registerName("contentsScale")) : 1;
+	uint32_t w = (uint32_t)(b.size.width * scale + 0.5), h = (uint32_t)(b.size.height * scale + 0.5);
+	for (int i = 0; i < 2; i++) {
+		if (c->surf[i]) {
+			CFRelease(c->surf[i]);
+			c->surf[i] = NULL;
+		}
+	}
+	if (c->layer) {
+		objc_release(c->layer);
+		c->layer = nil;
+	}
+	if (w == 0 || h == 0 || (GLenum)target != GL_RENDERBUFFER) {
+		return NO;
+	}
+	c->surf[0] = new_surface(w, h);
+	c->surf[1] = new_surface(w, h);
+	if (c->surf[0] == NULL || c->surf[1] == NULL) {
+		return NO;
+	}
+	GLint rb = 0;
+	glGetIntegerv(GL_RENDERBUFFER_BINDING, &rb);
+	c->rb = (GLuint)rb;
+	c->cur = 0;
+	c->layer = objc_retain(drawable);
+	sweet_drm_log("sweetgl: drawable %ux%u for renderbuffer %d", w, h, rb);
+	return rb_from_surface(c->surf[0]);
+}
+
+/* the frame drawn goes to the layer; the renderbuffer moves on to the other surface */
+static BOOL
+sgl_present(struct sgl_context *c)
+{
+	if (c->layer == nil || c->surf[0] == NULL) {
+		return NO;
+	}
+	SGL_CUR(c);
+	glFinish();
+	((void (*)(id, SEL, id))objc_msgSend)(c->layer, sel_registerName("setContents:"), (id)c->surf[c->cur]);
+	if (!pthread_main_np()) {
+		((void (*)(id, SEL))objc_msgSend)((id)objc_getClass("CATransaction"), sel_registerName("flush"));
+	}
+	c->cur ^= 1;
+	GLint was = 0;
+	glGetIntegerv(GL_RENDERBUFFER_BINDING, &was);
+	glBindRenderbuffer(GL_RENDERBUFFER, c->rb);
+	bool ok = rb_from_surface(c->surf[c->cur]);
+	glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)was);
+	return ok;
+}
+
+static BOOL
+m_present(id self, SEL cmd, NSUInteger target)
+{
+	struct sgl_context *c = lookup(self);
+	return c ? sgl_present(c) : ((BOOL(*)(id, SEL, NSUInteger))orig_present)(self, cmd, target);
+}
+
+static BOOL
+m_present_at(id self, SEL cmd, NSUInteger target, double t)
+{
+	struct sgl_context *c = lookup(self);
+	return c ? sgl_present(c) : ((BOOL(*)(id, SEL, NSUInteger, double))orig_present_at)(self, cmd, target, t);
+}
+
+static BOOL
+m_present_after(id self, SEL cmd, NSUInteger target, double t)
+{
+	struct sgl_context *c = lookup(self);
+	return c ? sgl_present(c) : ((BOOL(*)(id, SEL, NSUInteger, double))orig_present_after)(self, cmd, target, t);
+}
+
+/* setBlockFence:onQueue: the block runs once what was submitted so far is done */
+static BOOL
+m_fence(id self, SEL cmd, id block, id queue)
+{
+	struct sgl_context *c = lookup(self);
+	if (c == NULL) {
+		return ((BOOL(*)(id, SEL, id, id))orig_fence)(self, cmd, block, queue);
+	}
+	SGL_CUR(c);
+	glFinish();
+	dispatch_async((dispatch_queue_t)queue, (dispatch_block_t)block);
+	return YES;
 }
 
 static IMP
@@ -2302,12 +2753,10 @@ sgl_install_texfns(void)
 }
 
 /*
- * Core Image: this shim is EAGL as Core Animation uses it, not as Core Image does
- * (initWithOptions: asks a GL context for its sharegroup, whose private part our
- * contexts do not have: Settings' storage page crashed there). Every CIContext is
- * made with kCIContextUseSoftwareRenderer, so Core Image renders on the CPU and makes
- * no GL context at all. CoreImage may come after this library: the method is replaced
- * when its image arrives.
+ * Core Image's fallback, SWEETGL_CI_SOFTWARE=1: every CIContext made with
+ * kCIContextUseSoftwareRenderer, so Core Image renders on the CPU and makes no GL context.
+ * By default it renders through the EAGL below, as everybody else. CoreImage may come
+ * after this library: the method is replaced when its image arrives.
  */
 static IMP orig_ci_init;
 static CFStringRef ci_software_key;
@@ -2326,7 +2775,12 @@ m_ci_init(id self, SEL cmd, CFDictionaryRef options)
 static void
 ci_try_install(void)
 {
-	if (orig_ci_init != NULL) {
+	static int wanted = -1;
+	if (wanted < 0) {
+		const char *e = getenv("SWEETGL_CI_SOFTWARE");
+		wanted = e && e[0] == '1';
+	}
+	if (orig_ci_init != NULL || !wanted) {
 		return;
 	}
 	Class cls = objc_getClass("CIContext");
@@ -2378,6 +2832,32 @@ sweetgl_eagl_install(void)
 	orig_attach = swap(cls, "attachImage:toCoreSurface:invertedRender:", m_attach);
 	orig_set_current = swap(meta, "setCurrentContext:", m_set_current);
 	orig_current = swap(meta, "currentContext", m_current);
+	/* the rest of EAGLContext, for everyone else than CA (Core Image, GLKit, applications) */
+	orig_init_api = swap(cls, "initWithAPI:", m_init_api);
+	orig_init_sg = swap(cls, "initWithAPI:sharegroup:", m_init_sg);
+	orig_init_compute = swap(cls, "initWithAPI:sharedWithCompute:", m_init_compute);
+	orig_sharegroup = swap(cls, "sharegroup", m_sharegroup);
+	orig_label = swap(cls, "debugLabel", m_label);
+	orig_set_label = swap(cls, "setDebugLabel:", m_set_label);
+	orig_is_mt = swap(cls, "isMultiThreaded", m_is_mt);
+	orig_set_mt = swap(cls, "setMultiThreaded:", m_set_mt);
+	orig_get_param = swap(cls, "getParameter:to:", m_get_param);
+	orig_macro2 = swap(cls, "GetMacroContextPrivate", m_macro2);
+	orig_tex_iosurface8 = swap(cls, "texImageIOSurface:target:internalFormat:width:height:format:type:plane:",
+	    m_tex_iosurface8);
+	orig_storage = swap(cls, "renderbufferStorage:fromDrawable:", m_storage);
+	orig_present = swap(cls, "presentRenderbuffer:", m_present);
+	orig_present_at = swap(cls, "presentRenderbuffer:atTime:", m_present_at);
+	orig_present_after = swap(cls, "presentRenderbuffer:afterMinimumDuration:", m_present_after);
+	orig_fence = swap(cls, "setBlockFence:onQueue:", m_fence);
+	Class sgc = objc_getClass("EAGLSharegroup");
+	if (sgc != Nil) {
+		orig_sg_dealloc = swap(sgc, "dealloc", m_sg_dealloc);
+		orig_sg_label = swap(sgc, "debugLabel", m_sg_label);
+		orig_sg_set_label = swap(sgc, "setDebugLabel:", m_sg_set_label);
+		orig_sg_apis = swap(sgc, "APIs", m_sg_apis);
+		orig_sg_gli = swap(sgc, "getGLIShared", m_sg_gli);
+	}
 	sweet_drm_log("sweetgl: EAGL shim installed%s", sgl_check_errors ? " (GL error checks on)" : "");
 	_dyld_register_func_for_add_image(ci_image_added);       /* also runs for the images already there */
 }
