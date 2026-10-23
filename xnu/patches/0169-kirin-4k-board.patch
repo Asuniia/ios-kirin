@@ -2396,7 +2396,7 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..8426494
+index 0000000..86c1e45
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
 @@ -0,0 +1,1015 @@
@@ -2649,6 +2649,21 @@ index 0000000..8426494
 + * from the ADSP). Registers are a byte each at sdw_base + offset. This reads a few top
 + * registers to see whether the codec is reachable, before the full bring-up.
 + */
++struct apr_hdr {
++	uint16_t hdr_field, pkt_size;
++	uint8_t src_svc, src_domain;
++	uint16_t src_port;
++	uint8_t dest_svc, dest_domain;
++	uint16_t dest_port;
++	uint32_t token, opcode;
++} __attribute__((packed));
++
++#define SVC_CORE        3
++#define SVC_AFE         4
++#define SVC_ASM         7
++#define SVC_ADM         8
++#define BASIC_RSP       0x000110E8
++
 +static int afe_clock(const char *what, uint32_t id, uint32_t hz, uint32_t enable);
 +static int q6_cmd(const char *what, void *pkt, uint32_t len, uint8_t svc, uint16_t port, uint32_t token, uint32_t rsp);
 +#define PORT_INT4_RX    0x1036
@@ -2811,12 +2826,6 @@ index 0000000..8426494
 +#define GCC_LPASS_SMMU  0x0017d014ull
 +#define AUDIO_SID       1u
 +
-+#define SVC_CORE        3
-+#define SVC_AFE         4
-+#define SVC_ASM         7
-+#define SVC_ADM         8
-+#define BASIC_RSP       0x000110E8
-+
 +#define PORT_INT0_RX    0x102E
 +#define SESSION         1
 +#define ASM_PORT        ((SESSION << 8) | 1)
@@ -2825,15 +2834,6 @@ index 0000000..8426494
 +#define BUFSZ           4096u
 +#define INFLIGHT        4
 +#define RING            65536u
-+
-+struct apr_hdr {
-+	uint16_t hdr_field, pkt_size;
-+	uint8_t src_svc, src_domain;
-+	uint16_t src_port;
-+	uint8_t dest_svc, dest_domain;
-+	uint16_t dest_port;
-+	uint32_t token, opcode;
-+} __attribute__((packed));
 +
 +static struct {
 +	/* the one command waited for */
