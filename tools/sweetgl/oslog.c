@@ -1,11 +1,11 @@
 /*
  * sweetgl in the processes of boot-arg sweetoslog: their os_log lines in the log. logd
  * keeps them out of reach here (and OS_ACTIVITY_DT_MODE does nothing for system binaries),
- * so the calls are interposed: _os_log_impl and its error/fault/debug forms decode the
- * buffer as libtrace lays it out (a summary byte, the argument count, then per argument a
+ * so _os_log_impl and its error and fault forms are hooked: the buffer is decoded as
+ * libtrace lays it out (a summary byte, the argument count, then per argument a
  * descriptor byte -- its type in the high nibble: 0 scalar, 1 count, 2 string, 3 pointer,
  * 4 object -- a size byte and the data) against the format string, write the line through
- * sweet_drm_log (the process's /dev/null, teed to the console), then call the original.
+ * sweet_drm_log (the process's /dev/null, teed to the console), then the original runs.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <os/log.h>
@@ -17,10 +17,6 @@
 
 #include "sweet_drm.h"
 
-void _os_log_impl(void *dso, os_log_t log, os_log_type_t type, const char *format, uint8_t *buf, uint32_t size);
-void _os_log_error_impl(void *dso, os_log_t log, os_log_type_t type, const char *format, uint8_t *buf, uint32_t size);
-void _os_log_fault_impl(void *dso, os_log_t log, os_log_type_t type, const char *format, uint8_t *buf, uint32_t size);
-void _os_log_debug_impl(void *dso, os_log_t log, os_log_type_t type, const char *format, uint8_t *buf, uint32_t size);
 
 static __thread int in_log;
 
@@ -156,30 +152,104 @@ decode(os_log_type_t type, const char *fmt, const uint8_t *buf, uint32_t size)
 	sweet_drm_log("%s", out);
 }
 
-#define WRAP(name)                                                                              \
-	static void                                                                             \
-	sweet_##name(void *dso, os_log_t log, os_log_type_t type, const char *format, uint8_t *buf, \
-	    uint32_t size)                                                                      \
-	{                                                                                       \
-		if (!in_log && type != OS_LOG_TYPE_DEBUG && wanted()) {                         \
-			in_log = 1;                                                             \
-			decode(type, format, buf, size);                                        \
-			in_log = 0;                                                             \
-		}                                                                               \
-		name(dso, log, type, format, buf, size);                                        \
+/*
+ * The calls from inside the shared cache are not interposed (the HAL and VirtualAudio log
+ * from there), so the entry points themselves are patched. In iOS 16.7 each is a relay:
+ * stp fp, lr / mov fp, sp / mov x6, lr / bl _os_log / ldp / ret. Its first four words
+ * become a jump to oslog_hook, which decodes the line, then does what the relay did
+ * (x6 = the caller) and branches to the internal _os_log found from that bl, with lr
+ * left as the caller's: nothing of the original is replayed.
+ */
+#include <dlfcn.h>
+#include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
+
+uint64_t sweet_os_log_target;
+void sweet_oslog_decode(uint64_t type, const char *fmt, const uint8_t *buf, uint64_t size);
+
+void
+sweet_oslog_decode(uint64_t type, const char *fmt, const uint8_t *buf, uint64_t size)
+{
+	if (!in_log && type != OS_LOG_TYPE_DEBUG) {
+		in_log = 1;
+		decode((os_log_type_t)type, fmt, buf, (uint32_t)size);
+		in_log = 0;
 	}
+}
 
-WRAP(_os_log_impl)
-WRAP(_os_log_error_impl)
-WRAP(_os_log_fault_impl)
-WRAP(_os_log_debug_impl)
+__attribute__((naked)) static void
+oslog_hook(void)
+{
+	__asm__ volatile(
+	    "stp x29, x30, [sp, #-96]!\n"
+	    "mov x29, sp\n"
+	    "stp x0, x1, [sp, #16]\n"
+	    "stp x2, x3, [sp, #32]\n"
+	    "stp x4, x5, [sp, #48]\n"
+	    "stp x6, x7, [sp, #64]\n"
+	    "str x8, [sp, #80]\n"
+	    "mov x0, x2\n"
+	    "mov x1, x3\n"
+	    "mov x2, x4\n"
+	    "mov x3, x5\n"
+	    "bl _sweet_oslog_decode\n"
+	    "ldp x0, x1, [sp, #16]\n"
+	    "ldp x2, x3, [sp, #32]\n"
+	    "ldp x4, x5, [sp, #48]\n"
+	    "ldp x6, x7, [sp, #64]\n"
+	    "ldr x8, [sp, #80]\n"
+	    "ldp x29, x30, [sp], #96\n"
+	    "mov x6, x30\n"
+	    "adrp x16, _sweet_os_log_target@PAGE\n"
+	    "ldr x16, [x16, _sweet_os_log_target@PAGEOFF]\n"
+	    "br x16\n");
+}
 
-/* dyld interposes these for every image, the shared cache's included, while sweetgl is loaded */
-__attribute__((used, section("__DATA,__interpose"))) static const struct {
-	const void *replacement, *replacee;
-} interposers[] = {
-	{ (const void *)sweet__os_log_impl, (const void *)_os_log_impl },
-	{ (const void *)sweet__os_log_error_impl, (const void *)_os_log_error_impl },
-	{ (const void *)sweet__os_log_fault_impl, (const void *)_os_log_fault_impl },
-	{ (const void *)sweet__os_log_debug_impl, (const void *)_os_log_debug_impl },
-};
+static void
+patch_relay(const char *name)
+{
+	uint32_t *t = dlsym(RTLD_DEFAULT, name);
+	if (t == NULL) {
+		sweet_drm_log("sweetgl: os_log hook: no %s", name);
+		return;
+	}
+	if (t[0] != 0xa9bf7bfd || t[1] != 0x910003fd || t[2] != 0xaa1e03e6 || (t[3] & 0xfc000000) != 0x94000000) {
+		sweet_drm_log("sweetgl: os_log hook: %s is not the relay expected (%08x %08x %08x %08x)", name, t[0], t[1], t[2], t[3]);
+		return;
+	}
+	int64_t off = (int64_t)((uint64_t)(t[3] & 0x03ffffff) << 38) >> 36;     /* imm26 * 4, sign-extended */
+	uint64_t target = (uint64_t)(uintptr_t)&t[3] + (uint64_t)off;
+	if (sweet_os_log_target == 0) {
+		sweet_os_log_target = target;
+	} else if (target != sweet_os_log_target) {
+		sweet_drm_log("sweetgl: os_log hook: %s relays elsewhere, not hooked", name);
+		return;
+	}
+	vm_address_t page = (vm_address_t)t & ~(vm_address_t)vm_page_mask;
+	if (vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) !=
+	    KERN_SUCCESS) {
+		sweet_drm_log("sweetgl: os_log hook: %s not writable", name);
+		return;
+	}
+	uint32_t patch[4] = { 0x58000050, 0xd61f0200, 0, 0 };  /* ldr x16, #8; br x16; .quad oslog_hook */
+	uint64_t hook = (uint64_t)(uintptr_t)oslog_hook;
+	memcpy(&patch[2], &hook, 8);
+	memcpy(t, patch, sizeof(patch));
+	vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	sys_icache_invalidate(t, sizeof(patch));
+}
+
+/* sweetgl's constructor: only in the processes of sweetoslog */
+void sweetgl_oslog_install(void);
+
+void
+sweetgl_oslog_install(void)
+{
+	if (!wanted()) {
+		return;
+	}
+	patch_relay("_os_log_impl");
+	patch_relay("_os_log_error_impl");
+	patch_relay("_os_log_fault_impl");
+	sweet_drm_log("sweetgl: os_log hooked (_os_log at %#llx)", (unsigned long long)sweet_os_log_target);
+}

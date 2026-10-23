@@ -450,6 +450,8 @@ __attribute__((constructor)) static void
 sweetgl_load(void)
 {
 	prev_uncaught = objc_setUncaughtExceptionHandler(uncaught);
+	extern void sweetgl_oslog_install(void);
+	sweetgl_oslog_install();
 	if (strcmp(getprogname(), "SpringBoard") == 0) {
 		sweetgl_vibrant_fill_install();
 		const char *d = getenv("SWEETGL_LAYERDUMP");
