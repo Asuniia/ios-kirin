@@ -381,10 +381,43 @@ destroy_device(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectI
 	return kAudioHardwareUnsupportedOperationError;
 }
 
-static OSStatus
-device_client(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object,
-    __unused const AudioServerPlugInClientInfo *client)
+/* kirin: what the HAL and the virtual audio device do with our devices, each thing once */
+#define TRACE_TOLD 400
+static UInt32 trace_told[TRACE_TOLD][4];
+static unsigned trace_count;
+
+static void
+trace(const char *what, AudioObjectID object, const AudioObjectPropertyAddress *address)
 {
+	UInt32 s = address ? address->mSelector : 0, c = address ? address->mScope : 0;
+	UInt32 kind = (UInt32)what[0] << 8 | (UInt32)what[1];
+
+	for (unsigned i = 0; i < trace_count; i++) {
+		if (trace_told[i][0] == kind && trace_told[i][1] == object && trace_told[i][2] == s && trace_told[i][3] == c) {
+			return;
+		}
+	}
+	if (trace_count >= TRACE_TOLD) {
+		return;
+	}
+	trace_told[trace_count][0] = kind;
+	trace_told[trace_count][1] = object;
+	trace_told[trace_count][2] = s;
+	trace_told[trace_count][3] = c;
+	trace_count++;
+	say("sweetaudio: %s object %u (%s) '%c%c%c%c' scope '%c%c%c%c'\n", what, (unsigned)object,
+	    device_of(object) ? CFStringGetCStringPtr(device_of(object)->uid, kCFStringEncodingUTF8) : "-",
+	    (int)(s >> 24 & 0xff), (int)(s >> 16 & 0xff), (int)(s >> 8 & 0xff), (int)(s & 0xff),
+	    (int)(c >> 24 & 0xff), (int)(c >> 16 & 0xff), (int)(c >> 8 & 0xff), (int)(c & 0xff));
+}
+
+static OSStatus
+device_client(__unused AudioServerPlugInDriverRef driver, AudioObjectID object,
+    const AudioServerPlugInClientInfo *client)
+{
+	say("sweetaudio: client added to object %u (%s): pid %d\n", (unsigned)object,
+	    device_of(object) ? CFStringGetCStringPtr(device_of(object)->uid, kCFStringEncodingUTF8) : "-",
+	    client ? (int)client->mProcessID : -1);
 	return 0;
 }
 
@@ -756,6 +789,7 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		*size = sizeof(Float32);
 		return 0;
 	}
+	trace("get", object, address);
 	pthread_mutex_lock(&lock);
 	v = property(object, address, qualifier_size, qualifier);
 	pthread_mutex_unlock(&lock);
@@ -782,6 +816,7 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 {
 	Boolean settable = false;
 
+	trace("set", object, address);
 	if (address == NULL || data == NULL || is_property_settable(driver, object, client, address, &settable) != 0) {
 		return kAudioHardwareUnknownPropertyError;
 	}
@@ -897,6 +932,8 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 {
 	struct device *d = device_of(object);
 
+	say("sweetaudio: start I/O on object %u (%s)\n", (unsigned)object,
+	    d ? CFStringGetCStringPtr(d->uid, kCFStringEncodingUTF8) : "-");
 	if (d == NULL || object != d->object) {
 		return kAudioHardwareBadObjectError;
 	}
