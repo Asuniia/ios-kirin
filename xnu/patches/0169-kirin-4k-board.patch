@@ -456,10 +456,10 @@ index 0000000..e65c54e
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
 new file mode 100644
-index 0000000..066e1c4
+index 0000000..41d1987
 --- /dev/null
 +++ b/bsd/dev/sweet_glink.c
-@@ -0,0 +1,896 @@
+@@ -0,0 +1,948 @@
 +/*
 + * kirin: talking to the ADSP once it runs (bsd/dev/sweet_adsp.c), as
 + * Linux 4.19's qcom_smem + qcom_glink_smem + qcom_glink_native do it for DT
@@ -641,17 +641,69 @@ index 0000000..066e1c4
 +	return false;
 +}
 +
++static volatile uint8_t *smem_get_in(volatile uint8_t *part, uint32_t part_size, uint16_t item, uint32_t *size);
++
 +static volatile uint8_t *
 +smem_get(uint16_t item, uint32_t *size)
 +{
-+	volatile struct part_header *ph = (volatile struct part_header *)g.part;
++	return smem_get_in(g.part, g.part_size, item, size);
++}
++
++/*
++ * A global item: in the legacy table of the SMEM header (toc at +0xd0: allocated, offset,
++ * size, aux_base) or in the global partition (hosts 0xfffe), as Linux's qcom_smem_get.
++ * Its text (up to len - 1 bytes) for the audio side's diagnostics: item 423 is the
++ * reason the LPASS (the ADSP) gives when it goes down.
++ */
++bool sweet_glink_smem_string(uint16_t item, char *out, uint32_t len);
++
++bool
++sweet_glink_smem_string(uint16_t item, char *out, uint32_t len)
++{
++	volatile uint8_t *p = NULL;
++	uint32_t size = 0;
++	if (g.smem == NULL || len == 0) {
++		return false;
++	}
++	volatile uint32_t *toc = (volatile uint32_t *)(g.smem + 0xd0 + 16 * (uint32_t)item);
++	if (item < 512 && toc[0] == 1 && toc[1] + (uint64_t)toc[2] <= SMEM_SZ && toc[2] > 0) {
++		p = g.smem + toc[1];
++		size = toc[2];
++	} else {
++		volatile uint8_t *pt = g.smem + SMEM_SZ - 4096;
++		uint32_t n = memcmp((const void *)pt, "$TOC", 4) == 0 ? *(volatile uint32_t *)(pt + 8) : 0;
++		for (uint32_t i = 0; i < n && i < 32 && p == NULL; i++) {
++			volatile struct ptable_entry *e = (volatile struct ptable_entry *)(pt + 32 + i * sizeof(struct ptable_entry));
++			if (e->host0 == 0xfffe && e->host1 == 0xfffe && e->offset && e->offset + (uint64_t)e->size <= SMEM_SZ) {
++				p = smem_get_in(g.smem + e->offset, e->size, item, &size);
++			}
++		}
++	}
++	if (p == NULL) {
++		return false;
++	}
++	uint32_t k = 0;
++	for (; k + 1 < len && k < size && p[k] != 0; k++) {
++		out[k] = (char)p[k];
++	}
++	out[k] = 0;
++	return true;
++}
++
++static volatile uint8_t *
++smem_get_in(volatile uint8_t *part, uint32_t part_size, uint16_t item, uint32_t *size)
++{
++	volatile struct part_header *ph = (volatile struct part_header *)part;
++	if (part == NULL) {
++		return NULL;
++	}
 +	uint32_t end = ph->offset_free_uncached;
 +	uint32_t off = sizeof(struct part_header);
-+	if (end > g.part_size) {
++	if (end > part_size) {
 +		return NULL;
 +	}
 +	while (off + sizeof(struct private_entry) <= end) {
-+		volatile struct private_entry *e = (volatile struct private_entry *)(g.part + off);
++		volatile struct private_entry *e = (volatile struct private_entry *)(part + off);
 +		if (e->canary != 0xa5a5) {
 +			printf("SWEET GLINK: SMEM bad canary at +%#x\n", off);
 +			return NULL;
@@ -661,7 +713,7 @@ index 0000000..066e1c4
 +			if (size) {
 +				*size = e->size - e->padding_data;
 +			}
-+			return g.part + off + sizeof(struct private_entry) + e->padding_hdr;
++			return part + off + sizeof(struct private_entry) + e->padding_hdr;
 +		}
 +		if (next <= off) {
 +			return NULL;
@@ -2344,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..85ae248
+index 0000000..950072c
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,624 @@
+@@ -0,0 +1,657 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2395,6 +2447,26 @@ index 0000000..85ae248
 +extern void (*sweet_glink_apr_client)(const uint8_t *pkt, uint32_t len);
 +void sweet_q6audio_init(void);
 +void sweet_q6audio_play(const uint8_t *pcm, uint32_t len);
++extern bool sweet_glink_smem_string(uint16_t item, char *out, uint32_t len);
++
++/* our SMMU context bank, for its fault registers */
++static volatile uint32_t *q_cbr;
++
++/* why the DSP stopped: the context bank's fault state, and the LPASS's own reason (SMEM 423) */
++static void
++q6_diagnose(const char *when)
++{
++	char why[160] = "";
++	if (q_cbr) {
++		printf("SWEET Q6: %s: SMMU context FSR %#x FAR %#x%08x FSYNR0 %#x\n", when, q_cbr[0x58 / 4],
++		    q_cbr[0x64 / 4], q_cbr[0x60 / 4], q_cbr[0x68 / 4]);
++	}
++	if (sweet_glink_smem_string(423, why, sizeof(why)) && why[0]) {
++		printf("SWEET Q6: %s: the LPASS says \"%s\"\n", when, why);
++	} else {
++		printf("SWEET Q6: %s: no LPASS reason in SMEM 423\n", when);
++	}
++}
 +
 +#define SMMU_PA         0x05100000ull
 +#define SMMU_SZ         0x40000u
@@ -2660,6 +2732,7 @@ index 0000000..85ae248
 +	__builtin_arm_dsb(0xf);
 +	s[(0x800 + 4 * grp) / 4] = (1u << 31) | AUDIO_SID;
 +	__builtin_arm_dsb(0xf);
++	q_cbr = cbr;
 +	uint32_t smr = s[(0x800 + 4 * grp) / 4], s2 = s[(0xc00 + 4 * grp) / 4];
 +	bool ok = smr == ((1u << 31) | AUDIO_SID) && ((s2 >> 16) & 3) == 0 && (s2 & 0xff) == (uint32_t)cb &&
 +	    (cbr[0] & 1) && cbr[0x20 / 4] == (uint32_t)pt;
@@ -2885,7 +2958,7 @@ index 0000000..85ae248
 +	printf("SWEET Q6: ready, waiting for iOS to play\n");
 +	uint32_t inflight = 0, next = 0, seq = 0;
 +	uint64_t writes = 0, dones = 0, run_writes = 0, run_dones = 0, run_start = 0;
-+	bool running = false;
++	bool running = false, diagnosed = false;
 +	for (;;) {
 +		uint32_t done = __c11_atomic_exchange((_Atomic uint32_t *)&q.done_mask, 0, __ATOMIC_ACQUIRE);
 +		uint32_t back = (uint32_t)__builtin_popcount(done);
@@ -2902,6 +2975,10 @@ index 0000000..85ae248
 +			bzero(&c, sizeof(c));
 +			c.h.opcode = 0x00010DAA;        /* ASM_SESSION_CMD_RUN_V2 */
 +			if (q6_cmd("iOS plays: ASM run", &c, sizeof(c), SVC_ASM, ASM_PORT, 0, 0)) {
++				if (!diagnosed) {
++					diagnosed = true;
++					q6_diagnose("ASM run unanswered");
++				}
 +				q.last_write = 0;
 +				q_sleep_ms(1000);
 +				continue;
@@ -2922,6 +2999,14 @@ index 0000000..85ae248
 +			printf("SWEET Q6: %llu ms played: %llu buffers sent, %llu given back by the DSP (%u with an error)%s\n",
 +			    ns / 1000000ull, writes - run_writes, dones - run_dones, q.write_errs,
 +			    dones - run_dones >= (ns / 1000000ull) / 30 && dones > run_dones ? ": THE DSP PLAYS" : "");
++		}
++		if (running && !diagnosed && writes > run_writes && dones == run_dones) {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(now - run_start, &ns);
++			if (ns > 300000000ull) {
++				diagnosed = true;
++				q6_diagnose("no buffer back after 300 ms");
++			}
 +		}
 +		while (running && inflight < INFLIGHT) {
 +			uint32_t i = next;
