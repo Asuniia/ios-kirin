@@ -2396,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..a27202c
+index 0000000..8426494
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,968 @@
+@@ -0,0 +1,1015 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2650,6 +2650,8 @@ index 0000000..a27202c
 + * registers to see whether the codec is reachable, before the full bring-up.
 + */
 +static int afe_clock(const char *what, uint32_t id, uint32_t hz, uint32_t enable);
++static int q6_cmd(const char *what, void *pkt, uint32_t len, uint8_t svc, uint16_t port, uint32_t token, uint32_t rsp);
++#define PORT_INT4_RX    0x1036
 +#define SDW_CDC_PA      0x152c1000ull
 +
 +/* the LPASS SoundWire codec (0x152c1000), byte registers at a 4-byte stride */
@@ -2687,10 +2689,55 @@ index 0000000..a27202c
 +static void
 +sdw_probe(void)
 +{
-+	if (afe_clock("SoundWire codec clock (INT_MCLK_1 9.6 MHz)", 0x306, 9600000, 1) ||
++	/*
++	 * The SoundWire codec's register bus is clocked only once the ADSP's INT4_MI2S_RX
++	 * port runs (Linux enables INT_MCLK_1 against AFE_PORT_ID_INT4_MI2S_RX). So, as for
++	 * INT0: the codec MCLK (INT_MCLK_1 0x306), the INT4 bit clock (0x113), the SoundWire
++	 * NPL clock (0x307), then an I2S config and a device start on port 0x1036 (mono).
++	 */
++	if (afe_clock("INT_MCLK_1 (9.6 MHz)", 0x306, 9600000, 1) ||
++	    afe_clock("INT4_MI2S bit clock (1.536 MHz)", 0x113, 1536000, 1) ||
 +	    afe_clock("SoundWire NPL clock (153.6 MHz)", 0x307, 153600000, 1)) {
-+		printf("SWEET SDW: clocks refused, codec not probed\n");
++		printf("SWEET SDW: clocks refused, codec not brought up\n");
 +		return;
++	}
++	{
++		struct {
++			struct apr_hdr h;
++			uint16_t port, payload_size;
++			uint32_t mem[3];
++			uint32_t module, param;
++			uint16_t psize, reserved;
++			uint32_t ver;
++			uint16_t bit_width, channel_mode, mono_stereo, ws_src;
++			uint32_t rate;
++			uint16_t data_format, reserved2;
++		} __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.h.opcode = 0x000100EF;        /* AFE_PORT_CMD_SET_PARAM_V2 */
++		c.port = PORT_INT4_RX;
++		c.payload_size = 12 + 20;
++		c.module = 0x0001020C;          /* AFE_MODULE_AUDIO_DEV_INTERFACE */
++		c.param = 0x0001020D;           /* AFE_PARAM_ID_I2S_CONFIG */
++		c.psize = 20;
++		c.ver = 1;
++		c.bit_width = 16;
++		c.channel_mode = 1;             /* SD0 */
++		c.mono_stereo = 0;              /* mono (the WSA speaker) */
++		c.ws_src = 1;                   /* internal: we are the master */
++		c.rate = 48000;
++		if (q6_cmd("INT4_MI2S_RX I2S config", &c, sizeof(c), SVC_AFE, 0, 0, 0)) {
++			return;
++		}
++	}
++	{
++		struct { struct apr_hdr h; uint16_t port, reserved; } __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.h.opcode = 0x000100E5;        /* AFE_PORT_CMD_DEVICE_START */
++		c.port = PORT_INT4_RX;
++		if (q6_cmd("INT4_MI2S_RX start", &c, sizeof(c), SVC_AFE, 0, 0, 0)) {
++			return;
++		}
 +	}
 +	sdw_cdc = (volatile uint32_t *)ml_io_map(SDW_CDC_PA, 0x1000);
 +	if (sdw_cdc == NULL) {
