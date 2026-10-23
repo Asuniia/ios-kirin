@@ -389,10 +389,10 @@ index 0000000..e65c54e
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
 new file mode 100644
-index 0000000..779f14e
+index 0000000..066e1c4
 --- /dev/null
 +++ b/bsd/dev/sweet_glink.c
-@@ -0,0 +1,900 @@
+@@ -0,0 +1,896 @@
 +/*
 + * kirin: talking to the ADSP once it runs (bsd/dev/sweet_adsp.c), as
 + * Linux 4.19's qcom_smem + qcom_glink_smem + qcom_glink_native do it for DT
@@ -484,7 +484,7 @@ index 0000000..779f14e
 +} __attribute__((packed));
 +
 +/* our receive buffers (intents) and the ADSP's, per channel */
-+#define NLOCAL  12
++#define NLOCAL  24
 +#define NREMOTE 32
 +struct gchan {
 +	const char *name;
@@ -972,20 +972,16 @@ index 0000000..779f14e
 +		break;
 +	case CMD_RX_INTENT_REQ:
 +		rx_advance(8);
-+		printf("SWEET GLINK: the ADSP asks for a %u-byte buffer\n", m.p2);
++		printf("SWEET GLINK: the ADSP asks for a %u-byte buffer on channel %u\n", m.p2, m.p1);
 +		if ((c = ch_by_rcid(m.p1)) != NULL) {
-+			/* grow the smallest of ours to that size */
-+			uint32_t s = 0;
-+			for (uint32_t i = 1; i < c->nlocal; i++) {
-+				if (c->local[i].size < c->local[s].size) {
-+					s = i;
-+				}
++			/* one more buffer of that size (ours in use stay as they are) */
++			if (c->nlocal >= NLOCAL) {
++				(void)g_cmd(CMD_RX_INTENT_REQ_ACK, c->lcid, 0);
++				break;
 +			}
-+			if (c->local[s].size < m.p2) {
-+				kfree_data(c->local[s].buf, c->local[s].size);
-+				c->local[s].size = m.p2;
-+				c->local[s].buf = kalloc_data(m.p2, Z_WAITOK | Z_ZERO);
-+			}
++			uint32_t s = c->nlocal++;
++			c->local[s].size = MAX(m.p2, 512u);
++			c->local[s].buf = kalloc_data(c->local[s].size, Z_WAITOK | Z_ZERO);
 +			(void)g_cmd(CMD_RX_INTENT_REQ_ACK, c->lcid, 1);
 +			ch_advertise(c, s);
 +		}
@@ -1211,8 +1207,8 @@ index 0000000..779f14e
 +	g.ch[0].name = "apr_audio_svc";
 +	g.ch[0].lcid = 1;
 +	g.ch[0].handler = &sweet_glink_apr_handler;
-+	g.ch[0].nlocal = NLOCAL;
-+	for (int i = 0; i < NLOCAL; i++) {
++	g.ch[0].nlocal = 12;
++	for (int i = 0; i < 12; i++) {
 +		g.ch[0].isize[i] = 4096;
 +	}
 +	g.ch[1].name = "IPCRTR";
@@ -2281,10 +2277,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..13e153e
+index 0000000..483035a
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,511 @@
+@@ -0,0 +1,524 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2739,6 +2735,8 @@ index 0000000..13e153e
 +	uint32_t inflight = 0, next = 0, seq = 0;
 +	uint64_t writes = 0, dones = 0, start = mach_absolute_time();
 +	bool told = false;
++	uint64_t last_beat = 0;
++	printf("SWEET Q6: playing\n");
 +	for (;;) {
 +		uint32_t done = __c11_atomic_exchange((_Atomic uint32_t *)&q.done_mask, 0, __ATOMIC_ACQUIRE);
 +		uint32_t back = (uint32_t)__builtin_popcount(done);
@@ -2769,7 +2767,14 @@ index 0000000..13e153e
 +			w.handle = handle;
 +			w.size = BUFSZ;
 +			w.seq = seq++;
-+			if (sweet_glink_apr_send(&w, sizeof(w)) != 0) {
++			if (writes < 2) {
++				printf("SWEET Q6: write %llu (buffer %u at %#llx)\n", writes, i, pa + i * BUFSZ);
++			}
++			int err = sweet_glink_apr_send(&w, sizeof(w));
++			if (writes < 2) {
++				printf("SWEET Q6: write %llu sent (%d)\n", writes, err);
++			}
++			if (err != 0) {
 +				break;
 +			}
 +			inflight++;
@@ -2777,6 +2782,10 @@ index 0000000..13e153e
 +		}
 +		uint64_t ns;
 +		absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++		if (ns / 5000000000ull != last_beat) {
++			last_beat = ns / 5000000000ull;
++			printf("SWEET Q6: %llu s: %llu sent, %llu back, %u in flight\n", ns / 1000000000ull, writes, dones, inflight);
++		}
 +		if (!told && ns > 3000000000ull) {
 +			told = true;
 +			/* 1024 frames per buffer: 3 s of playing is about 140 buffers */
@@ -2797,7 +2806,7 @@ index 0000000..13e153e
 +}
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index a9ad4f2..0b0f2a5 100644
+index a9ad4f2..41f8d34 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
 @@ -18,6 +18,20 @@
@@ -2857,7 +2866,7 @@ index a9ad4f2..0b0f2a5 100644
  	return false;
  }
  
-@@ -439,6 +466,103 @@ touch_poll(void)
+@@ -439,6 +466,106 @@ touch_poll(void)
  	return 0;
  }
  
@@ -2935,7 +2944,10 @@ index a9ad4f2..0b0f2a5 100644
 +	}
 +	printf("SWEET TOUCH: Novatek NT36672A running, polled every 10 ms\n");
 +	unsigned errors = 0;
-+	for (;;) {
++	for (uint32_t polls = 1;; polls++) {
++		if (polls % 3000 == 0) {
++			printf("SWEET TOUCH: alive, %u polls\n", polls);
++		}
 +		err = nvt_poll();
 +		if (err) {
 +			if ((errors++ % 100u) == 0) {
@@ -2961,7 +2973,7 @@ index a9ad4f2..0b0f2a5 100644
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -531,6 +655,7 @@ out:
+@@ -531,6 +658,7 @@ out:
  	(void)thread_terminate(current_thread());
  	thread_block(THREAD_CONTINUE_NULL);
  }
