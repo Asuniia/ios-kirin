@@ -2396,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..950072c
+index 0000000..4575f40
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,657 @@
+@@ -0,0 +1,691 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2448,6 +2448,39 @@ index 0000000..950072c
 +void sweet_q6audio_init(void);
 +void sweet_q6audio_play(const uint8_t *pcm, uint32_t len);
 +extern bool sweet_glink_smem_string(uint16_t item, char *out, uint32_t len);
++extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++
++/*
++ * The earpiece's codec, analog half: the PM660L's peripherals 0xf0 (digital) and 0xf1
++ * (analog) on SPMI SID 3 (DT anlg-cdc@f000 under pm660l@3). Linux's msm-analog-cdc picks
++ * its whole sequence by version: REVISION1, PERPH_SUBTYPE and the analog REVISION4
++ * (CAJON 2.0 on a TOMBAK 1.0 PMIC with analog major 2 is the DRAX codec). Read only, to
++ * write the earpiece path for the codec this phone has.
++ */
++#define CDC_DIG_PPID    0x3f0
++#define CDC_ANA_PPID    0x3f1
++
++static void
++cdc_probe(void)
++{
++	static const uint8_t dig[] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x46, 0x48, 0x49, 0x4a };
++	static const uint8_t ana[] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x46, 0x80, 0x9e, 0xc3 };
++	char line[200];
++	int n = 0;
++	uint8_t v;
++	n += snprintf(line + n, sizeof(line) - n, "SWEET CDC: digital");
++	for (unsigned i = 0; i < sizeof(dig); i++) {
++		n += sweet_pmic_read(CDC_DIG_PPID, dig[i], &v) ? snprintf(line + n, sizeof(line) - n, " %02x=%02x", dig[i], v) :
++		    snprintf(line + n, sizeof(line) - n, " %02x=?", dig[i]);
++	}
++	printf("%s\n", line);
++	n = snprintf(line, sizeof(line), "SWEET CDC: analog ");
++	for (unsigned i = 0; i < sizeof(ana); i++) {
++		n += sweet_pmic_read(CDC_ANA_PPID, ana[i], &v) ? snprintf(line + n, sizeof(line) - n, " %02x=%02x", ana[i], v) :
++		    snprintf(line + n, sizeof(line) - n, " %02x=?", ana[i]);
++	}
++	printf("%s\n", line);
++}
 +
 +/* our SMMU context bank, for its fault registers */
 +static volatile uint32_t *q_cbr;
@@ -2803,6 +2836,7 @@ index 0000000..950072c
 +	    afe_clock("INT0_MI2S bit clock (1.536 MHz)", 0x10F, 1536000, 1)) {
 +		return;
 +	}
++	cdc_probe();
 +	{
 +		struct {
 +			struct apr_hdr h;
