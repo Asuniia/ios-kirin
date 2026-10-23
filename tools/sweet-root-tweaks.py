@@ -144,12 +144,15 @@ def feature_flags(root):
 
 
 def audio(root):
-    src = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
-    dst_dir = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
-    if os.path.exists(src):
-        os.makedirs(dst_dir, exist_ok=True)
+    # VirtualAudio.plugin stays: it is the router through which iOS plays everything (the
+    # VAD); with SweetAudio.driver's devices it takes the speaker, the Taptic Engine and the
+    # microphone (kirin, 23 October: haptics work). ios-sweet, with no audio device at all,
+    # moved it to HAL.disabled; a root made that way gets it back here.
+    src = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin')
+    dst_dir = os.path.join(root, 'Library/Audio/Plug-Ins/HAL')
+    if os.path.exists(src) and not os.path.exists(os.path.join(dst_dir, 'VirtualAudio.plugin')):
         shutil.move(src, dst_dir)
-        print('VirtualAudio.plugin disabled')
+        print('VirtualAudio.plugin enabled again')
     for conf in glob.glob(os.path.join(root, 'System/Library/Frameworks/MediaToolbox.framework/*/SubServerConfiguration.plist')):
         st = os.stat(conf)
         data = load(conf)
