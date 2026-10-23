@@ -2396,10 +2396,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..edc71b3
+index 0000000..a27202c
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,906 @@
+@@ -0,0 +1,968 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2652,6 +2652,38 @@ index 0000000..edc71b3
 +static int afe_clock(const char *what, uint32_t id, uint32_t hz, uint32_t enable);
 +#define SDW_CDC_PA      0x152c1000ull
 +
++/* the LPASS SoundWire codec (0x152c1000), byte registers at a 4-byte stride */
++static volatile uint32_t *sdw_cdc;
++
++/* one SoundWire-master register through the codec's AHB bridge (4 bytes, LSB first) */
++static void
++swrm_write(uint32_t addr, uint32_t val)
++{
++	for (int i = 0; i < 4; i++) {
++		sdw_cdc[(0xa4 + 4 * i) / 4] = (val >> (8 * i)) & 0xff;      /* WR_DATA_0..3 */
++	}
++	for (int i = 0; i < 4; i++) {
++		sdw_cdc[(0xb4 + 4 * i) / 4] = (addr >> (8 * i)) & 0xff;     /* WR_ADDR_0..3 triggers it */
++	}
++	__builtin_arm_dsb(0xf);
++	delay(100);
++}
++
++static uint32_t
++swrm_read(uint32_t addr)
++{
++	for (int i = 0; i < 4; i++) {
++		sdw_cdc[(0xc4 + 4 * i) / 4] = (addr >> (8 * i)) & 0xff;     /* RD_ADDR_0..3 */
++	}
++	__builtin_arm_dsb(0xf);
++	delay(100);
++	uint32_t v = 0;
++	for (int i = 0; i < 4; i++) {
++		v |= (sdw_cdc[(0xd4 + 4 * i) / 4] & 0xff) << (8 * i);       /* RD_DATA_0..3 */
++	}
++	return v;
++}
++
 +static void
 +sdw_probe(void)
 +{
@@ -2660,21 +2692,51 @@ index 0000000..edc71b3
 +		printf("SWEET SDW: clocks refused, codec not probed\n");
 +		return;
 +	}
-+	volatile uint32_t *sdw = (volatile uint32_t *)ml_io_map(SDW_CDC_PA, 0x1000);
-+	if (sdw == NULL) {
++	sdw_cdc = (volatile uint32_t *)ml_io_map(SDW_CDC_PA, 0x1000);
++	if (sdw_cdc == NULL) {
 +		printf("SWEET SDW: codec cannot be mapped\n");
 +		return;
 +	}
-+	static const struct { uint16_t off; const char *name; } regs[] = {
-+		{ 0x104, "CLK_MCLK" }, { 0x10c, "CLK_SWR" }, { 0x204, "TOP_CFG0" }, { 0x208, "TOP_CFG1" },
-+		{ 0x214, "I2S_CLK" }, { 0x228, "FREQ_MCLK" }, { 0x238, "BLOCKS_RESET" },
-+	};
-+	char line[200];
-+	int n = snprintf(line, sizeof(line), "SWEET SDW: codec");
-+	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
-+		n += snprintf(line + n, sizeof(line) - n, " %s=%02x", regs[i].name, (uint8_t)sdw[regs[i].off / 4]);
-+	}
-+	printf("%s\n", line);
++	/*
++	 * Codec clock block (msm_sdw_mclk_enable): FS_CNT (0x108), MCLK_CONTROL (0x104),
++	 * FREQ_MCLK (0x228) for 9.6 MHz; then SWR_CONTROL (0x10c) clocks the SoundWire master.
++	 * Each register is a byte at a 4-byte stride (regmap reg_stride 4), so sdw_cdc[off/4].
++	 */
++	sdw_cdc[0x108 / 4] = 0x01;
++	sdw_cdc[0x104 / 4] = 0x01;
++	sdw_cdc[0x228 / 4] = 0x01;
++	sdw_cdc[0x10c / 4] = 0x01;
++	__builtin_arm_dsb(0xf);
++	delay(1000);
++	printf("SWEET SDW: codec MCLK=%02x FS_CNT=%02x SWR=%02x TOP_CFG0=%02x FREQ=%02x\n",
++	    (uint8_t)sdw_cdc[0x104 / 4], (uint8_t)sdw_cdc[0x108 / 4], (uint8_t)sdw_cdc[0x10c / 4],
++	    (uint8_t)sdw_cdc[0x204 / 4], (uint8_t)sdw_cdc[0x228 / 4]);
++
++	/*
++	 * The SoundWire master is reached through the codec's AHB bridge: its registers are
++	 * not in the codec's own map. To write one, put the 32-bit value in WR_DATA_0..3
++	 * (0xa4 + 4*i) then the address in WR_ADDR_0..3 (0xb4 + 4*i); to read, put the address
++	 * in RD_ADDR_0..3 (0xc4) and read RD_DATA_0..3 (0xd4). As Linux's msm_sdw_swrm_read/write.
++	 */
++	uint32_t hw = swrm_read(0x0);                   /* SWRM_COMP_HW_VERSION */
++	printf("SWEET SDW: SoundWire master HW version %#x\n", hw);
++
++	/* init as swr-wcd-ctrl's swrm_reg_writes */
++	swrm_write(0x1044, 0x02);                       /* MCP_BUS_CTRL: clock start */
++	swrm_write(0x500, 0x01);                        /* ENUMERATOR_CFG: auto-enumerate */
++	swrm_write(0x204, 0x1FFFD);                     /* INTERRUPT_MASK */
++	uint32_t mcp = swrm_read(0x1048);
++	swrm_write(0x1048, (mcp & ~0x1f0000u) | (0x1fu << 16)); /* MCP_CFG: max no-ping cmds */
++	swrm_write(0x314, 0x01);                        /* CMD_FIFO_CFG: 1 retry */
++	swrm_write(0x4, 0x02);                          /* COMP_CFG: IRQ pulse */
++	swrm_write(0x4, 0x03);                          /* COMP_CFG: enable */
++	swrm_write(0x208, 0x08);                        /* INTERRUPT_CLEAR */
++	__builtin_arm_dsb(0xf);
++	delay(5000);                                    /* let the WSA amps enumerate */
++
++	uint32_t slv = swrm_read(0x1090);               /* MCP_SLV_STATUS: 2 bits per device */
++	printf("SWEET SDW: slave status %#x (01 = a device attached, per slot)%s\n", slv,
++	    slv ? "" : ": no WSA enumerated");
 +}
 +
 +/* our SMMU context bank, for its fault registers */
