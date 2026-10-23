@@ -2277,10 +2277,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..800e082
+index 0000000..85ae248
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,561 @@
+@@ -0,0 +1,624 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2290,10 +2290,11 @@ index 0000000..800e082
 + *            (0x5100000, stream 1: DT msm-audio-ion iommus = <&lpass_q6_smmu 1>);
 + *            its power vote (GCC 0x17d034) and clock (0x17d014) on; no stream
 + *            group matches stream 1 after boot (the DSP's first read then froze
-+ *            the whole SoC), so a free group gets it, as bypass: the address
-+ *            given to the DSP is the physical one, with the stream id in its
-+ *            upper 32 bits (as msm_audio_ion's smmu_sid_bits). Not taken: no
-+ *            playback at all
++ *            the whole SoC) and bypass is refused, so a free group points it at
++ *            a free context bank whose tables map each address to itself: the
++ *            address given to the DSP is the physical one, with the stream id in
++ *            its upper 32 bits (as msm_audio_ion's smmu_sid_bits). Not taken:
++ *            no playback at all
 + *   AFE      clocks INT_MCLK_0 (codec core, 9.6 MHz) and INT0_MI2S_IBIT
 + *            (1.536 MHz), I2S config 48 kHz 16-bit stereo on SD0, port start
 + *   ADM      COPP on the port, NULL topology; the matrix maps ASM session 1
@@ -2521,25 +2522,87 @@ index 0000000..800e082
 +	}
 +	/*
 +	 * No group matches stream 1: the DSP's first read of our buffers froze the whole SoC.
-+	 * A free group gets stream 1, as bypass (S2CR first, then the valid SMR).
++	 * Bypass is refused (S2CR stays "fault": the hypervisor's rule), so as Linux's arm-smmu:
++	 * a free context bank, stage 1 only, AArch64 tables with T0SZ 32 (4 GB of IOVA, starting
++	 * at level 1) whose four 1 GB blocks map each address to itself; then a free group points
++	 * stream 1 at it.
 +	 */
++	uint32_t ncb = idr1 & 0xff, used = 0;
 +	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
-+		if (s[(0x800 + 4 * i) / 4] & (1u << 31)) {
-+			continue;
-+		}
 +		uint32_t s2cr = s[(0xc00 + 4 * i) / 4];
-+		s[(0xc00 + 4 * i) / 4] = (s2cr & ~(3u << 16) & ~0xffu) | (1u << 16);
-+		__builtin_arm_dsb(0xf);
-+		s[(0x800 + 4 * i) / 4] = (1u << 31) | AUDIO_SID;
-+		__builtin_arm_dsb(0xf);
-+		uint32_t smr = s[(0x800 + 4 * i) / 4], s2 = s[(0xc00 + 4 * i) / 4];
-+		bool ok = smr == ((1u << 31) | AUDIO_SID) && ((s2 >> 16) & 3) == 1;
-+		printf("SWEET Q6: SMMU free group %u given to stream %u as bypass: SMR %#x S2CR %#x (%s)\n",
-+		    i, AUDIO_SID, smr, s2, ok ? "taken" : "NOT taken, no playback");
-+		return ok ? 1 : 0;
++		if ((s[(0x800 + 4 * i) / 4] & (1u << 31)) && ((s2cr >> 16) & 3) == 0) {
++			used |= 1u << (s2cr & 0x1f);
++		}
 +	}
-+	printf("SWEET Q6: no SMMU group for stream %u and none free: no playback\n", AUDIO_SID);
-+	return 0;
++	int cb = -1;
++	for (int c = (int)MIN(ncb, 32u) - 1; c >= 0; c--) {
++		if (!(used & (1u << c))) {
++			cb = c;
++			break;
++		}
++	}
++	int grp = -1;
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		if (!(s[(0x800 + 4 * i) / 4] & (1u << 31))) {
++			grp = (int)i;
++			break;
++		}
++	}
++	if (cb < 0 || grp < 0) {
++		printf("SWEET Q6: no free SMMU context (%d) or group (%d): no playback\n", cb, grp);
++		return 0;
++	}
++	vm_offset_t ptva = 0;
++	if (kmem_alloc_contig(kernel_map, &ptva, PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	uint64_t pt = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)ptva));
++	for (uint64_t i = 0; i < 4; i++) {
++		/* block, AttrIndx 0 (normal write-back), inner shareable, access flag */
++		((uint64_t *)ptva)[i] = (i << 30) | (1ull << 10) | (3ull << 8) | 1ull;
++	}
++	flush_dcache64((addr64_t)pt, PAGE_SIZE, TRUE);
++
++	volatile uint32_t *gr1 = s + pg / 4;
++	volatile uint32_t *cbr = s + (SMMU_SZ / 2 + (uint32_t)cb * pg) / 4;
++	cbr[0] = 0;                                     /* SCTLR: off while it is set up */
++	gr1[cb] = (1u << 16) | (3u << 8) | (0xfu << 12); /* CBAR: S1 trans S2 bypass, NSH, WB */
++	gr1[(0x800 / 4) + cb] = 1;                      /* CBA2R: AArch64 */
++	cbr[0x10 / 4] = 2;                              /* TCR2: PASize 40 bits */
++	cbr[0x20 / 4] = (uint32_t)pt;                   /* TTBR0, ASID 0 */
++	cbr[0x24 / 4] = (uint32_t)(pt >> 32);
++	cbr[0x28 / 4] = 0;                              /* TTBR1 */
++	cbr[0x2c / 4] = 0;
++	/* TCR: T0SZ 32, IRGN0/ORGN0 write-back, SH0 inner, TG0 4K, EPD1 */
++	cbr[0x30 / 4] = 32u | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23);
++	cbr[0x38 / 4] = 0xff;                           /* MAIR0: attr 0 normal write-back */
++	cbr[0x3c / 4] = 0;
++	cbr[0x58 / 4] = 0xffffffffu;                    /* FSR: clear */
++	__builtin_arm_dsb(0xf);
++	cbr[0x618 / 4] = 0;                             /* TLBIALL */
++	cbr[0x7f0 / 4] = 0;                             /* TLBSYNC */
++	for (int i = 0; i < 1000 && (cbr[0x7f4 / 4] & 1); i++) {
++		delay(1);
++	}
++	/* SCTLR: M, TRE, AFE, CFRE, CFIE (faults report, they do not stall) */
++	cbr[0] = 1u | (1u << 1) | (1u << 2) | (1u << 5) | (1u << 6);
++	__builtin_arm_dsb(0xf);
++	uint32_t s2cr = s[(0xc00 + 4 * grp) / 4];
++	s[(0xc00 + 4 * grp) / 4] = (s2cr & ~(3u << 16) & ~0xffu) | (uint32_t)cb;
++	__builtin_arm_dsb(0xf);
++	s[(0x800 + 4 * grp) / 4] = (1u << 31) | AUDIO_SID;
++	__builtin_arm_dsb(0xf);
++	uint32_t smr = s[(0x800 + 4 * grp) / 4], s2 = s[(0xc00 + 4 * grp) / 4];
++	bool ok = smr == ((1u << 31) | AUDIO_SID) && ((s2 >> 16) & 3) == 0 && (s2 & 0xff) == (uint32_t)cb &&
++	    (cbr[0] & 1) && cbr[0x20 / 4] == (uint32_t)pt;
++	printf("SWEET Q6: SMMU context %d (identity, tables at %#llx: SCTLR %#x TCR %#x TTBR0 %#x CBAR %#x) "
++	    "and group %d (SMR %#x S2CR %#x) for stream %u: %s\n", cb, pt, cbr[0], cbr[0x30 / 4], cbr[0x20 / 4],
++	    gr1[cb], grp, smr, s2, AUDIO_SID, ok ? "taken" : "NOT taken, no playback");
++	if (!ok) {
++		s[(0x800 + 4 * grp) / 4] = 0;          /* give the group back */
++	}
++	return ok ? 1 : 0;
 +}
 +
 +static void
