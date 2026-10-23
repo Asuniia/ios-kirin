@@ -2277,10 +2277,10 @@ index a0a9ae1..2a8d40c 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..483035a
+index 0000000..800e082
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,524 @@
+@@ -0,0 +1,561 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -2288,20 +2288,23 @@ index 0000000..483035a
 + *
 + *   SMMU     the ADSP reads our buffers through the LPASS Q6 SMMU
 + *            (0x5100000, stream 1: DT msm-audio-ion iommus = <&lpass_q6_smmu 1>);
-+ *            its power vote (GCC 0x17d034) and clock (0x17d014) on, then
-+ *            stream 1 is set to bypass, so the address given to the DSP is
-+ *            the physical one, with the stream id in its upper 32 bits (as
-+ *            msm_audio_ion's smmu_sid_bits)
++ *            its power vote (GCC 0x17d034) and clock (0x17d014) on; no stream
++ *            group matches stream 1 after boot (the DSP's first read then froze
++ *            the whole SoC), so a free group gets it, as bypass: the address
++ *            given to the DSP is the physical one, with the stream id in its
++ *            upper 32 bits (as msm_audio_ion's smmu_sid_bits). Not taken: no
++ *            playback at all
 + *   AFE      clocks INT_MCLK_0 (codec core, 9.6 MHz) and INT0_MI2S_IBIT
 + *            (1.536 MHz), I2S config 48 kHz 16-bit stereo on SD0, port start
 + *   ADM      COPP on the port, NULL topology; the matrix maps ASM session 1
 + *            to it
 + *   ASM      the buffers mapped (8 x 4 KB), stream 1 of session 1 opened for
-+ *            PCM (no post-processing), media format, run; then a write per
-+ *            buffer, each refilled when the DSP says it is done with it
++ *            PCM (no post-processing), media format; RUN only when iOS plays
++ *            and PAUSE 0.5 s after its last frames, a write per buffer while
++ *            running, each refilled when the DSP says it is done with it
 + *
 + * What iOS plays (/dev/sweet-audio, stereo 16-bit 48 kHz, bsd/dev/sweet_audio.c)
-+ * goes to a 64 KB ring; silence when it is empty. The codec (digital part in
++ * goes to a 64 KB ring; silence when it runs dry. The codec (digital part in
 + * the LPASS, analog part in the PM660L) is not set up here yet: the DSP
 + * plays into a port nothing listens to, which says whether this half works.
 + */
@@ -2364,6 +2367,7 @@ index 0000000..483035a
 +	uint8_t ring[RING];
 +	volatile uint32_t rhead, rtail;
 +	bool playing;
++	volatile uint64_t last_write;
 +	int sleep_chan;
 +} q;
 +
@@ -2512,10 +2516,30 @@ index 0000000..483035a
 +			printf("SWEET Q6: SMMU group %u set to bypass: S2CR now %#x\n", i, s[(0xc00 + 4 * i) / 4]);
 +		}
 +	}
-+	if (!found) {
-+		printf("SWEET Q6: no SMMU stream group for id %u\n", AUDIO_SID);
++	if (found) {
++		return 1;
 +	}
-+	return 1;
++	/*
++	 * No group matches stream 1: the DSP's first read of our buffers froze the whole SoC.
++	 * A free group gets stream 1, as bypass (S2CR first, then the valid SMR).
++	 */
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		if (s[(0x800 + 4 * i) / 4] & (1u << 31)) {
++			continue;
++		}
++		uint32_t s2cr = s[(0xc00 + 4 * i) / 4];
++		s[(0xc00 + 4 * i) / 4] = (s2cr & ~(3u << 16) & ~0xffu) | (1u << 16);
++		__builtin_arm_dsb(0xf);
++		s[(0x800 + 4 * i) / 4] = (1u << 31) | AUDIO_SID;
++		__builtin_arm_dsb(0xf);
++		uint32_t smr = s[(0x800 + 4 * i) / 4], s2 = s[(0xc00 + 4 * i) / 4];
++		bool ok = smr == ((1u << 31) | AUDIO_SID) && ((s2 >> 16) & 3) == 1;
++		printf("SWEET Q6: SMMU free group %u given to stream %u as bypass: SMR %#x S2CR %#x (%s)\n",
++		    i, AUDIO_SID, smr, s2, ok ? "taken" : "NOT taken, no playback");
++		return ok ? 1 : 0;
++	}
++	printf("SWEET Q6: no SMMU group for stream %u and none free: no playback\n", AUDIO_SID);
++	return 0;
 +}
 +
 +static void
@@ -2545,6 +2569,7 @@ index 0000000..483035a
 +	}
 +	q.rhead = (q.rhead + len) & (RING - 1);
 +	lck_spin_unlock(&sweet_q6_ring_lock);
++	q.last_write = mach_absolute_time();
 +}
 +
 +static void
@@ -2558,7 +2583,7 @@ index 0000000..483035a
 +	}
 +	sweet_glink_apr_client = q6_rx;
 +	if (!smmu_setup()) {
-+		printf("SWEET Q6: SMMU registers cannot be mapped\n");
++		printf("SWEET Q6: the DSP could not read our buffers: playback not started\n");
 +		return;
 +	}
 +
@@ -2721,30 +2746,54 @@ index 0000000..483035a
 +			return;
 +		}
 +	}
-+	{
-+		struct { struct apr_hdr h; uint32_t flags, lsw, msw; } __attribute__((packed)) c;
-+		bzero(&c, sizeof(c));
-+		c.h.opcode = 0x00010DAA;        /* ASM_SESSION_CMD_RUN_V2 */
-+		if (q6_cmd("ASM run", &c, sizeof(c), SVC_ASM, ASM_PORT, 0, 0)) {
-+			return;
-+		}
-+	}
-+
++	/*
++	 * Ready, not running: the DSP reads our buffers only while iOS plays. The first frames
++	 * start the session (RUN), 0.5 s without any pause it (PAUSE); RUN again resumes.
++	 */
 +	q.playing = true;
-+	q.done_mask = (1u << NBUF) - 1;
++	q.done_mask = 0;
++	printf("SWEET Q6: ready, waiting for iOS to play\n");
 +	uint32_t inflight = 0, next = 0, seq = 0;
-+	uint64_t writes = 0, dones = 0, start = mach_absolute_time();
-+	bool told = false;
-+	uint64_t last_beat = 0;
-+	printf("SWEET Q6: playing\n");
++	uint64_t writes = 0, dones = 0, run_writes = 0, run_dones = 0, run_start = 0;
++	bool running = false;
 +	for (;;) {
 +		uint32_t done = __c11_atomic_exchange((_Atomic uint32_t *)&q.done_mask, 0, __ATOMIC_ACQUIRE);
 +		uint32_t back = (uint32_t)__builtin_popcount(done);
-+		if (writes > 0) {
-+			dones += back;
-+			inflight -= MIN(inflight, back);
++		dones += back;
++		inflight -= MIN(inflight, back);
++
++		uint64_t now = mach_absolute_time(), idle_ns = ~0ull;
++		if (q.last_write) {
++			absolutetime_to_nanoseconds(now - q.last_write, &idle_ns);
 +		}
-+		while (inflight < INFLIGHT) {
++		bool active = idle_ns < 500000000ull;
++		if (active && !running) {
++			struct { struct apr_hdr h; uint32_t flags, lsw, msw; } __attribute__((packed)) c;
++			bzero(&c, sizeof(c));
++			c.h.opcode = 0x00010DAA;        /* ASM_SESSION_CMD_RUN_V2 */
++			if (q6_cmd("iOS plays: ASM run", &c, sizeof(c), SVC_ASM, ASM_PORT, 0, 0)) {
++				q.last_write = 0;
++				q_sleep_ms(1000);
++				continue;
++			}
++			running = true;
++			run_start = now;
++			run_writes = writes;
++			run_dones = dones;
++		} else if (!active && running) {
++			struct apr_hdr c;
++			bzero(&c, sizeof(c));
++			c.opcode = 0x00010BD3;          /* ASM_SESSION_CMD_PAUSE */
++			(void)q6_cmd("iOS stopped: ASM pause", &c, sizeof(c), SVC_ASM, ASM_PORT, 0, 0);
++			running = false;
++			uint64_t ns;
++			absolutetime_to_nanoseconds(now - run_start, &ns);
++			/* 1024 frames (21.3 ms) per buffer */
++			printf("SWEET Q6: %llu ms played: %llu buffers sent, %llu given back by the DSP (%u with an error)%s\n",
++			    ns / 1000000ull, writes - run_writes, dones - run_dones, q.write_errs,
++			    dones - run_dones >= (ns / 1000000ull) / 30 && dones > run_dones ? ": THE DSP PLAYS" : "");
++		}
++		while (running && inflight < INFLIGHT) {
 +			uint32_t i = next;
 +			next = (next + 1) % NBUF;
 +			ring_take(buf + i * BUFSZ, BUFSZ);
@@ -2780,19 +2829,7 @@ index 0000000..483035a
 +			inflight++;
 +			writes++;
 +		}
-+		uint64_t ns;
-+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
-+		if (ns / 5000000000ull != last_beat) {
-+			last_beat = ns / 5000000000ull;
-+			printf("SWEET Q6: %llu s: %llu sent, %llu back, %u in flight\n", ns / 1000000000ull, writes, dones, inflight);
-+		}
-+		if (!told && ns > 3000000000ull) {
-+			told = true;
-+			/* 1024 frames per buffer: 3 s of playing is about 140 buffers */
-+			printf("SWEET Q6: after 3 s: %llu buffers sent, %llu given back by the DSP (%u with an error)%s\n",
-+			    writes, dones, q.write_errs, dones > 100 ? ": THE DSP PLAYS" : "");
-+		}
-+		q_sleep_ms(2);
++		q_sleep_ms(running ? 2 : 20);
 +	}
 +}
 +
