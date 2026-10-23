@@ -13,6 +13,73 @@ index 2a6dc36..ec721ac 100644
  bsd/dev/sweet_perf.c			standard
  bsd/dev/sweet_gpu.c			standard
  bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index 291a546..ea86e59 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -165,18 +165,19 @@ mmioctl(dev_t dev, u_long cmd, __unused caddr_t data,
+ static char sweet_null_names[128];
+ static int sweet_null_parsed;
+ 
++/*
++ * Boot-arg sweetoslog (comma separated): processes whose own os_log lines are wanted too;
++ * exec gives them OS_ACTIVITY_DT_MODE=YES (bsd/kern/kern_exec.c) and their /dev/null is
++ * teed as for sweetnull.
++ */
++static char sweet_oslog_names[128];
++bool sweet_oslog_listed(const char *name);
++
+ static bool
+-sweet_null_tee(char *name, size_t len)
++sweet_name_in(const char *list, const char *name)
+ {
+-	if (!sweet_null_parsed) {
+-		if (!PE_parse_boot_argn("sweetnull", sweet_null_names, sizeof(sweet_null_names))) {
+-			strlcpy(sweet_null_names, "backboardd,SpringBoard", sizeof(sweet_null_names));
+-		}
+-		sweet_null_parsed = 1;
+-	}
+-	proc_selfname(name, (int)len);
+ 	size_t n = strlen(name);
+-	for (const char *t = sweet_null_names; *t;) {
++	for (const char *t = list; *t;) {
+ 		const char *end = strchr(t, ',');
+ 		size_t tl = end ? (size_t)(end - t) : strlen(t);
+ 		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
+@@ -189,6 +190,33 @@ sweet_null_tee(char *name, size_t len)
+ 	}
+ 	return false;
+ }
++
++static void
++sweet_null_parse(void)
++{
++	if (!sweet_null_parsed) {
++		if (!PE_parse_boot_argn("sweetnull", sweet_null_names, sizeof(sweet_null_names))) {
++			strlcpy(sweet_null_names, "backboardd,SpringBoard", sizeof(sweet_null_names));
++		}
++		(void)PE_parse_boot_argn("sweetoslog", sweet_oslog_names, sizeof(sweet_oslog_names));
++		sweet_null_parsed = 1;
++	}
++}
++
++bool
++sweet_oslog_listed(const char *name)
++{
++	sweet_null_parse();
++	return sweet_name_in(sweet_oslog_names, name);
++}
++
++static bool
++sweet_null_tee(char *name, size_t len)
++{
++	sweet_null_parse();
++	proc_selfname(name, (int)len);
++	return sweet_name_in(sweet_null_names, name) || sweet_name_in(sweet_oslog_names, name);
++}
+ #endif
+ 
+ int
 diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
 new file mode 100644
 index 0000000..daa3007
@@ -4006,10 +4073,10 @@ index bb2a2bf..878fb4c 100644
  	lock_trace = 1;
  }
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 01e674f..5a3f0d0 100644
+index 01e674f..47d4621 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -453,6 +453,57 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
+@@ -453,13 +453,23 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
   * without editing launchd.plist on the phone). Several NAME:... entries
   * are separated by ';'.
   */
@@ -4022,24 +4089,24 @@ index 01e674f..5a3f0d0 100644
 + * forever.) For daemons that spin on hardware this port does not have
 + * (health, widgets, accessory updates, ...). Each name is logged once.
 + */
-+static int
+ static int
+-sweet_exec_env(struct image_params *imgp, int ptr_size)
 +sweet_exec_denied(struct image_params *imgp)
-+{
+ {
+-	static char spec[512];
 +	static char list[512];
-+	static int state;       /* 0 not parsed, 1 none, 2 set */
+ 	static int state;       /* 0 not parsed, 1 none, 2 set */
 +	static char logged[512];
-+	if (state == 0) {
+ 	if (state == 0) {
+-		state = PE_parse_boot_argn("sweetenv", spec, sizeof(spec)) && spec[0] ? 2 : 1;
 +		state = PE_parse_boot_argn("sweetnoexec", list, sizeof(list)) && list[0] ? 2 : 1;
-+	}
-+	if (state != 2) {
-+		return 0;
-+	}
-+	const char *path = imgp->ip_strings + strlen("executable_path="), *base = path;
-+	for (const char *c = path; *c; c++) {
-+		if (*c == '/') {
-+			base = c + 1;
-+		}
-+	}
+ 	}
+ 	if (state != 2) {
+ 		return 0;
+@@ -470,6 +480,66 @@ sweet_exec_env(struct image_params *imgp, int ptr_size)
+ 			base = c + 1;
+ 		}
+ 	}
 +	size_t bl = strlen(base);
 +	for (const char *e = list; *e;) {
 +		size_t n = 0;
@@ -4064,10 +4131,46 @@ index 01e674f..5a3f0d0 100644
 +	return 0;
 +}
 +
- static int
- sweet_exec_env(struct image_params *imgp, int ptr_size)
- {
-@@ -5814,6 +5865,10 @@ exec_extract_strings(struct image_params *imgp)
++static int
++sweet_exec_env(struct image_params *imgp, int ptr_size)
++{
++	static char spec[512];
++	static int state;       /* 0 not parsed, 1 none, 2 set */
++	if (state == 0) {
++		state = PE_parse_boot_argn("sweetenv", spec, sizeof(spec)) && spec[0] ? 2 : 1;
++	}
++	const char *path = imgp->ip_strings + strlen("executable_path="), *base = path;
++	for (const char *c = path; *c; c++) {
++		if (*c == '/') {
++			base = c + 1;
++		}
++	}
++	/*
++	 * The processes of boot-arg sweetoslog (bsd/dev/mem.c: their /dev/null goes to the
++	 * console) get OS_ACTIVITY_DT_MODE=YES, with which libtrace writes each os_log line to
++	 * stderr as well (what Xcode sets): their own logs, which logd keeps out of reach here.
++	 */
++	{
++		extern bool sweet_oslog_listed(const char *name);
++		if (sweet_oslog_listed(base)) {
++			int error = exec_add_user_string(imgp, CAST_USER_ADDR_T("OS_ACTIVITY_DT_MODE=YES"), UIO_SYSSPACE, TRUE);
++			if (error) {
++				return error;
++			}
++			if (imgp->ip_argspace < ptr_size) {
++				return E2BIG;
++			}
++			imgp->ip_argspace -= ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++	if (state != 2) {
++		return 0;
++	}
+ 	const char *entry = spec;
+ 	for (;;) {
+ 		size_t n = 0;
+@@ -5814,6 +5884,10 @@ exec_extract_strings(struct image_params *imgp)
  	}
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
