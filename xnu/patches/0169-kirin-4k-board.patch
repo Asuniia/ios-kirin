@@ -3115,10 +3115,10 @@ index a0a9ae1..63d27e4 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..5650dc6
+index 0000000..57136e8
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,1425 @@
+@@ -0,0 +1,1430 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -3348,17 +3348,20 @@ index 0000000..5650dc6
 +static void
 +cdc_mic_on(void)
 +{
-+	/* micbias1 for the internal (bottom) microphone */
-+	cdc_upd(CDC_ANA_PPID, 0x42, 0x02, 0x02);        /* MICB_1_CTL: enable */
-+	cdc_w(CDC_ANA_PPID, 0x40, 0x80);                /* MICB_1_EN */
++	/* micbias1 (internal), the bottom mic's bias, as msm_anlg_cdc configure */
++	cdc_upd(CDC_ANA_PPID, 0x42, 0x60, 0x60);        /* MICB_1_CTL: enable */
++	cdc_w(CDC_ANA_PPID, 0x41, 0xc0);                /* MICB_1_VAL: bias level */
++	cdc_upd(CDC_ANA_PPID, 0x40, 0x04, 0x04);        /* MICB_1_EN: enable (bit 2) */
++	cdc_upd(CDC_ANA_PPID, 0x43, 0x10, 0x10);        /* MICB_1_INT_RBIAS: internal bias */
 +	delay(10000);
-+	/* TX1 analog front-end (ADC1) */
-+	cdc_w(CDC_ANA_PPID, 0x65, 0x6b);                /* TX_1_2_OPAMP_BIAS (POR) */
-+	cdc_w(CDC_ANA_PPID, 0x66, 0x51);                /* TX_1_2_TXFE_CLKDIV (POR) */
-+	cdc_w(CDC_ANA_PPID, 0x62, 0xbf);                /* TX_1_2_TEST_CTL_1 (POR) */
-+	cdc_w(CDC_ANA_PPID, 0x63, 0x8c);                /* TX_1_2_TEST_CTL_2 (POR) */
-+	cdc_upd(CDC_ANA_PPID, 0x60, 0x03, 0x03);        /* TX_1_EN: ADC1 on */
-+	delay(12000);
++	/* ADC1 front-end, as msm_anlg_cdc_codec_enable_adc (TX_1_EN) */
++	cdc_w(CDC_ANA_PPID, 0x65, 0x6b);                /* TX_1_2_OPAMP_BIAS */
++	cdc_w(CDC_ANA_PPID, 0x66, 0x51);                /* TX_1_2_TXFE_CLKDIV */
++	cdc_w(CDC_ANA_PPID, 0x62, 0xbf);                /* TX_1_2_TEST_CTL_1 */
++	cdc_w(CDC_ANA_PPID, 0x63, 0x8c);                /* TX_1_2_TEST_CTL_2 */
++	cdc_upd(CDC_ANA_PPID, 0x60, 0x80, 0x80);        /* TX_1_EN: ADC1 enable (bit 7) */
++	cdc_upd(CDC_ANA_PPID, 0x60, 0x20, 0x20);        /* ADC1 init (bit 5) */
++	delay(10000);
 +	/*
 +	 * digital decimator DEC1 and TX I2S (LPASS dig codec, MMIO), as
 +	 * msm_dig_cdc_codec_enable_dec: clock the decimator, pulse its reset, route
@@ -3366,6 +3369,8 @@ index 0000000..5650dc6
 +	 * 0x04, TX_CLK_EN_B1 0x18, TX1_MUX_CTL 0x28C, TX1_VOL_CTL_CFG 0x288.
 +	 */
 +	cdc_upd(CDC_DIG_PPID, 0x50, 0x03, 0x00);        /* CONN_TX1_CTL: ADC1 -> TX1 */
++	delay(12000);
++	cdc_upd(CDC_ANA_PPID, 0x60, 0x20, 0x00);        /* ADC1 init release (POST_PMU) */
 +	dig_upd(0x10, 0x1f, 0x13);                      /* CLK_TX_I2S_CTL: 48 kHz, enabled */
 +	dig_upd(0x18, 0x01, 0x01);                      /* CLK_TX_CLK_EN_B1: DEC1 clock on */
 +	dig_upd(0x04, 0x01, 0x01);                      /* CLK_TX_RESET_B1: assert DEC1 */
