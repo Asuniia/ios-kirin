@@ -1,5 +1,5 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 2a6dc36..64c4741 100644
+index 2a6dc36..309a24e 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -107,6 +107,12 @@ bsd/dev/memdev.c			standard
@@ -11,7 +11,7 @@ index 2a6dc36..64c4741 100644
 +bsd/dev/sweet_glink.c			standard
 +bsd/dev/sweet_modem.c			standard
 +bsd/dev/sweet_q6audio.c			standard
-+bsd/dev/sweet_rpm.c			standard
++bsd/dev/sweet_rpm_kirin.c		standard
  bsd/dev/sweet_perf.c			standard
  bsd/dev/sweet_gpu.c			standard
  bsd/dev/sweet_touch.c			standard
@@ -4048,27 +4048,13 @@ index 0000000..3c3c896
 +	}
 +}
 +#endif /* SWEET_KIRIN */
-diff --git a/bsd/dev/sweet_rpm.c b/bsd/dev/sweet_rpm.c
-index 10d7b16..b40baeb 100644
---- a/bsd/dev/sweet_rpm.c
-+++ b/bsd/dev/sweet_rpm.c
-@@ -1,453 +1,613 @@
- /*
-- * Pixel 1 (MSM8996) RPM requests over GLINK, polled. The regulators the AP
-- * needs (touch rails PM8994 L6/L17/L18/L19/L23) belong to the RPM: a direct
-- * SPMI write resets the phone, Linux asks the RPM (rpm-smd-regulator).
-- *   transport  DT qcom,glink-rpm-native-xprt: RPM message RAM 0x68000
-- *              (24 KiB, TOC "grt0" in its last 256 bytes naming the ap2r and
-- *              r2ap FIFOs: tail, head, data), doorbell APCS IPC 0x9820010
-- *              bit 0. Intentless edge, features 0.
-- *   protocol   mainline Linux qcom_glink_rpm.c / qcom_glink_native.c:
-- *              VERSION -> VERSION_ACK, OPEN "rpm_requests" both ways + OPEN_ACK,
-- *              TX_DATA {cmd, lcid, 0, chunk, left} + payload, 8-byte aligned.
-- *   requests   smd-rpm.c / qcom_smd-regulator.c: "req" header, {msg_id,
-- *              flags 0 = active set, type "ldoa", id n, len} + KVPs swen/uv;
-- *              the answer carries "msg#" and, on failure, "err" + text.
-- * Callers are serialized by sweet_rpm_lock (touch thread, perf thread);
-- * message RAM only 32-bit accesses.
+diff --git a/bsd/dev/sweet_rpm_kirin.c b/bsd/dev/sweet_rpm_kirin.c
+new file mode 100644
+index 0000000..b40baeb
+--- /dev/null
++++ b/bsd/dev/sweet_rpm_kirin.c
+@@ -0,0 +1,613 @@
++/*
 + * kirin: voting power resources on the RPM, as Linux 4.19's qcom_glink_rpm +
 + * rpmsg/rpm-smd do it for DT /soc/rpm-glink + /soc/qcom,rpm-smd.
 + *
@@ -4091,48 +4077,14 @@ index 10d7b16..b40baeb 100644
 + *
 + * Reusable: sweet_rpm_vote_level(resource, id, set, level) votes any RPM level
 + * resource, so the Wi-Fi rails (rwlc/rwle...) and other corners go the same way.
-  */
--#if defined(ARM64_BOARD_CONFIG_SWEET)
++ */
 +#if defined(SWEET_KIRIN)
- #include <sys/param.h>
- #include <sys/systm.h>
++#include <sys/param.h>
++#include <sys/systm.h>
 +#include <sys/errno.h>
 +#include <kern/thread.h>
 +#include <kern/sched_prim.h>
- #include <kern/clock.h>
--#include <machine/machine_routines.h>
--#include <kern/locks.h>
--
--extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
--bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
--bool sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz);
--bool sweet_rpm_clk_scaling(void);
--
--static LCK_GRP_DECLARE(sweet_rpm_grp, "sweet_rpm");
--static LCK_MTX_DECLARE(sweet_rpm_lock, &sweet_rpm_grp);
--
--#define RPM_MSGRAM_PA   0x00068000u
--#define RPM_MSGRAM_SIZE 0x6000u
--#define RPM_IPC_PA      0x09820000u     /* APCS GLB, +0x10 IPC */
--#define RPM_TOC_MAGIC   0x67727430u     /* grt0 */
--#define RPM_FIFO_AP2R   0x61703272u
--#define RPM_FIFO_R2AP   0x72326170u
--#define RPM_LCID        1u
--
--#define CMD_VERSION       0u
--#define CMD_VERSION_ACK   1u
--#define CMD_OPEN          2u
--#define CMD_CLOSE         3u
--#define CMD_OPEN_ACK      4u
--#define CMD_TX_DATA       9u
--#define CMD_CLOSE_ACK     11u
--#define CMD_TX_DATA_CONT  12u
--#define CMD_READ_NOTIF    13u
--
--struct rpm_fifo {
--	volatile uint32_t *tail, *head, *data;
--	uint32_t len;
--};
++#include <kern/clock.h>
 +#include <pexpert/pexpert.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -4180,16 +4132,8 @@ index 10d7b16..b40baeb 100644
 +
 +#define NLOCAL                  2
 +#define LOCAL_SZ                256u
- 
- static struct {
--	struct rpm_fifo tx, rx;
--	vm_offset_t ipc;
--	bool mapped, up, remote_open, open_acked;
--	uint32_t rcid, msg_id;
--	uint32_t resp[64];              /* last complete TX_DATA payload */
--	uint32_t resp_len;
--	bool resp_ready;
--} rpm;
++
++static struct {
 +	volatile uint8_t *msgram;
 +	volatile uint8_t *apcs;
 +	/* tx pipe = our 'ap2r' fifo, rx pipe = the RPM's 'r2ap' fifo */
@@ -4226,26 +4170,18 @@ index 10d7b16..b40baeb 100644
 +}
 +
 +/* ---- fifo ---- */
- 
- static uint32_t
--fifo_avail_rx(void)
++
++static uint32_t
 +rx_avail(void)
- {
--	uint32_t head = *rpm.rx.head, tail = *rpm.rx.tail;
--	return head >= tail ? head - tail : rpm.rx.len - tail + head;
++{
 +	uint32_t head = *r.rx_head, tail = *r.rx_tail;
 +	uint32_t n = head >= tail ? head - tail : r.rx_len - tail + head;
 +	return n > r.rx_len ? 0 : n;
- }
- 
- static void
--fifo_peek(uint32_t off, uint32_t *buf, uint32_t n)
++}
++
++static void
 +rx_peek(void *out, uint32_t off, uint32_t n)
- {
--	uint32_t pos = (*rpm.rx.tail + off) % rpm.rx.len;
--	for (uint32_t i = 0; i < n / 4; i++) {
--		buf[i] = rpm.rx.data[pos / 4];
--		pos = (pos + 4) % rpm.rx.len;
++{
 +	uint32_t t = *r.rx_tail + off;
 +	if (t >= r.rx_len) {
 +		t -= r.rx_len;
@@ -4256,11 +4192,10 @@ index 10d7b16..b40baeb 100644
 +	}
 +	for (uint32_t i = 0; i < n - a; i++) {
 +		((uint8_t *)out)[a + i] = r.rx_fifo[i];
- 	}
- }
- 
- static void
--fifo_advance(uint32_t n)
++	}
++}
++
++static void
 +rx_advance(uint32_t n)
 +{
 +	uint32_t t = *r.rx_tail + ((n + 7) & ~7u);
@@ -4281,10 +4216,7 @@ index 10d7b16..b40baeb 100644
 +
 +static uint32_t
 +tx_write_one(uint32_t head, const void *d, uint32_t n)
- {
--	__asm__ volatile("dsb sy" ::: "memory");
--	*rpm.rx.tail = (*rpm.rx.tail + n) % rpm.rx.len;
--	__asm__ volatile("dsb sy" ::: "memory");
++{
 +	uint32_t a = MIN(n, r.tx_len - head);
 +	for (uint32_t i = 0; i < a; i++) {
 +		r.tx_fifo[head + i] = ((const uint8_t *)d)[i];
@@ -4294,35 +4226,19 @@ index 10d7b16..b40baeb 100644
 +	}
 +	head += n;
 +	return head >= r.tx_len ? head - r.tx_len : head;
- }
- 
- static void
--rpm_kick(void)
++}
++
++static void
 +kick(void)
- {
--	__asm__ volatile("dsb sy" ::: "memory");
--	*(volatile uint32_t *)(rpm.ipc + 0x10) = 1u;
++{
 +	__builtin_arm_dsb(0xf);
 +	*(volatile uint32_t *)(r.apcs + APCS_IPC_OFF) = RPM_IPC_BIT;
- }
- 
--/* n is a multiple of 4; the message is padded to 8 bytes. */
--static bool
--rpm_send(const uint32_t *w, uint32_t n)
++}
++
 +/* one command (+ data), 8-byte aligned in the fifo */
 +static int
 +g_tx(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
- {
--	uint32_t total = (n + 7u) & ~7u;
--	for (unsigned tries = 0;; tries++) {
--		uint32_t head = *rpm.tx.head, tail = *rpm.tx.tail;
--		uint32_t avail = tail <= head ? rpm.tx.len - head + tail : tail - head;
--		if (avail > total) {
--			break;
--		}
--		if (tries == 100) {
--			printf("SWEET RPM: tx fifo full (head %u tail %u)\n", head, tail);
--			return false;
++{
 +	uint32_t tlen = (hlen + dlen + 7) & ~7u;
 +	if (tlen >= r.tx_len) {
 +		return EINVAL;
@@ -4331,24 +4247,15 @@ index 10d7b16..b40baeb 100644
 +		if (i > 2000) {
 +			printf("SWEET RPM: tx fifo stays full\n");
 +			return EBUSY;
- 		}
--		delay(1000);
++		}
 +		kick();
 +		r_sleep_ms(1);
- 	}
--	uint32_t pos = *rpm.tx.head;
--	for (uint32_t i = 0; i < total / 4; i++) {
--		rpm.tx.data[pos / 4] = i < n / 4 ? w[i] : 0u;
--		pos = (pos + 4) % rpm.tx.len;
++	}
 +	uint32_t head = *r.tx_head;
 +	head = tx_write_one(head, hdr, hlen);
 +	if (dlen) {
 +		head = tx_write_one(head, data, dlen);
- 	}
--	__asm__ volatile("dsb sy" ::: "memory");
--	*rpm.tx.head = pos;
--	rpm_kick();
--	return true;
++	}
 +	head = (head + 7) & ~7u;
 +	if (head >= r.tx_len) {
 +		head -= r.tx_len;
@@ -4357,21 +4264,15 @@ index 10d7b16..b40baeb 100644
 +	*r.tx_head = head;
 +	kick();
 +	return 0;
- }
- 
--static bool
--rpm_send_cmd(uint32_t cmd, uint32_t param1, uint32_t param2)
++}
++
 +static int
 +g_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
- {
--	uint32_t w[2] = {cmd | (param1 << 16), param2};
--	return rpm_send(w, sizeof(w));
++{
 +	struct { uint16_t cmd, p1; uint32_t p2; } m = { cmd, p1, p2 };
 +	return g_tx(&m, sizeof(m), NULL, 0);
- }
- 
--static bool
--rpm_send_open(void)
++}
++
 +/* ---- channel "rpm_requests" ---- */
 +
 +static void
@@ -4405,11 +4306,7 @@ index 10d7b16..b40baeb 100644
 +
 +static void
 +ch_ready(void)
- {
--	static const char name[] = "rpm_requests";
--	uint32_t w[2 + 4] = {CMD_OPEN | (RPM_LCID << 16), sizeof(name)};
--	memcpy(&w[2], name, sizeof(name));
--	return rpm_send(w, 8u + ((sizeof(name) + 3u) & ~3u));
++{
 +	if (r.ready || !r.open_acked || !r.remote_open) {
 +		return;
 +	}
@@ -4455,62 +4352,37 @@ index 10d7b16..b40baeb 100644
 +	}
 +	printf("SWEET RPM: no RPM buffer for %u bytes\n", len);
 +	return EBUSY;
- }
- 
--/* Handle one incoming message; false when nothing (complete) is there. */
++}
++
 +/* ---- rx ---- */
 +
 +/* returns false when the next command is not all in the fifo yet */
- static bool
--rpm_rx_one(void)
++static bool
 +rx_one(void)
- {
--	uint32_t avail = fifo_avail_rx(), h[4];
++{
 +	uint32_t avail = rx_avail();
 +	struct { uint16_t cmd, p1; uint32_t p2; } m;
- 	if (avail < 8) {
- 		return false;
- 	}
--	fifo_peek(0, h, 8);
--	uint32_t cmd = h[0] & 0xffffu, p1 = h[0] >> 16, p2 = h[1];
--	switch (cmd) {
++	if (avail < 8) {
++		return false;
++	}
 +	rx_peek(&m, 0, 8);
 +	switch (m.cmd) {
- 	case CMD_VERSION:
--		fifo_advance(8);
--		(void)rpm_send_cmd(CMD_VERSION_ACK, 1, 0);
++	case CMD_VERSION:
 +		rx_advance(8);
 +		printf("SWEET RPM: RPM speaks GLINK version %u, features %#x\n", m.p1, m.p2);
 +		(void)g_cmd(CMD_VERSION_ACK, GLINK_VERSION, GLINK_FEATURES);
 +		r.version_done = true;
- 		break;
- 	case CMD_VERSION_ACK:
--		fifo_advance(8);
--		if (p1 != 1) {
--			printf("SWEET RPM: version ack %u features %#x\n", p1, p2);
--		} else if (p2 != 0) {
--			(void)rpm_send_cmd(CMD_VERSION, 1, 0);
--		} else if (!rpm.up) {
--			rpm.up = true;
--			(void)rpm_send_open();
--		}
++		break;
++	case CMD_VERSION_ACK:
 +		rx_advance(8);
 +		r.version_done = true;
- 		break;
- 	case CMD_OPEN: {
--		uint32_t len = 8u + ((p2 + 7u) & ~7u), name[8] = {0};
--		if (avail < len) {
++		break;
++	case CMD_OPEN: {
 +		uint32_t nl = m.p2 & 0xffff;
 +		char name[33] = { 0 };
 +		if (avail < 8 + nl) {
- 			return false;
- 		}
--		fifo_peek(8, name, MIN(p2 + 3u, 31u) & ~3u);
--		fifo_advance(len);
--		if (strncmp((const char *)name, "rpm_requests", 13) == 0) {
--			rpm.rcid = p1;
--			rpm.remote_open = true;
--			(void)rpm_send_cmd(CMD_OPEN_ACK, p1, 0);
++			return false;
++		}
 +		rx_peek(name, 8, MIN(nl, 32u));
 +		rx_advance(8 + nl);
 +		if (strcmp(name, "rpm_requests") == 0) {
@@ -4521,27 +4393,19 @@ index 10d7b16..b40baeb 100644
 +				ch_open();
 +			}
 +			ch_ready();
- 		} else {
--			printf("SWEET RPM: ignoring remote open of '%.24s'\n", (const char *)name);
++		} else {
 +			(void)g_cmd(CMD_OPEN_ACK, m.p1, 0);
- 		}
- 		break;
- 	}
- 	case CMD_OPEN_ACK:
--		fifo_advance(8);
--		if (p1 == RPM_LCID) {
--			rpm.open_acked = true;
++		}
++		break;
++	}
++	case CMD_OPEN_ACK:
 +		rx_advance(8);
 +		if (m.p1 == r.lcid) {
 +			r.open_acked = true;
 +			ch_ready();
- 		}
- 		break;
- 	case CMD_CLOSE:
--		fifo_advance(8);
--		(void)rpm_send_cmd(CMD_CLOSE_ACK, p1, 0);
--		if (p1 == rpm.rcid) {
--			rpm.remote_open = false;
++		}
++		break;
++	case CMD_CLOSE:
 +		rx_advance(8);
 +		(void)g_cmd(CMD_CLOSE_ACK, m.p1, 0);
 +		break;
@@ -4578,27 +4442,22 @@ index 10d7b16..b40baeb 100644
 +				}
 +				r.rem[i].used = false;
 +			}
- 		}
- 		break;
++		}
++		break;
 +	case CMD_RX_INTENT_REQ:
 +		rx_advance(8);
 +		(void)g_cmd(CMD_RX_INTENT_REQ_ACK, r.lcid, 1);
 +		break;
- 	case CMD_TX_DATA:
- 	case CMD_TX_DATA_CONT: {
++	case CMD_TX_DATA:
++	case CMD_TX_DATA_CONT: {
 +		struct { uint16_t cmd, p1; uint32_t liid, chunk, left; } h;
- 		if (avail < 16) {
- 			return false;
- 		}
--		fifo_peek(0, h, 16);
--		uint32_t chunk = h[2], left = h[3];
--		if (avail < 16 + chunk) {
++		if (avail < 16) {
++			return false;
++		}
 +		rx_peek(&h, 0, 16);
 +		if (avail < 16 + h.chunk) {
- 			return false;
- 		}
--		if (cmd == CMD_TX_DATA) {
--			rpm.resp_len = 0;
++			return false;
++		}
 +		int li = -1;
 +		for (uint32_t i = 0; i < r.nloc; i++) {
 +			if (r.loc[i].id == h.liid) {
@@ -4608,13 +4467,7 @@ index 10d7b16..b40baeb 100644
 +		if (li < 0 || r.loc[li].size - r.loc[li].off < h.chunk) {
 +			rx_advance(16 + h.chunk);
 +			break;
- 		}
--		uint32_t take = MIN(chunk, sizeof(rpm.resp) - rpm.resp_len) & ~3u;
--		fifo_peek(16, (uint32_t *)((uint8_t *)rpm.resp + rpm.resp_len), take);
--		rpm.resp_len += take;
--		fifo_advance((16u + chunk + 7u) & ~7u);
--		if (left == 0) {
--			rpm.resp_ready = true;
++		}
 +		rx_peek(r.loc[li].buf + r.loc[li].off, 16, h.chunk);
 +		r.loc[li].off += h.chunk;
 +		rx_advance(16 + h.chunk);
@@ -4628,73 +4481,28 @@ index 10d7b16..b40baeb 100644
 +			}
 +			(void)g_cmd(CMD_RX_DONE, r.lcid, r.loc[li].id);
 +			ch_advertise((uint32_t)li);
- 		}
- 		break;
- 	}
- 	case CMD_READ_NOTIF:
--		fifo_advance(8);
--		rpm_kick();
++		}
++		break;
++	}
++	case CMD_READ_NOTIF:
 +		rx_advance(8);
 +		kick();
 +		break;
 +	case CMD_RX_INTENT_REQ_ACK:
 +	case CMD_SIGNALS:
 +		rx_advance(8);
- 		break;
- 	default:
--		/* intent/rx-done/signals: not used on this intentless edge */
--		printf("SWEET RPM: rx cmd %u p1 %u p2 %#x dropped\n", cmd, p1, p2);
--		fifo_advance(8);
++		break;
++	default:
 +		printf("SWEET RPM: unknown command %u, fifo reset\n", m.cmd);
 +		*r.rx_tail = *r.rx_head;
- 		break;
- 	}
- 	return true;
- }
- 
--/* Poll up to ms for cond. */
--#define RPM_POLL(ms, cond) ({                                   \
--	unsigned _i;                                            \
--	for (_i = 0; _i < (ms) && !(cond); _i++) {              \
--	        while (rpm_rx_one()) {                          \
--	        }                                               \
--	        if (!(cond)) {                                  \
--	                delay(1000);                            \
--	        }                                               \
--	}                                                       \
--	(cond);                                                 \
--})
--
- static bool
--rpm_open(void)
++		break;
++	}
++	return true;
++}
++
++static bool
 +rx_pump(void)
- {
--	if (rpm.up && rpm.remote_open && rpm.open_acked) {
--		return true;
--	}
--	if (!rpm.mapped) {
--		vm_offset_t ram = ml_io_map(RPM_MSGRAM_PA, RPM_MSGRAM_SIZE);
--		rpm.ipc = ml_io_map(RPM_IPC_PA, 0x1000);
--		if (!ram || !rpm.ipc) {
--			printf("SWEET RPM: MMIO mapping failed\n");
--			return false;
--		}
--		volatile uint32_t *toc = (volatile uint32_t *)(ram + RPM_MSGRAM_SIZE - 256);
--		uint32_t count = toc[1];
--		if (toc[0] != RPM_TOC_MAGIC || count > 20) {
--			printf("SWEET RPM: bad TOC magic %#x count %u\n", toc[0], count);
--			return false;
--		}
--		for (uint32_t i = 0; i < count; i++) {
--			uint32_t id = toc[2 + 3 * i], off = toc[3 + 3 * i], size = toc[4 + 3 * i];
--			struct rpm_fifo *f = id == RPM_FIFO_AP2R ? &rpm.tx : id == RPM_FIFO_R2AP ? &rpm.rx : NULL;
--			if (f == NULL || off + size > RPM_MSGRAM_SIZE || (size & 3u)) {
--				continue;
--			}
--			f->tail = (volatile uint32_t *)(ram + off);
--			f->head = f->tail + 1;
--			f->data = f->tail + 2;
--			f->len = size;
++{
 +	bool any = false;
 +	while (rx_one()) {
 +		any = true;
@@ -4727,10 +4535,7 @@ index 10d7b16..b40baeb 100644
 +		uint32_t id = rd32(ent), off = rd32(ent + 4), size = rd32(ent + 8);
 +		if (off + size > RPM_MSGRAM_SZ || size < 8) {
 +			continue;
- 		}
--		if (!rpm.tx.data || !rpm.rx.data) {
--			printf("SWEET RPM: TOC has no ap2r/r2ap fifo\n");
--			return false;
++		}
 +		if (id == RPM_TX_FIFO_ID) {
 +			r.tx_tail = (volatile uint32_t *)(r.msgram + off);
 +			r.tx_head = (volatile uint32_t *)(r.msgram + off + 4);
@@ -4741,20 +4546,7 @@ index 10d7b16..b40baeb 100644
 +			r.rx_head = (volatile uint32_t *)(r.msgram + off + 4);
 +			r.rx_fifo = r.msgram + off + 8;
 +			r.rx_len = size;
- 		}
--		printf("SWEET RPM: tx len %u head %u tail %u, rx len %u head %u tail %u\n",
--		    rpm.tx.len, *rpm.tx.head, *rpm.tx.tail, rpm.rx.len, *rpm.rx.head, *rpm.rx.tail);
--		rpm.mapped = true;
--	}
--	/* As Linux: our write index and read index start over, then negotiate. */
--	rpm.up = rpm.remote_open = rpm.open_acked = false;
--	*rpm.tx.head = 0;
--	*rpm.rx.tail = 0;
--	(void)rpm_send_cmd(CMD_VERSION, 1, 0);
--	bool ok = RPM_POLL(1000u, rpm.up && rpm.remote_open && rpm.open_acked);
--	printf("SWEET RPM: link %s (version %d, remote open %d rcid %u, open ack %d)\n",
--	    ok ? "up" : "FAILED", rpm.up, rpm.remote_open, rpm.rcid, rpm.open_acked);
--	return ok;
++		}
 +	}
 +	if (!r.tx_fifo || !r.rx_fifo) {
 +		printf("SWEET RPM: TOC without both fifos\n");
@@ -4762,31 +4554,14 @@ index 10d7b16..b40baeb 100644
 +	}
 +	printf("SWEET RPM: tx fifo %u bytes, rx fifo %u bytes\n", r.tx_len, r.rx_len);
 +	return 0;
- }
- 
--/*
-- * One request in set `set` (0 active, 1 sleep): type, id and nkvp {key, 4,
-- * value} records. Lock held. True if the RPM acked it ("msg#" = our id)
-- * without "err".
-- */
--static bool
--rpm_request(const char *what, uint32_t set, uint32_t type, uint32_t id, const uint32_t *kv, unsigned nkvp)
++}
++
 +int
 +sweet_rpm_setup(void)
- {
--	if (!rpm_open()) {
--		return false;
++{
 +	if (r.ready) {
 +		return 0;
- 	}
--	uint32_t msg = ++rpm.msg_id;
--	uint32_t w[11 + 3 * 4] = {
--		CMD_TX_DATA | (RPM_LCID << 16), 0, 0, 0,        /* chunk set below */
--		0x00716572u, 20u + 12u * nkvp,                  /* "req", length */
--		msg, set, type, id, 12u * nkvp,
--	};
--	if (nkvp > 4) {
--		return false;
++	}
 +	if (!r.mapped) {
 +		r.msgram = (volatile uint8_t *)ml_io_map(RPM_MSGRAM_PA, RPM_MSGRAM_SZ);
 +		r.apcs = (volatile uint8_t *)ml_io_map(APCS_IPC_PA, 0x1000);
@@ -4801,11 +4576,7 @@ index 10d7b16..b40baeb 100644
 +		if (parse_toc() != 0) {
 +			return ENODEV;
 +		}
- 	}
--	for (unsigned k = 0; k < nkvp; k++) {
--		w[11 + 3 * k] = kv[2 * k];
--		w[12 + 3 * k] = 4u;
--		w[13 + 3 * k] = kv[2 * k + 1];
++	}
 +
 +	/* version handshake */
 +	(void)g_cmd(CMD_VERSION, GLINK_VERSION, GLINK_FEATURES);
@@ -4813,85 +4584,34 @@ index 10d7b16..b40baeb 100644
 +		rx_pump();
 +		kick();
 +		r_sleep_ms(1);
- 	}
--	uint32_t bytes = (11u + 3u * nkvp) * 4u;
--	w[2] = bytes - 16u;
--	rpm.resp_ready = false;
--	if (!rpm_send(w, bytes)) {
--		return false;
++	}
 +	if (!r.version_done) {
 +		printf("SWEET RPM: no GLINK version from the RPM\n");
 +		return ETIMEDOUT;
- 	}
--	if (!RPM_POLL(1000u, rpm.resp_ready)) {
--		printf("SWEET RPM: %s: no answer\n", what);
--		return false;
++	}
 +
 +	/* open our side of rpm_requests, then wait for the link to be ready */
 +	if (!r.open_sent) {
 +		ch_open();
- 	}
--	/* "req", length, then {type, length, data} records */
--	bool acked = false, err = false;
--	uint32_t words = MIN(rpm.resp_len / 4, 2u + rpm.resp[1] / 4), i = 2;
--	while (i + 2 <= words) {
--		uint32_t rtype = rpm.resp[i], len = rpm.resp[i + 1];
--		if (rtype == 0x2367736du && rpm.resp[i + 2] == msg) {
--			acked = true;
--		} else if (rtype == 0x00727265u) {
--			char text[32] = {0};
--			memcpy(text, &rpm.resp[i + 2], MIN(len, sizeof(text) - 1));
--			printf("SWEET RPM: %s: error '%s'\n", what, text);
--			err = true;
++	}
 +	for (int i = 0; i < 2000 && !r.ready; i++) {
 +		rx_pump();
 +		if (!r.open_sent) {
 +			ch_open();
- 		}
--		i += 2 + (len + 3) / 4;
++		}
 +		r_sleep_ms(1);
- 	}
--	return acked && !err;
--}
--
--/* Vote PM8994 LDOn on at uv in the active set. */
--bool
--sweet_rpm_ldoa(unsigned ldo, uint32_t uv)
--{
--	uint32_t kv[4] = {0x6e657773u, 1u, 0x00007675u, uv};      /* swen = 1, uv */
--	char what[8];
--	snprintf(what, sizeof(what), "L%u", ldo);
--	lck_mtx_lock(&sweet_rpm_lock);
--	bool ok = rpm_request(what, 0, 0x616f646cu, ldo, kv, 2);       /* "ldoa" */
--	lck_mtx_unlock(&sweet_rpm_lock);
--	printf("SWEET RPM: L%u %u uV: %s\n", ldo, uv, ok ? "ok" : "FAILED");
--	return ok;
++	}
 +	if (!r.ready) {
 +		printf("SWEET RPM: rpm_requests did not open (open_acked %d remote %d)\n",
 +		    r.open_acked, r.remote_open);
 +		return ETIMEDOUT;
 +	}
 +	return 0;
- }
- 
--/*
-- * VDD_MX (PM8994 S2+S12, RPM "smpa" 2) corner vote in the active set, like
-- * Linux's pm8994_s2_corner: key "corn" = corner - 1 (rpm-smd-regulator
-- * voltage_offset RPM_REGULATOR_CORNER_NONE); corner 7 = super turbo, which
-- * the GPU needs above 510 MHz (gfxfreq-mx-speedbin0).
-- */
--bool
--sweet_rpm_mx_corner(uint32_t corner)
++}
++
 +int
 +sweet_rpm_vote_level(uint32_t resource, uint32_t resource_id, uint32_t set, uint32_t level)
- {
--	uint32_t kv[4] = {0x6e657773u, 1u, 0x6e726f63u, corner - 1};   /* swen = 1, corn */
--	lck_mtx_lock(&sweet_rpm_lock);
--	bool ok = rpm_request("MX", 0, 0x61706d73u, 2, kv, 2);           /* "smpa" */
--	lck_mtx_unlock(&sweet_rpm_lock);
--	printf("SWEET RPM: MX corner %u: %s\n", corner, ok ? "ok" : "FAILED");
--	return ok;
--}
++{
 +	if (sweet_rpm_setup() != 0) {
 +		return ENOTCONN;
 +	}
@@ -4911,22 +4631,7 @@ index 10d7b16..b40baeb 100644
 +	msg.key = KVP_KEY_LEVEL;
 +	msg.nbytes = 4;
 +	msg.value = level;
- 
--/*
-- * Clock vote in the sleep and the active set, like a Linux clk-smd-rpm
-- * clock without an _a twin: type e.g. "clk2" (memory clocks: id 0 bimc =
-- * DDR), key "KHz ", rate in kHz; the RPM rounds to a supported rate. Takes
-- * effect only once scaling is on (sweet_rpm_clk_scaling).
-- */
--bool
--sweet_rpm_clk(uint32_t type, uint32_t id, uint32_t khz)
--{
--	uint32_t kv[2] = {0x007a484bu, khz};                    /* "KHz " */
--	lck_mtx_lock(&sweet_rpm_lock);
--	bool ok = rpm_request("clk sleep", 1, type, id, kv, 1) && rpm_request("clk active", 0, type, id, kv, 1);
--	lck_mtx_unlock(&sweet_rpm_lock);
--	printf("SWEET RPM: clock %08x id %u %u kHz: %s\n", type, id, khz, ok ? "ok" : "FAILED");
--	return ok;
++
 +	r.last_ack_id = 0;
 +	r.last_ack_err = -1;
 +	uint32_t want = msg.msg_id;
@@ -4948,75 +4653,19 @@ index 10d7b16..b40baeb 100644
 +	}
 +	printf("SWEET RPM: resource %#x set %u at level %u\n", resource, set, level);
 +	return 0;
- }
- 
--/*
-- * RPM clock scaling on (clk-smd-rpm.c clk_smd_rpm_enable_scaling, downstream
-- * enable_rpm_scaling): "clk0" id 2, "Enab" = 1, sleep then active set.
-- * Until then the RPM acks rate votes and ignores them (0146a: DDR stayed at
-- * 1016 MHz after an acked 1804 MHz vote). Once it is on the RPM goes by the
-- * AP's votes, so first, like Linux's clk_smd_rpm_handoff, every msm8996 RPM
-- * clock (downstream clock-gcc-8996.c / msm-clocks-hwio-8996.h) is voted on
-- * at its maximum in both sets: rate clocks "KHz " INT_MAX, branches "Enab"
-- * 1, XO buffers "swen" 1, their pin-controlled twins "pccb" 1.
-- */
--static const struct {
--	uint32_t type, id, key, value;
--} rpm_handoff[] = {
--	{0x316b6c63u, 0, 0x007a484bu, 0x7fffffffu},     /* clk1 pnoc */
--	{0x316b6c63u, 1, 0x007a484bu, 0x7fffffffu},     /* clk1 snoc */
--	{0x316b6c63u, 2, 0x007a484bu, 0x7fffffffu},     /* clk1 cnoc */
--	{0x326b6c63u, 0, 0x007a484bu, 0x7fffffffu},     /* clk2 bimc (DDR) */
--	{0x69786d6du, 0, 0x007a484bu, 0x7fffffffu},     /* mmxi mmssnoc_axi */
--	{0x00617069u, 0, 0x007a484bu, 0x7fffffffu},     /* ipa */
--	{0x00006563u, 0, 0x007a484bu, 0x7fffffffu},     /* ce1 */
--	{0x72676761u, 1, 0x62616e45u, 1},               /* aggr aggre1_noc */
--	{0x72676761u, 2, 0x62616e45u, 1},               /* aggr aggre2_noc */
--	{0x306b6c63u, 1, 0x62616e45u, 1},               /* clk0 qdss */
--	{0x616b6c63u, 1, 0x6e657773u, 1},               /* clka bb_clk1 */
--	{0x616b6c63u, 2, 0x6e657773u, 1},               /* clka bb_clk2 */
--	{0x616b6c63u, 4, 0x6e657773u, 1},               /* clka rf_clk1 */
--	{0x616b6c63u, 5, 0x6e657773u, 1},               /* clka rf_clk2 */
--	{0x616b6c63u, 8, 0x6e657773u, 1},               /* clka ln_bb_clk */
--	{0x616b6c63u, 0xb, 0x6e657773u, 1},             /* clka div_clk1 */
--	{0x616b6c63u, 0xc, 0x6e657773u, 1},             /* clka div_clk2 */
--	{0x616b6c63u, 0xd, 0x6e657773u, 1},             /* clka div_clk3 */
--	{0x616b6c63u, 1, 0x62636370u, 1},               /* clka bb_clk1_pin */
--	{0x616b6c63u, 2, 0x62636370u, 1},               /* clka bb_clk2_pin */
--	{0x616b6c63u, 4, 0x62636370u, 1},               /* clka rf_clk1_pin */
--	{0x616b6c63u, 5, 0x62636370u, 1},               /* clka rf_clk2_pin */
--};
--
--bool
--sweet_rpm_clk_scaling(void)
++}
++
 +int
 +sweet_rpm_vote_cx_mx(uint32_t cx_level, uint32_t mx_level)
- {
--	uint32_t kv[2] = {0x62616e45u, 1u};                     /* "Enab" */
--	unsigned failed = 0;
--	lck_mtx_lock(&sweet_rpm_lock);
--	for (unsigned i = 0; i < sizeof(rpm_handoff) / sizeof(rpm_handoff[0]); i++) {
--		uint32_t h[2] = {rpm_handoff[i].key, rpm_handoff[i].value};
--		char what[24];
--		snprintf(what, sizeof(what), "handoff %08x %u", rpm_handoff[i].type, rpm_handoff[i].id);
--		for (uint32_t set = 0; set < 2; set++) {
--			failed += !rpm_request(what, 1 - set, rpm_handoff[i].type, rpm_handoff[i].id, h, 1);
--		}
++{
 +	if (sweet_rpm_setup() != 0) {
 +		printf("SWEET RPM: link not up, skipping the CX/MX vote\n");
 +		return ENOTCONN;
- 	}
--	bool ok = failed == 0 && rpm_request("scaling sleep", 1, 0x306b6c63u, 2, kv, 1) &&
--	    rpm_request("scaling active", 0, 0x306b6c63u, 2, kv, 1);
--	lck_mtx_unlock(&sweet_rpm_lock);
--	printf("SWEET RPM: clock handoff (%u votes failed)\n", failed);
--	printf("SWEET RPM: clock scaling on: %s\n", ok ? "ok" : "FAILED");
--	return ok;
++	}
 +	int a = sweet_rpm_vote_level(0x78637772u /* 'rwcx' */, 0, RPM_SET_ACTIVE, cx_level);
 +	int b = sweet_rpm_vote_level(0x786d7772u /* 'rwmx' */, 0, RPM_SET_ACTIVE, mx_level);
 +	return a ? a : b;
- }
--#endif /* ARM64_BOARD_CONFIG_SWEET */
++}
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 index a9ad4f2..41f8d34 100644
