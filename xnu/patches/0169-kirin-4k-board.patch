@@ -2764,10 +2764,10 @@ index 0000000..13d14df
 +}
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
-index a0a9ae1..2a8d40c 100644
+index a0a9ae1..4eaf5e6 100644
 --- a/bsd/dev/sweet_perf.c
 +++ b/bsd/dev/sweet_perf.c
-@@ -563,6 +563,200 @@ fastboot_thread(void *arg, wait_result_t result)
+@@ -563,6 +563,260 @@ fastboot_thread(void *arg, wait_result_t result)
  	printf("SWEET FASTBOOT: still running after PS_HOLD\n");
  }
  
@@ -2848,6 +2848,65 @@ index a0a9ae1..2a8d40c 100644
 +	    clk_rd(pll, 0x00), clk_rd(rcg, 0x54), clk_rd(rcg, 0x50), upd ? "" : " (update stuck)");
 +}
 +
++/*
++ * OSM pstate (SDM630 clk-cpu-osm, DT qcom,clk-cpu-630@179c0000). The big
++ * cluster (perfcl, CPU 0-3) is driven by the OSM at base + 1 * OSM_CORE_TABLE_SIZE
++ * (0x2000), the little one (pwrcl) at +0. ENABLE_REG 0x1004, the requested
++ * performance state at DCVS_PERF_STATE_DESIRED_REG 0x1F10. The OSM's LUT, loaded
++ * by the bootloader from the device DT (qcom,{pwrcl,perfcl}-speedbin0-v0),
++ * carries the fused open-loop voltage of every corner, so raising the pstate
++ * applies the matching voltage in hardware: no manual CPRh/SAW, no guessed mV.
++ * Read only, unless sweetpstate_perf / sweetpstate_pwr name a pstate and the
++ * cluster's OSM reports enabled.
++ */
++static const uint32_t pwrcl_mhz[8] = {300, 614, 883, 1094, 1382, 1536, 1728, 1843};
++static const uint32_t perfcl_mhz[10] = {300, 787, 1113, 1344, 1516, 1670, 1881, 2016, 2150, 2380};
++
++static void
++kirin_osm_tune(void)
++{
++	vm_offset_t osm = ml_io_map(0x179c0000u, 0x4000);
++	if (osm == 0) {
++		return;
++	}
++	vm_offset_t efuse = ml_io_map(0x784000u, 0x1000);
++	if (efuse != 0) {
++		printf("SWEET OSM: perfcl speed-bin fuse %#x %#x\n", clk_rd(efuse, 0x130), clk_rd(efuse, 0x134));
++	}
++	static const struct {
++		const char *name;
++		uint32_t base;
++		const uint32_t *mhz;
++		unsigned n;
++		const char *arg;
++	} cl[] = {
++		{"pwrcl", 0x0000u, pwrcl_mhz, 8, "sweetpstate_pwr"},
++		{"perfcl", 0x2000u, perfcl_mhz, 10, "sweetpstate_perf"},
++	};
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t en = clk_rd(osm, cl[i].base + 0x1004u);
++		uint32_t cur = clk_rd(osm, cl[i].base + 0x1f10u);
++		printf("SWEET OSM: %s enable %#x, pstate %u (%u MHz); %u pstates, max %u MHz\n",
++		    cl[i].name, en, cur, cur < cl[i].n ? cl[i].mhz[cur] : 0, cl[i].n, cl[i].mhz[cl[i].n - 1]);
++		int want = -1;
++		(void)PE_parse_boot_argn(cl[i].arg, &want, sizeof(want));
++		if (want < 0) {
++			continue;
++		}
++		if (!(en & 1u)) {
++			printf("SWEET OSM: %s OSM not enabled, pstate left alone\n", cl[i].name);
++			continue;
++		}
++		if (want >= (int)cl[i].n) {
++			want = (int)cl[i].n - 1;
++		}
++		clk_wr(osm, cl[i].base + 0x1f10u, (uint32_t)want);
++		delay(2000);
++		printf("SWEET OSM: %s -> pstate %u (%u MHz), reads %u\n", cl[i].name, want, cl[i].mhz[want],
++		    clk_rd(osm, cl[i].base + 0x1f10u));
++	}
++}
++
 +static void
 +kirin_clk_probe(void)
 +{
@@ -2919,6 +2978,7 @@ index a0a9ae1..2a8d40c 100644
 +		    clk_rd(osm, 0x1100), clk_rd(osm, 0x3000));
 +	}
 +	kirin_pwrcl_raise();
++	kirin_osm_tune();
 +	for (int c = 0; c < (int)ml_get_cpu_count(); c++) {
 +		struct processor *p = cpu_to_processor(c);
 +		if (p == NULL) {
@@ -2968,7 +3028,7 @@ index a0a9ae1..2a8d40c 100644
  void
  sweet_perf_init(void)
  {
-@@ -577,6 +771,15 @@ sweet_perf_init(void)
+@@ -577,6 +831,15 @@ sweet_perf_init(void)
  	int enabled = 1;
  	thread_t thread;
  	(void)PE_parse_boot_argn("sweetperf", &enabled, sizeof(enabled));
