@@ -2178,10 +2178,10 @@ index 0c548d1..9bc7611 100644
  		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 new file mode 100644
-index 0000000..b0f8ffd
+index 0000000..23cc781
 --- /dev/null
 +++ b/bsd/dev/sweet_modem.c
-@@ -0,0 +1,559 @@
+@@ -0,0 +1,572 @@
 +/*
 + * kirin, boot-arg sweetmodem=1: bring up the SDM630 modem (MSS, the Hexagon Q6 that runs
 + * the cellular and Wi-Fi firmware), stage A. Unlike the ADSP (a simple TrustZone PAS), the
@@ -2304,12 +2304,18 @@ index 0000000..b0f8ffd
 +extern int sweet_emmc_read_partition(const char *want, uint64_t off, uint32_t count, void *out, uint64_t *total);
 +#define MODEM_PART      "modem_a"
 +
-+static uint32_t fat_bps, fat_spc, fat_fat_sec, fat_root_sec, fat_root_ents, fat_data_sec;
-+static uint8_t fat_sb[512];
-+static uint8_t fat_bounce[64 * 1024];   /* at most one cluster (spc <= 128 sectors) */
-+static uint8_t fat_cache[512];          /* the last-read FAT sector, to follow a chain cheaply */
++#define FAT_SECMAX      4096u           /* largest FAT logical sector we handle (modem_a uses 4096) */
++
++static uint32_t fat_bps;                /* bytes per FAT logical sector (512 or 4096 here) */
++static uint32_t fat_r;                  /* 512-byte eMMC sectors per FAT sector (bps / 512) */
++static uint32_t fat_spc;                /* FAT sectors per cluster */
++static uint32_t fat_clbytes;            /* bytes per cluster (spc * bps) */
++static uint32_t fat_fat_sec, fat_root_sec, fat_root_fs, fat_data_sec, fat_root_ents;
++static uint8_t fat_sb[FAT_SECMAX];      /* scratch for one FAT sector (BPB, directory) */
++static uint8_t fat_cache[FAT_SECMAX];   /* the last-read FAT-table sector, cached while walking a chain */
 +static uint32_t fat_cache_sec;
 +static int fat_cache_valid;
++static uint8_t fat_bounce[64 * 1024];   /* one cluster (mount rejects a FAT whose cluster is larger) */
 +
 +static uint16_t
 +u16le(const uint8_t *p)
@@ -2318,23 +2324,26 @@ index 0000000..b0f8ffd
 +}
 +
 +/*
-+ * One read goes through sweet_emmc_read_partition, which re-parses the GPT and copies through a
-+ * 1 MB DMA bounce; count is capped at 2048 sectors. It is slow per call, so the readers below
-+ * coalesce contiguous clusters into reads of up to 1 MB and cache the FAT sector while following
-+ * a chain, to move the 57 MB image in as few calls as possible.
++ * modem_a is a FAT with 4096-byte logical sectors, while sweet_emmc_read_partition works in
++ * 512-byte eMMC sectors (and re-parses the GPT and copies through a 1 MB bounce on every call,
++ * capped at 2048 sectors). fat_rd takes a count in FAT sectors and converts: the readers below
++ * coalesce contiguous clusters into reads of up to 1 MB and cache the FAT-table sector while
++ * following a chain, to move the 57 MB image in as few calls as possible.
 + */
 +static int
-+fat_rd(uint64_t sec, uint32_t n, void *out)
++fat_rd(uint32_t fs, uint32_t n, void *out)
 +{
 +	uint64_t total = 0;
-+	return sweet_emmc_read_partition(MODEM_PART, sec, n, out, &total);
++	return sweet_emmc_read_partition(MODEM_PART, (uint64_t)fs * fat_r, n * fat_r, out, &total);
 +}
 +
 +static int
 +fat_mount(void)
 +{
++	uint64_t total = 0;
 +	fat_cache_valid = 0;
-+	if (fat_rd(0, 1, fat_sb) != 0) {
++	/* the BPB is in the first 512 bytes; read one raw eMMC sector for it */
++	if (sweet_emmc_read_partition(MODEM_PART, 0, 1, fat_sb, &total) != 0) {
 +		printf("SWEET MODEM: cannot read %s sector 0\n", MODEM_PART);
 +		return -1;
 +	}
@@ -2344,13 +2353,17 @@ index 0000000..b0f8ffd
 +	uint32_t nfat = fat_sb[0x10];
 +	fat_root_ents = u16le(fat_sb + 0x11);
 +	uint32_t spf = u16le(fat_sb + 0x16);
-+	if (fat_bps != 512 || fat_spc == 0 || fat_spc > 128) {
-+		printf("SWEET MODEM: not a 512-byte FAT (bps %u spc %u)\n", fat_bps, fat_spc);
++	if (fat_bps < 512 || fat_bps > FAT_SECMAX || (fat_bps & (fat_bps - 1)) != 0 ||
++	    fat_spc == 0 || (uint32_t)fat_spc * fat_bps > sizeof(fat_bounce)) {
++		printf("SWEET MODEM: unsupported FAT (bps %u spc %u)\n", fat_bps, fat_spc);
 +		return -1;
 +	}
++	fat_r = fat_bps / 512;
++	fat_clbytes = fat_spc * fat_bps;
 +	fat_fat_sec = rsvd;
 +	fat_root_sec = rsvd + nfat * spf;
-+	fat_data_sec = fat_root_sec + (fat_root_ents * 32 + 511) / 512;
++	fat_root_fs = (fat_root_ents * 32 + fat_bps - 1) / fat_bps;
++	fat_data_sec = fat_root_sec + fat_root_fs;
 +	return 0;
 +}
 +
@@ -2358,7 +2371,7 @@ index 0000000..b0f8ffd
 +fat_next(uint32_t cl)
 +{
 +	uint32_t off = cl * 2;
-+	uint32_t sec = fat_fat_sec + off / 512;
++	uint32_t sec = fat_fat_sec + off / fat_bps;
 +	if (!fat_cache_valid || sec != fat_cache_sec) {
 +		if (fat_rd(sec, 1, fat_cache) != 0) {
 +			return 0xffff;
@@ -2366,10 +2379,10 @@ index 0000000..b0f8ffd
 +		fat_cache_sec = sec;
 +		fat_cache_valid = 1;
 +	}
-+	return u16le(fat_cache + (off % 512));
++	return u16le(fat_cache + (off % fat_bps));
 +}
 +
-+/* find an 8.3 name (11 bytes, space padded) in a directory; root if cluster 0 */
++/* find an 8.3 name (11 bytes, space padded) in a directory; the root when dir_cluster == 0 */
 +static int
 +fat_find(uint32_t dir_cluster, const char name[11], uint32_t *first_cl, uint32_t *fsize, int *is_dir)
 +{
@@ -2378,7 +2391,7 @@ index 0000000..b0f8ffd
 +		uint32_t base, nsec;
 +		if (dir_cluster == 0) {         /* FAT16 root: contiguous */
 +			base = fat_root_sec;
-+			nsec = (fat_root_ents * 32 + 511) / 512;
++			nsec = fat_root_fs;
 +		} else {
 +			base = fat_data_sec + (cl - 2) * fat_spc;
 +			nsec = fat_spc;
@@ -2387,7 +2400,7 @@ index 0000000..b0f8ffd
 +			if (fat_rd(base + s, 1, fat_sb) != 0) {
 +				return -1;
 +			}
-+			for (uint32_t e = 0; e < 512; e += 32) {
++			for (uint32_t e = 0; e < fat_bps; e += 32) {
 +				const uint8_t *d = fat_sb + e;
 +				if (d[0] == 0x00) {
 +					return -1;      /* end of directory */
@@ -2413,27 +2426,27 @@ index 0000000..b0f8ffd
 +	}
 +}
 +
-+/* read a file (by its 8.3 name in the IMAGE directory) into dest, up to maxlen; size, or -1 */
++/* read a file (by its 8.3 name in dir_cluster, root if 0) into dest, up to maxlen; size, or -1 */
 +static int64_t
-+fat_read_image_file(uint32_t image_cl, const char name[11], uint8_t *dest, uint32_t maxlen)
++fat_read_file(uint32_t dir_cluster, const char name[11], uint8_t *dest, uint32_t maxlen)
 +{
 +	uint32_t cl, fsize;
 +	int is_dir;
-+	if (fat_find(image_cl, name, &cl, &fsize, &is_dir) != 0 || is_dir) {
++	if (fat_find(dir_cluster, name, &cl, &fsize, &is_dir) != 0 || is_dir) {
 +		return -1;
 +	}
 +	if (fsize > maxlen) {
 +		printf("SWEET MODEM: %.11s is %u bytes, over the %u-byte buffer\n", name, fsize, maxlen);
 +		return -1;
 +	}
-+	uint32_t got = 0, clbytes = fat_spc * 512;
-+	uint32_t maxrun = 2048 / fat_spc;       /* keep each read within the 1 MB bounce */
++	uint32_t maxrun = 2048 / (fat_spc * fat_r);     /* clusters per read, within the 1 MB bounce */
 +	if (maxrun == 0) {
 +		maxrun = 1;
 +	}
++	uint32_t got = 0;
 +	while (cl >= 2 && cl < 0xfff8 && got < fsize) {
 +		uint32_t remain = fsize - got;
-+		if (remain < clbytes) {
++		if (remain < fat_clbytes) {
 +			/* the final, partial cluster: read it whole, copy only what the file holds */
 +			if (fat_rd(fat_data_sec + (cl - 2) * fat_spc, fat_spc, fat_bounce) != 0) {
 +				return -1;
@@ -2444,7 +2457,7 @@ index 0000000..b0f8ffd
 +		}
 +		/* gather a run of physically contiguous full clusters, up to the bounce size */
 +		uint32_t start = cl, run = 1;
-+		while (run < maxrun && (uint64_t)(run + 1) * clbytes <= remain) {
++		while (run < maxrun && (uint64_t)(run + 1) * fat_clbytes <= remain) {
 +			uint32_t nx = fat_next(cl);
 +			if (nx != cl + 1) {
 +				break;
@@ -2456,7 +2469,7 @@ index 0000000..b0f8ffd
 +		if (fat_rd(fat_data_sec + (start - 2) * fat_spc, run * fat_spc, dest + got) != 0) {
 +			return -1;
 +		}
-+		got += run * clbytes;
++		got += run * fat_clbytes;
 +		cl = nx;
 +	}
 +	return got;
@@ -2484,7 +2497,7 @@ index 0000000..b0f8ffd
 +		image_cl = 0;
 +		printf("SWEET MODEM: no image/, reading the firmware from %s root\n", MODEM_PART);
 +	}
-+	int64_t mdt_len = fat_read_image_file(image_cl, "MODEM   MDT", modem_mdt, sizeof(modem_mdt));
++	int64_t mdt_len = fat_read_file(image_cl, "MODEM   MDT", modem_mdt, sizeof(modem_mdt));
 +	if (mdt_len < 0x34) {
 +		printf("SWEET MODEM: modem.mdt not read (%lld)\n", mdt_len);
 +		return -1;
@@ -2540,7 +2553,7 @@ index 0000000..b0f8ffd
 +			nm[8] = 'B';
 +			nm[9] = '0' + (i / 10);
 +			nm[10] = '0' + (i % 10);
-+			if (fat_read_image_file(image_cl, nm, dst, ph->memsz) < 0) {
++			if (fat_read_file(image_cl, nm, dst, ph->memsz) < 0) {
 +				printf("SWEET MODEM: segment %u (modem.b%02u) not read\n", i, i);
 +				return -1;
 +			}
