@@ -2178,7 +2178,7 @@ index 0c548d1..9bc7611 100644
  		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 new file mode 100644
-index 0000000..b435ed0
+index 0000000..9035dda
 --- /dev/null
 +++ b/bsd/dev/sweet_modem.c
 @@ -0,0 +1,388 @@
@@ -2269,6 +2269,7 @@ index 0000000..b435ed0
 +#define STATUS_META_DATA_AUTH_SUCCESS   0x3
 +#define STATUS_AUTH_COMPLETE            0x4
 +
++static volatile uint32_t *gcc, *q6, *rmb, *restart;
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +
 +struct elf_phdr32 {
@@ -2396,7 +2397,6 @@ index 0000000..b435ed0
 +	return 0;
 +}
 +
-+static volatile uint32_t *gcc, *q6, *rmb, *restart;
 +
 +static void
 +clk_on(uint32_t off, uint32_t bit)
