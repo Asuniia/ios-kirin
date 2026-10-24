@@ -1,14 +1,15 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 2a6dc36..ec721ac 100644
+index 2a6dc36..b291095 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -107,6 +107,10 @@ bsd/dev/memdev.c			standard
+@@ -107,6 +107,11 @@ bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
 +bsd/dev/sweet_audio.c			standard
 +bsd/dev/sweet_adsp.c			standard
 +bsd/dev/sweet_glink.c			standard
++bsd/dev/sweet_modem.c			standard
 +bsd/dev/sweet_q6audio.c			standard
  bsd/dev/sweet_perf.c			standard
  bsd/dev/sweet_gpu.c			standard
@@ -82,10 +83,10 @@ index 291a546..ea86e59 100644
  int
 diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
 new file mode 100644
-index 0000000..daa3007
+index 0000000..d61c864
 --- /dev/null
 +++ b/bsd/dev/sweet_adsp.c
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,187 @@
 +/*
 + * kirin, boot-arg sweetadsp=1: the audio DSP (ADSP, the LPASS Hexagon) is
 + * loaded and started through TrustZone, as Linux's pil-tz-generic does it
@@ -182,6 +183,8 @@ index 0000000..daa3007
 +	/* the GLINK descriptor and our fifo are in SMEM before the DSP starts */
 +	extern void sweet_glink_init(void);
 +	sweet_glink_init();
++	extern void sweet_modem_init(void);
++	sweet_modem_init();
 +	const uint8_t *fw = (const uint8_t *)phystokv(v[0]);
 +	uint64_t fwlen = v[1];
 +	uint32_t nseg, mdt_off, mdt_len;
@@ -2173,6 +2176,262 @@ index 0c548d1..9bc7611 100644
  	if (!pok) {
  		printf("SWEET KEYS: power key unreadable; volume keys only\n");
  		keys_pon_apid = KEYS_NO_APID;
+diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
+new file mode 100644
+index 0000000..79e21dd
+--- /dev/null
++++ b/bsd/dev/sweet_modem.c
+@@ -0,0 +1,250 @@
++/*
++ * kirin, boot-arg sweetmodem=1: bring up the SDM630 modem (MSS, the Hexagon Q6 that runs
++ * the cellular and Wi-Fi firmware), stage A. Unlike the ADSP (a simple TrustZone PAS), the
++ * modem self-authenticates through its MBA (Modem Boot Authenticator), as Linux's
++ * pil-q6v5-mss / pil-msa / pil-q6v5 for DT /soc/qcom,mss@4080000 (qcom,pil-q6v55-mss,
++ * qdsp6v62-1-5):
++ *
++ *   GCC clocks    MSS cfg_ahb, q6_bimc_axi, snoc_axi, mnoc_bimc_axi, boot_rom (0x100000)
++ *   reset         MSS_RESTART (GCC 0x179000): assert (1), then deassert (0)
++ *   MBA           mba.bin loaded into the MBA region (0x94800000); its address written to
++ *                 RMB_MBA_IMAGE (rmb_base 0x4180000 + 0x00)
++ *   Q6 out of     the QDSP6SS register dance (reg_base 0x4080000): XO clock, BHS head switch,
++ *   reset         LDO bypass, memory clamps and power, core out of reset, core clock
++ *   handshake     poll RMB_PBL_STATUS == 1 (the PBL validated the MBA), then RMB_MBA_STATUS
++ *
++ * Stage A stops once the MBA runs (PBL success). Loading modem.mdt and its segments through
++ * the RMB protocol, SMP2P, rmtfs, QMI are the later stages (research/modem-notes.md). No RPM
++ * rail votes yet: the bootloader left vdd_cx/vdd_mx on; if the PBL never validates, add them.
++ */
++#if defined(SWEET_KIRIN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern vm_map_address_t phystokv(uint64_t pa);
++void sweet_modem_init(void);
++
++#define GCC_PA          0x00100000ull
++#define QDSP6SS_PA      0x04080000ull
++#define RMB_PA          0x04180000ull
++#define MSS_RESTART     0x00179000ull         /* GCC MSS_RESTART, a 4 KB page of its own */
++#define MBA_PA          0x94800000ull
++#define MBA_SZ          0x00200000u
++
++/* GCC clock branch enable registers (offsets in the GCC block), and their enable bits */
++#define GCC_MSS_CFG_AHB         0x8a000
++#define GCC_MSS_Q6_BIMC_AXI     0x8a040
++#define GCC_MSS_SNOC_AXI        0x8a03c
++#define GCC_MSS_MNOC_BIMC_AXI   0x8a004
++#define GCC_BOOT_ROM_AHB        0x52004        /* bit 10 */
++
++/* QDSP6SS registers (offsets in reg_base) */
++#define QDSP6SS_RESET           0x014
++#define QDSP6SS_GFMUX_CTL       0x020
++#define QDSP6SS_PWR_CTL         0x030
++#define QDSP6SS_XO_CBCR         0x038
++#define QDSP6SS_MEM_PWR_CTL     0x0b0
++#define QDSP6V62SS_BHS_STATUS   0x0c4
++#define QDSP6SS_STRAP_ACC       0x110
++
++#define Q6SS_STOP_CORE          (1u << 0)
++#define Q6SS_CORE_ARES          (1u << 1)
++#define Q6SS_BUS_ARES_ENA       (1u << 2)
++#define Q6SS_CLK_ENA            (1u << 1)
++#define Q6SS_L2DATA_STBY_N      (1u << 18)
++#define Q6SS_SLP_RET_N          (1u << 19)
++#define Q6SS_CLAMP_IO           (1u << 20)
++#define Q6v55_CLAMP_WL          (1u << 21)
++#define Q6v55_CLAMP_QMC_MEM     (1u << 22)
++#define Q6v55_BHS_ON            (1u << 24)
++#define Q6v55_LDO_BYP           (1u << 25)
++#define Q6v55_BHS_EN_REST_ACK   (1u << 0)
++
++/* RMB protocol (offsets in rmb_base) */
++#define RMB_MBA_IMAGE           0x00
++#define RMB_PBL_STATUS          0x04
++#define RMB_MBA_COMMAND         0x08
++#define RMB_MBA_STATUS          0x0c
++#define STATUS_PBL_SUCCESS      0x1
++
++static volatile uint32_t *gcc, *q6, *rmb, *restart;
++
++static void
++clk_on(uint32_t off, uint32_t bit)
++{
++	gcc[off / 4] |= bit;
++	__builtin_arm_dsb(0xf);
++	for (int i = 0; i < 1000; i++) {
++		if (!(gcc[off / 4] & (1u << 31))) {       /* CLK_OFF clear = running */
++			return;
++		}
++		delay(1);
++	}
++	printf("SWEET MODEM: GCC clock %#x stays off (%#x)\n", off, gcc[off / 4]);
++}
++
++/* the QDSP6SS v62_1_5 reset: head switch, LDO, memory, core out of reset */
++static int
++q6_bring_up(void)
++{
++	int i;
++	/* assert resets, stop core */
++	q6[QDSP6SS_RESET / 4] |= Q6SS_CORE_ARES | Q6SS_BUS_ARES_ENA | Q6SS_STOP_CORE;
++	__builtin_arm_dsb(0xf);
++	/* BHS needs the XO clock */
++	q6[QDSP6SS_XO_CBCR / 4] |= 1u;
++	__builtin_arm_dsb(0xf);
++	for (i = 0; i < 200 && (q6[QDSP6SS_XO_CBCR / 4] & (1u << 31)); i++) {
++		delay(1);
++	}
++	/* head switch on, wait for the BHS acknowledge */
++	q6[QDSP6SS_PWR_CTL / 4] |= Q6v55_BHS_ON;
++	__builtin_arm_dsb(0xf);
++	delay(1);
++	for (i = 200; i > 0; i--) {
++		if (q6[QDSP6V62SS_BHS_STATUS / 4] & Q6v55_BHS_EN_REST_ACK) {
++			break;
++		}
++		delay(1);
++	}
++	if (i == 0) {
++		printf("SWEET MODEM: BHS acknowledge never came (PWR_CTL %#x BHS_STATUS %#x)\n",
++		    q6[QDSP6SS_PWR_CTL / 4], q6[QDSP6V62SS_BHS_STATUS / 4]);
++		return -1;
++	}
++	/* LDO bypass */
++	q6[QDSP6SS_PWR_CTL / 4] |= Q6v55_LDO_BYP;
++	/* deassert the compiler memory clamp */
++	q6[QDSP6SS_PWR_CTL / 4] &= ~Q6v55_CLAMP_QMC_MEM;
++	/* deassert memory peripheral sleep and L2 standby */
++	q6[QDSP6SS_PWR_CTL / 4] |= Q6SS_L2DATA_STBY_N | Q6SS_SLP_RET_N;
++	__builtin_arm_dsb(0xf);
++	/* turn on the memories one bit at a time (MEM_PWR_CTL, v62) */
++	uint32_t m = q6[QDSP6SS_MEM_PWR_CTL / 4];
++	for (i = 19; i >= 0; i--) {
++		m |= (1u << i);
++		q6[QDSP6SS_MEM_PWR_CTL / 4] = m;
++		m |= q6[QDSP6SS_MEM_PWR_CTL / 4];
++		delay(1);
++	}
++	/* remove word-line and IO clamps */
++	q6[QDSP6SS_PWR_CTL / 4] &= ~Q6v55_CLAMP_WL;
++	q6[QDSP6SS_PWR_CTL / 4] &= ~Q6SS_CLAMP_IO;
++	__builtin_arm_dsb(0xf);
++	/* core out of reset, core clock on */
++	q6[QDSP6SS_RESET / 4] &= ~(Q6SS_CORE_ARES | Q6SS_STOP_CORE);
++	__builtin_arm_dsb(0xf);
++	q6[QDSP6SS_GFMUX_CTL / 4] |= Q6SS_CLK_ENA;
++	__builtin_arm_dsb(0xf);
++	return 0;
++}
++
++static void
++modem_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	DTEntry mm;
++	uint64_t const *v;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
++	    SecureDTGetProperty(mm, "MBA-FW", (void const **)&v, &size) != kSuccess || size != 16) {
++		printf("SWEET MODEM: no MBA-FW in the payload\n");
++		return;
++	}
++	const uint8_t *mba = (const uint8_t *)phystokv(v[0]);
++	uint64_t mba_len = v[1];
++	if (mba_len == 0 || mba_len > MBA_SZ) {
++		printf("SWEET MODEM: MBA is %llu bytes, out of range\n", mba_len);
++		return;
++	}
++
++	gcc = (volatile uint32_t *)ml_io_map(GCC_PA, 0x100000);
++	q6 = (volatile uint32_t *)ml_io_map(QDSP6SS_PA, 0x1000);
++	rmb = (volatile uint32_t *)ml_io_map(RMB_PA, 0x1000);
++	restart = (volatile uint32_t *)ml_io_map(MSS_RESTART & ~0xfffull, 0x1000);
++	uint8_t *mba_region = (uint8_t *)ml_io_map_wcomb(MBA_PA, MBA_SZ);
++	if (!gcc || !q6 || !rmb || !restart || !mba_region) {
++		printf("SWEET MODEM: a register region could not be mapped\n");
++		return;
++	}
++
++	/* the MBA into its region */
++	memcpy(mba_region, mba, (size_t)mba_len);
++	__builtin_arm_dsb(0xf);
++	printf("SWEET MODEM: MBA (%llu bytes) at %#llx\n", mba_len, MBA_PA);
++
++	/* GCC MSS clocks */
++	clk_on(GCC_MSS_CFG_AHB, 1u << 0);
++	clk_on(GCC_MSS_Q6_BIMC_AXI, 1u << 0);
++	clk_on(GCC_MSS_SNOC_AXI, 1u << 0);
++	clk_on(GCC_MSS_MNOC_BIMC_AXI, 1u << 0);
++	clk_on(GCC_BOOT_ROM_AHB, 1u << 10);
++
++	/* MSS reset: assert, then deassert */
++	restart[(MSS_RESTART & 0xfff) / 4] = 1;
++	__builtin_arm_dsb(0xf);
++	delay(200);
++	restart[(MSS_RESTART & 0xfff) / 4] = 0;
++	__builtin_arm_dsb(0xf);
++	delay(200);
++
++	/* the PBL reads the MBA address from RMB before the core leaves reset */
++	rmb[RMB_MBA_IMAGE / 4] = (uint32_t)MBA_PA;
++	__builtin_arm_dsb(0xf);
++
++	if (q6_bring_up() != 0) {
++		return;
++	}
++	printf("SWEET MODEM: Q6 out of reset, waiting for the PBL to validate the MBA\n");
++
++	/* the PBL validates the MBA and sets PBL_STATUS; then the MBA runs */
++	int ok = 0;
++	for (int i = 0; i < 2000; i++) {
++		uint32_t pbl = rmb[RMB_PBL_STATUS / 4];
++		if (pbl != 0) {
++			printf("SWEET MODEM: PBL status %#x after %d ms%s\n", pbl, i,
++			    pbl == STATUS_PBL_SUCCESS ? ": MBA validated, PBL success" : ": PBL error");
++			ok = pbl == STATUS_PBL_SUCCESS;
++			break;
++		}
++		delay(1000);
++	}
++	if (!ok) {
++		printf("SWEET MODEM: PBL never validated the MBA (PBL %#x MBA_STATUS %#x RESET %#x PWR_CTL %#x)\n",
++		    rmb[RMB_PBL_STATUS / 4], rmb[RMB_MBA_STATUS / 4], q6[QDSP6SS_RESET / 4], q6[QDSP6SS_PWR_CTL / 4]);
++		return;
++	}
++	/* the MBA is now running; it reports through RMB_MBA_STATUS */
++	for (int i = 0; i < 1000; i++) {
++		uint32_t st = rmb[RMB_MBA_STATUS / 4];
++		if (st != 0) {
++			printf("SWEET MODEM: MBA status %#x after %d ms (the MBA is running)\n", st, i);
++			break;
++		}
++		delay(1000);
++	}
++	printf("SWEET MODEM: stage A done (PBL %#x MBA %#x). Next: load modem.mdt through the RMB.\n",
++	    rmb[RMB_PBL_STATUS / 4], rmb[RMB_MBA_STATUS / 4]);
++}
++
++void
++sweet_modem_init(void)
++{
++	int on = 0;
++	thread_t t;
++	if (!PE_parse_boot_argn("sweetmodem", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	if (kernel_thread_start(modem_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
 index a0a9ae1..2a8d40c 100644
 --- a/bsd/dev/sweet_perf.c
