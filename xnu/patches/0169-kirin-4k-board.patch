@@ -3115,10 +3115,10 @@ index a0a9ae1..63d27e4 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..f49bd0b
+index 0000000..2d906b9
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,1384 @@
+@@ -0,0 +1,1391 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -3733,6 +3733,11 @@ index 0000000..f49bd0b
 +		return;
 +	}
 +	if (h->opcode == 0x00010D9A) {          /* ASM_DATA_EVENT_READ_DONE_V2 */
++		static uint32_t rd_seen;
++		if (rd_seen++ < 3) {
++			printf("SWEET Q6: READ_DONE token %u status %#x size %u\n", h->token, n >= 1 ? pl[0] : 0,
++			    n >= 5 ? pl[4] : 0);
++		}
 +		if (h->token < NBUF_CAP) {
 +			mc.read_len[h->token] = n >= 5 ? pl[4] : BUFSZ;      /* enc_framesotal_size */
 +			__c11_atomic_fetch_or((_Atomic uint32_t *)&mc.read_done, 1u << h->token, __ATOMIC_RELEASE);
@@ -4148,7 +4153,7 @@ index 0000000..f49bd0b
 +}
 +
 +/* submit one empty buffer for the DSP to fill */
-+static void
++static int
 +capture_read_submit(uint32_t i, uint32_t seq)
 +{
 +	struct { struct apr_hdr h; uint32_t lsw, msw, handle, size, seq; } __attribute__((packed)) r;
@@ -4166,7 +4171,7 @@ index 0000000..f49bd0b
 +	r.handle = mc.handle;
 +	r.size = BUFSZ;
 +	r.seq = seq;
-+	(void)sweet_glink_apr_send(&r, sizeof(r));
++	return sweet_glink_apr_send(&r, sizeof(r));
 +}
 +
 +/* RUN/PAUSE the capture with /dev/sweet-mic, and drain filled buffers */
@@ -4187,10 +4192,12 @@ index 0000000..f49bd0b
 +		}
 +		crun = true;
 +		mc.read_done = 0;
++		int serr = 0;
 +		for (uint32_t i = 0; i < NBUF_CAP; i++) {
-+			capture_read_submit(i, cseq++);
++			serr |= capture_read_submit(i, cseq++);
 +		}
-+		printf("SWEET Q6: mic capture running\n");
++		printf("SWEET Q6: mic capture running (%u reads at %#llx, send %s)\n", NBUF_CAP, mc.cpa,
++		    serr ? "ERROR" : "ok");
 +		return;
 +	}
 +	if (!mc.capturing && crun) {
