@@ -2178,10 +2178,10 @@ index 0c548d1..9bc7611 100644
  		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 new file mode 100644
-index 0000000..9035dda
+index 0000000..b0f8ffd
 --- /dev/null
 +++ b/bsd/dev/sweet_modem.c
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,559 @@
 +/*
 + * kirin, boot-arg sweetmodem=1: bring up the SDM630 modem (MSS, the Hexagon Q6 that runs
 + * the cellular and Wi-Fi firmware), stage A. Unlike the ADSP (a simple TrustZone PAS), the
@@ -2296,49 +2296,215 @@ index 0000000..9035dda
 +}
 +
 +/*
-+ * Stage B: load modem.mdt and its segments through the RMB, as pil_msa_auth_modem_mdt and
-+ * pil_msa_mba_verify_blob. The firmware is the MODEM-FW blob (SADF: 'SADF', seg count, the
-+ * .mdt offset/len, then per program header offset/len). The MBA authenticates the metadata,
-+ * then each PT_LOAD segment as it is written to its physical address in the modem region.
++ * A tiny read-only FAT16 reader over the eMMC "modem_a" partition: the modem firmware
++ * (image/modem.mdt and image/modem.bNN) is there, and it is too big (57 MB) to carry in the
++ * boot payload (it overflowed the payload region and reset the phone before any log). The
++ * files are read from the partition at boot instead, with sweet_emmc_read_partition.
 + */
++extern int sweet_emmc_read_partition(const char *want, uint64_t off, uint32_t count, void *out, uint64_t *total);
++#define MODEM_PART      "modem_a"
++
++static uint32_t fat_bps, fat_spc, fat_fat_sec, fat_root_sec, fat_root_ents, fat_data_sec;
++static uint8_t fat_sb[512];
++static uint8_t fat_bounce[64 * 1024];   /* at most one cluster (spc <= 128 sectors) */
++static uint8_t fat_cache[512];          /* the last-read FAT sector, to follow a chain cheaply */
++static uint32_t fat_cache_sec;
++static int fat_cache_valid;
++
++static uint16_t
++u16le(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++/*
++ * One read goes through sweet_emmc_read_partition, which re-parses the GPT and copies through a
++ * 1 MB DMA bounce; count is capped at 2048 sectors. It is slow per call, so the readers below
++ * coalesce contiguous clusters into reads of up to 1 MB and cache the FAT sector while following
++ * a chain, to move the 57 MB image in as few calls as possible.
++ */
++static int
++fat_rd(uint64_t sec, uint32_t n, void *out)
++{
++	uint64_t total = 0;
++	return sweet_emmc_read_partition(MODEM_PART, sec, n, out, &total);
++}
++
++static int
++fat_mount(void)
++{
++	fat_cache_valid = 0;
++	if (fat_rd(0, 1, fat_sb) != 0) {
++		printf("SWEET MODEM: cannot read %s sector 0\n", MODEM_PART);
++		return -1;
++	}
++	fat_bps = u16le(fat_sb + 0x0b);
++	fat_spc = fat_sb[0x0d];
++	uint32_t rsvd = u16le(fat_sb + 0x0e);
++	uint32_t nfat = fat_sb[0x10];
++	fat_root_ents = u16le(fat_sb + 0x11);
++	uint32_t spf = u16le(fat_sb + 0x16);
++	if (fat_bps != 512 || fat_spc == 0 || fat_spc > 128) {
++		printf("SWEET MODEM: not a 512-byte FAT (bps %u spc %u)\n", fat_bps, fat_spc);
++		return -1;
++	}
++	fat_fat_sec = rsvd;
++	fat_root_sec = rsvd + nfat * spf;
++	fat_data_sec = fat_root_sec + (fat_root_ents * 32 + 511) / 512;
++	return 0;
++}
++
++static uint32_t
++fat_next(uint32_t cl)
++{
++	uint32_t off = cl * 2;
++	uint32_t sec = fat_fat_sec + off / 512;
++	if (!fat_cache_valid || sec != fat_cache_sec) {
++		if (fat_rd(sec, 1, fat_cache) != 0) {
++			return 0xffff;
++		}
++		fat_cache_sec = sec;
++		fat_cache_valid = 1;
++	}
++	return u16le(fat_cache + (off % 512));
++}
++
++/* find an 8.3 name (11 bytes, space padded) in a directory; root if cluster 0 */
++static int
++fat_find(uint32_t dir_cluster, const char name[11], uint32_t *first_cl, uint32_t *fsize, int *is_dir)
++{
++	uint32_t cl = dir_cluster;
++	for (;;) {
++		uint32_t base, nsec;
++		if (dir_cluster == 0) {         /* FAT16 root: contiguous */
++			base = fat_root_sec;
++			nsec = (fat_root_ents * 32 + 511) / 512;
++		} else {
++			base = fat_data_sec + (cl - 2) * fat_spc;
++			nsec = fat_spc;
++		}
++		for (uint32_t s = 0; s < nsec; s++) {
++			if (fat_rd(base + s, 1, fat_sb) != 0) {
++				return -1;
++			}
++			for (uint32_t e = 0; e < 512; e += 32) {
++				const uint8_t *d = fat_sb + e;
++				if (d[0] == 0x00) {
++					return -1;      /* end of directory */
++				}
++				if (d[0] == 0xe5 || (d[0x0b] & 0x0f) == 0x0f) {
++					continue;       /* deleted or long-name entry */
++				}
++				if (memcmp(d, name, 11) == 0) {
++					*first_cl = u16le(d + 0x1a);
++					*fsize = *(const uint32_t *)(d + 0x1c);
++					*is_dir = (d[0x0b] & 0x10) != 0;
++					return 0;
++				}
++			}
++		}
++		if (dir_cluster == 0) {
++			return -1;
++		}
++		cl = fat_next(cl);
++		if (cl < 2 || cl >= 0xfff8) {
++			return -1;
++		}
++	}
++}
++
++/* read a file (by its 8.3 name in the IMAGE directory) into dest, up to maxlen; size, or -1 */
++static int64_t
++fat_read_image_file(uint32_t image_cl, const char name[11], uint8_t *dest, uint32_t maxlen)
++{
++	uint32_t cl, fsize;
++	int is_dir;
++	if (fat_find(image_cl, name, &cl, &fsize, &is_dir) != 0 || is_dir) {
++		return -1;
++	}
++	if (fsize > maxlen) {
++		printf("SWEET MODEM: %.11s is %u bytes, over the %u-byte buffer\n", name, fsize, maxlen);
++		return -1;
++	}
++	uint32_t got = 0, clbytes = fat_spc * 512;
++	uint32_t maxrun = 2048 / fat_spc;       /* keep each read within the 1 MB bounce */
++	if (maxrun == 0) {
++		maxrun = 1;
++	}
++	while (cl >= 2 && cl < 0xfff8 && got < fsize) {
++		uint32_t remain = fsize - got;
++		if (remain < clbytes) {
++			/* the final, partial cluster: read it whole, copy only what the file holds */
++			if (fat_rd(fat_data_sec + (cl - 2) * fat_spc, fat_spc, fat_bounce) != 0) {
++				return -1;
++			}
++			memcpy(dest + got, fat_bounce, remain);
++			got += remain;
++			break;
++		}
++		/* gather a run of physically contiguous full clusters, up to the bounce size */
++		uint32_t start = cl, run = 1;
++		while (run < maxrun && (uint64_t)(run + 1) * clbytes <= remain) {
++			uint32_t nx = fat_next(cl);
++			if (nx != cl + 1) {
++				break;
++			}
++			cl = nx;
++			run++;
++		}
++		uint32_t nx = fat_next(cl);
++		if (fat_rd(fat_data_sec + (start - 2) * fat_spc, run * fat_spc, dest + got) != 0) {
++			return -1;
++		}
++		got += run * clbytes;
++		cl = nx;
++	}
++	return got;
++}
++
++/*
++ * Stage B: load modem.mdt and its segments through the RMB, as pil_msa_auth_modem_mdt and
++ * pil_msa_mba_verify_blob. The files come from the modem_a partition (above). The MBA
++ * authenticates the metadata, then each PT_LOAD segment as it is written to its physical
++ * address in the modem region.
++ */
++static uint8_t modem_mdt[64 * 1024];    /* the .mdt: ELF header, phdrs, hash segment and cert chain */
++
 +static int
 +modem_load(void)
 +{
-+	DTEntry mm;
-+	uint64_t const *v;
-+	unsigned int size;
-+	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
-+	    SecureDTGetProperty(mm, "MODEM-FW", (void const **)&v, &size) != kSuccess || size != 16) {
-+		printf("SWEET MODEM: no MODEM-FW in the payload\n");
++	if (fat_mount() != 0) {
 +		return -1;
 +	}
-+	const uint8_t *fw = (const uint8_t *)phystokv(v[0]);
-+	uint64_t fwlen = v[1];
-+	uint32_t nseg, mdt_off, mdt_len;
-+	if (fwlen < 16 || memcmp(fw, "SADF", 4) != 0) {
-+		printf("SWEET MODEM: MODEM-FW is not a SADF container\n");
++	uint32_t image_cl = 0, dummy;   /* the root by default; Qualcomm usually puts them under image/ */
++	int is_dir;
++	if (fat_find(0, "IMAGE      ", &image_cl, &dummy, &is_dir) == 0 && is_dir) {
++		printf("SWEET MODEM: reading the firmware from %s:/image\n", MODEM_PART);
++	} else {
++		image_cl = 0;
++		printf("SWEET MODEM: no image/, reading the firmware from %s root\n", MODEM_PART);
++	}
++	int64_t mdt_len = fat_read_image_file(image_cl, "MODEM   MDT", modem_mdt, sizeof(modem_mdt));
++	if (mdt_len < 0x34) {
++		printf("SWEET MODEM: modem.mdt not read (%lld)\n", mdt_len);
 +		return -1;
 +	}
-+	memcpy(&nseg, fw + 4, 4);
-+	memcpy(&mdt_off, fw + 8, 4);
-+	memcpy(&mdt_len, fw + 12, 4);
-+	const uint8_t *mdt = fw + mdt_off;
++	const uint8_t *mdt = modem_mdt;
 +	uint32_t phoff = *(const uint32_t *)(mdt + 0x1c);
 +	uint16_t phnum = *(const uint16_t *)(mdt + 0x2c);
-+	if (nseg > 64 || phnum != nseg || phoff + 32ull * phnum > mdt_len) {
-+		printf("SWEET MODEM: bad MODEM-FW header (%u segments)\n", nseg);
++	if (phnum > 64 || phoff + 32ull * phnum > (uint64_t)mdt_len) {
++		printf("SWEET MODEM: bad modem.mdt (%u phdrs)\n", phnum);
 +		return -1;
 +	}
 +
 +	/* metadata (the .mdt) in a physically contiguous, cache-flushed buffer */
 +	vm_offset_t meta_va = 0;
-+	vm_size_t meta_sz = round_page(mdt_len);
++	vm_size_t meta_sz = round_page((uint32_t)mdt_len);
 +	if (kmem_alloc_contig(kernel_map, &meta_va, meta_sz, PAGE_MASK, 0, 0,
 +	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-+		printf("SWEET MODEM: no memory for the %u-byte metadata\n", mdt_len);
 +		return -1;
 +	}
-+	memcpy((void *)meta_va, mdt, mdt_len);
++	memcpy((void *)meta_va, mdt, (size_t)mdt_len);
 +	uint64_t meta_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)meta_va));
 +	flush_dcache64((addr64_t)meta_pa, (unsigned)meta_sz, TRUE);
 +
@@ -2351,7 +2517,6 @@ index 0000000..9035dda
 +	}
 +	printf("SWEET MODEM: metadata authenticated\n");
 +
-+	/* the segments at their physical addresses in the modem region */
 +	uint8_t *region = (uint8_t *)ml_io_map_wcomb(MODEM_PA, MODEM_SZ);
 +	if (!region) {
 +		printf("SWEET MODEM: the modem region cannot be mapped\n");
@@ -2367,12 +2532,18 @@ index 0000000..9035dda
 +			printf("SWEET MODEM: segment %u (%#x + %#x) outside the region\n", i, ph->paddr, ph->memsz);
 +			return -1;
 +		}
-+		uint32_t off, len;
-+		memcpy(&off, fw + 16 + 8 * i, 4);
-+		memcpy(&len, fw + 20 + 8 * i, 4);
-+		memcpy(region + (ph->paddr - MODEM_PA), fw + off, MIN(ph->filesz, len));
-+		if (ph->memsz > ph->filesz) {
-+			bzero(region + (ph->paddr - MODEM_PA) + ph->filesz, ph->memsz - ph->filesz);
++		uint8_t *dst = region + (ph->paddr - MODEM_PA);
++		bzero(dst, ph->memsz);
++		if (ph->filesz > 0) {
++			char nm[11];
++			memcpy(nm, "MODEM   B  ", 11);
++			nm[8] = 'B';
++			nm[9] = '0' + (i / 10);
++			nm[10] = '0' + (i % 10);
++			if (fat_read_image_file(image_cl, nm, dst, ph->memsz) < 0) {
++				printf("SWEET MODEM: segment %u (modem.b%02u) not read\n", i, i);
++				return -1;
++			}
 +		}
 +		__builtin_arm_dsb(0xf);
 +		if (total_len == 0) {
