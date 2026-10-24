@@ -2178,10 +2178,10 @@ index 0c548d1..9bc7611 100644
  		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 new file mode 100644
-index 0000000..79e21dd
+index 0000000..b435ed0
 --- /dev/null
 +++ b/bsd/dev/sweet_modem.c
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,388 @@
 +/*
 + * kirin, boot-arg sweetmodem=1: bring up the SDM630 modem (MSS, the Hexagon Q6 that runs
 + * the cellular and Wi-Fi firmware), stage A. Unlike the ADSP (a simple TrustZone PAS), the
@@ -2223,6 +2223,8 @@ index 0000000..79e21dd
 +#define MSS_RESTART     0x00179000ull         /* GCC MSS_RESTART, a 4 KB page of its own */
 +#define MBA_PA          0x94800000ull
 +#define MBA_SZ          0x00200000u
++#define MODEM_PA        0x8ac00000ull
++#define MODEM_SZ        0x07e00000u
 +
 +/* GCC clock branch enable registers (offsets in the GCC block), and their enable bits */
 +#define GCC_MSS_CFG_AHB         0x8a000
@@ -2236,7 +2238,7 @@ index 0000000..79e21dd
 +#define QDSP6SS_GFMUX_CTL       0x020
 +#define QDSP6SS_PWR_CTL         0x030
 +#define QDSP6SS_XO_CBCR         0x038
-+#define QDSP6SS_MEM_PWR_CTL     0x0b0
++#define QDSP6V6SS_MEM_PWR_CTL   0x034         /* v62 memory power (not the v56 0x0b0) */
 +#define QDSP6V62SS_BHS_STATUS   0x0c4
 +#define QDSP6SS_STRAP_ACC       0x110
 +
@@ -2258,7 +2260,141 @@ index 0000000..79e21dd
 +#define RMB_PBL_STATUS          0x04
 +#define RMB_MBA_COMMAND         0x08
 +#define RMB_MBA_STATUS          0x0c
++#define RMB_PMI_META_DATA       0x10
++#define RMB_PMI_CODE_START      0x14
++#define RMB_PMI_CODE_LENGTH     0x18
 +#define STATUS_PBL_SUCCESS      0x1
++#define CMD_META_DATA_READY     0x1
++#define CMD_LOAD_READY          0x2
++#define STATUS_META_DATA_AUTH_SUCCESS   0x3
++#define STATUS_AUTH_COMPLETE            0x4
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++struct elf_phdr32 {
++	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++
++/* wait for RMB_MBA_STATUS to reach want (or go negative = error) */
++static int
++rmb_wait(uint32_t want, const char *what)
++{
++	for (int i = 0; i < 5000; i++) {
++		int32_t st = (int32_t)rmb[RMB_MBA_STATUS / 4];
++		if (st < 0) {
++			printf("SWEET MODEM: %s: MBA error %d\n", what, st);
++			return -1;
++		}
++		if ((uint32_t)st == want) {
++			return 0;
++		}
++		delay(1000);
++	}
++	printf("SWEET MODEM: %s: timeout (MBA_STATUS %#x)\n", what, rmb[RMB_MBA_STATUS / 4]);
++	return -1;
++}
++
++/*
++ * Stage B: load modem.mdt and its segments through the RMB, as pil_msa_auth_modem_mdt and
++ * pil_msa_mba_verify_blob. The firmware is the MODEM-FW blob (SADF: 'SADF', seg count, the
++ * .mdt offset/len, then per program header offset/len). The MBA authenticates the metadata,
++ * then each PT_LOAD segment as it is written to its physical address in the modem region.
++ */
++static int
++modem_load(void)
++{
++	DTEntry mm;
++	uint64_t const *v;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
++	    SecureDTGetProperty(mm, "MODEM-FW", (void const **)&v, &size) != kSuccess || size != 16) {
++		printf("SWEET MODEM: no MODEM-FW in the payload\n");
++		return -1;
++	}
++	const uint8_t *fw = (const uint8_t *)phystokv(v[0]);
++	uint64_t fwlen = v[1];
++	uint32_t nseg, mdt_off, mdt_len;
++	if (fwlen < 16 || memcmp(fw, "SADF", 4) != 0) {
++		printf("SWEET MODEM: MODEM-FW is not a SADF container\n");
++		return -1;
++	}
++	memcpy(&nseg, fw + 4, 4);
++	memcpy(&mdt_off, fw + 8, 4);
++	memcpy(&mdt_len, fw + 12, 4);
++	const uint8_t *mdt = fw + mdt_off;
++	uint32_t phoff = *(const uint32_t *)(mdt + 0x1c);
++	uint16_t phnum = *(const uint16_t *)(mdt + 0x2c);
++	if (nseg > 64 || phnum != nseg || phoff + 32ull * phnum > mdt_len) {
++		printf("SWEET MODEM: bad MODEM-FW header (%u segments)\n", nseg);
++		return -1;
++	}
++
++	/* metadata (the .mdt) in a physically contiguous, cache-flushed buffer */
++	vm_offset_t meta_va = 0;
++	vm_size_t meta_sz = round_page(mdt_len);
++	if (kmem_alloc_contig(kernel_map, &meta_va, meta_sz, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET MODEM: no memory for the %u-byte metadata\n", mdt_len);
++		return -1;
++	}
++	memcpy((void *)meta_va, mdt, mdt_len);
++	uint64_t meta_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)meta_va));
++	flush_dcache64((addr64_t)meta_pa, (unsigned)meta_sz, TRUE);
++
++	rmb[RMB_PMI_CODE_LENGTH / 4] = 0;
++	rmb[RMB_PMI_META_DATA / 4] = (uint32_t)meta_pa;
++	rmb[RMB_MBA_COMMAND / 4] = CMD_META_DATA_READY;
++	__builtin_arm_dsb(0xf);
++	if (rmb_wait(STATUS_META_DATA_AUTH_SUCCESS, "metadata auth") != 0) {
++		return -1;
++	}
++	printf("SWEET MODEM: metadata authenticated\n");
++
++	/* the segments at their physical addresses in the modem region */
++	uint8_t *region = (uint8_t *)ml_io_map_wcomb(MODEM_PA, MODEM_SZ);
++	if (!region) {
++		printf("SWEET MODEM: the modem region cannot be mapped\n");
++		return -1;
++	}
++	uint32_t total_len = 0, loaded = 0;
++	for (uint32_t i = 0; i < phnum; i++) {
++		const struct elf_phdr32 *ph = (const struct elf_phdr32 *)(mdt + phoff + 32 * i);
++		if (ph->type != 1 || ((ph->flags >> 24) & 7) == 2 || ph->memsz == 0) {
++			continue;       /* only PT_LOAD that is not the hash segment */
++		}
++		if (ph->paddr < MODEM_PA || ph->paddr + (uint64_t)ph->memsz > MODEM_PA + MODEM_SZ) {
++			printf("SWEET MODEM: segment %u (%#x + %#x) outside the region\n", i, ph->paddr, ph->memsz);
++			return -1;
++		}
++		uint32_t off, len;
++		memcpy(&off, fw + 16 + 8 * i, 4);
++		memcpy(&len, fw + 20 + 8 * i, 4);
++		memcpy(region + (ph->paddr - MODEM_PA), fw + off, MIN(ph->filesz, len));
++		if (ph->memsz > ph->filesz) {
++			bzero(region + (ph->paddr - MODEM_PA) + ph->filesz, ph->memsz - ph->filesz);
++		}
++		__builtin_arm_dsb(0xf);
++		if (total_len == 0) {
++			rmb[RMB_PMI_CODE_START / 4] = ph->paddr;
++			rmb[RMB_MBA_COMMAND / 4] = CMD_LOAD_READY;
++			__builtin_arm_dsb(0xf);
++		}
++		total_len += ph->memsz;
++		rmb[RMB_PMI_CODE_LENGTH / 4] = total_len;
++		__builtin_arm_dsb(0xf);
++		if ((int32_t)rmb[RMB_MBA_STATUS / 4] < 0) {
++			printf("SWEET MODEM: segment %u refused (MBA_STATUS %#x)\n", i, rmb[RMB_MBA_STATUS / 4]);
++			return -1;
++		}
++		loaded++;
++	}
++	printf("SWEET MODEM: %u segments loaded (%u bytes), waiting for auth complete\n", loaded, total_len);
++	if (rmb_wait(STATUS_AUTH_COMPLETE, "modem auth") != 0) {
++		return -1;
++	}
++	printf("SWEET MODEM: THE MODEM IMAGE IS AUTHENTICATED AND RUNNING\n");
++	return 0;
++}
 +
 +static volatile uint32_t *gcc, *q6, *rmb, *restart;
 +
@@ -2312,12 +2448,11 @@ index 0000000..79e21dd
 +	/* deassert memory peripheral sleep and L2 standby */
 +	q6[QDSP6SS_PWR_CTL / 4] |= Q6SS_L2DATA_STBY_N | Q6SS_SLP_RET_N;
 +	__builtin_arm_dsb(0xf);
-+	/* turn on the memories one bit at a time (MEM_PWR_CTL, v62) */
-+	uint32_t m = q6[QDSP6SS_MEM_PWR_CTL / 4];
-+	for (i = 19; i >= 0; i--) {
++	/* turn on L1/L2/ETB/JU memories one bit at a time (v62_1_5: QDSP6V6SS_MEM_PWR_CTL, 29..0) */
++	uint32_t m = q6[QDSP6V6SS_MEM_PWR_CTL / 4];
++	for (i = 29; i >= 0; i--) {
 +		m |= (1u << i);
-+		q6[QDSP6SS_MEM_PWR_CTL / 4] = m;
-+		m |= q6[QDSP6SS_MEM_PWR_CTL / 4];
++		q6[QDSP6V6SS_MEM_PWR_CTL / 4] = m;
 +		delay(1);
 +	}
 +	/* remove word-line and IO clamps */
@@ -2415,8 +2550,11 @@ index 0000000..79e21dd
 +		}
 +		delay(1000);
 +	}
-+	printf("SWEET MODEM: stage A done (PBL %#x MBA %#x). Next: load modem.mdt through the RMB.\n",
++	printf("SWEET MODEM: MBA up (PBL %#x MBA %#x), loading the modem image\n",
 +	    rmb[RMB_PBL_STATUS / 4], rmb[RMB_MBA_STATUS / 4]);
++
++	/* stage B: load and authenticate modem.mdt + segments through the RMB */
++	(void)modem_load();
 +}
 +
 +void
