@@ -2764,10 +2764,10 @@ index 0000000..13d14df
 +}
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
-index a0a9ae1..4eaf5e6 100644
+index a0a9ae1..63d27e4 100644
 --- a/bsd/dev/sweet_perf.c
 +++ b/bsd/dev/sweet_perf.c
-@@ -563,6 +563,260 @@ fastboot_thread(void *arg, wait_result_t result)
+@@ -563,6 +563,281 @@ fastboot_thread(void *arg, wait_result_t result)
  	printf("SWEET FASTBOOT: still running after PS_HOLD\n");
  }
  
@@ -2878,11 +2878,20 @@ index a0a9ae1..4eaf5e6 100644
 +		uint32_t base;
 +		const uint32_t *mhz;
 +		unsigned n;
++		unsigned safe;          /* pstate matching the current PLL freq (handover target) */
 +		const char *arg;
 +	} cl[] = {
-+		{"pwrcl", 0x0000u, pwrcl_mhz, 8, "sweetpstate_pwr"},
-+		{"perfcl", 0x2000u, perfcl_mhz, 10, "sweetpstate_perf"},
++		{"pwrcl", 0x0000u, pwrcl_mhz, 8, 3, "sweetpstate_pwr"},    /* 1094 MHz */
++		{"perfcl", 0x2000u, perfcl_mhz, 10, 5, "sweetpstate_perf"}, /* 1670 MHz */
 +	};
++	/*
++	 * sweetosmon=1 enables the OSM (if the bootloader left it off) at the
++	 * target pstate, so the hardware drives frequency and the CPRh voltage from
++	 * its LUT. Without a sweetpstate, it goes to the corner that matches the
++	 * current PLL frequency first, to validate the handover safely.
++	 */
++	int osmon = 0;
++	(void)PE_parse_boot_argn("sweetosmon", &osmon, sizeof(osmon));
 +	for (unsigned i = 0; i < 2; i++) {
 +		uint32_t en = clk_rd(osm, cl[i].base + 0x1004u);
 +		uint32_t cur = clk_rd(osm, cl[i].base + 0x1f10u);
@@ -2890,20 +2899,32 @@ index a0a9ae1..4eaf5e6 100644
 +		    cl[i].name, en, cur, cur < cl[i].n ? cl[i].mhz[cur] : 0, cl[i].n, cl[i].mhz[cl[i].n - 1]);
 +		int want = -1;
 +		(void)PE_parse_boot_argn(cl[i].arg, &want, sizeof(want));
-+		if (want < 0) {
-+			continue;
++		if (want < 0 && osmon && i == 1) {
++			want = (int)cl[i].safe;         /* perfcl only; pwrcl stays on its manual PLL */
 +		}
-+		if (!(en & 1u)) {
-+			printf("SWEET OSM: %s OSM not enabled, pstate left alone\n", cl[i].name);
++		if (want < 0) {
 +			continue;
 +		}
 +		if (want >= (int)cl[i].n) {
 +			want = (int)cl[i].n - 1;
 +		}
-+		clk_wr(osm, cl[i].base + 0x1f10u, (uint32_t)want);
-+		delay(2000);
-+		printf("SWEET OSM: %s -> pstate %u (%u MHz), reads %u\n", cl[i].name, want, cl[i].mhz[want],
-+		    clk_rd(osm, cl[i].base + 0x1f10u));
++		if (en & 1u) {
++			/* OSM already driving: just move the desired pstate */
++			clk_wr(osm, cl[i].base + 0x1f10u, (uint32_t)want);
++			delay(2000);
++			printf("SWEET OSM: %s -> pstate %u (%u MHz), reads %u\n", cl[i].name, want,
++			    cl[i].mhz[want], clk_rd(osm, cl[i].base + 0x1f10u));
++		} else if (osmon) {
++			/* set the pstate, then hand the cluster over to the OSM */
++			clk_wr(osm, cl[i].base + 0x1f10u, (uint32_t)want);
++			clk_wr(osm, cl[i].base + 0x1004u, 1u);
++			delay(5000);
++			printf("SWEET OSM: %s enabled at pstate %u (%u MHz): enable %#x desired %u\n",
++			    cl[i].name, want, cl[i].mhz[want], clk_rd(osm, cl[i].base + 0x1004u),
++			    clk_rd(osm, cl[i].base + 0x1f10u));
++		} else {
++			printf("SWEET OSM: %s OSM off, pstate left alone (sweetosmon=1 to enable)\n", cl[i].name);
++		}
 +	}
 +}
 +
@@ -3028,7 +3049,7 @@ index a0a9ae1..4eaf5e6 100644
  void
  sweet_perf_init(void)
  {
-@@ -577,6 +831,15 @@ sweet_perf_init(void)
+@@ -577,6 +852,15 @@ sweet_perf_init(void)
  	int enabled = 1;
  	thread_t thread;
  	(void)PE_parse_boot_argn("sweetperf", &enabled, sizeof(enabled));
