@@ -3115,10 +3115,10 @@ index a0a9ae1..63d27e4 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..2d906b9
+index 0000000..bbcfe36
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,1391 @@
+@@ -0,0 +1,1416 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -4142,11 +4142,36 @@ index 0000000..2d906b9
 +			return false;
 +		}
 +	}
-+	/*
-+	 * No MEDIA_FMT_UPDATE here: that is a playback (write) command. A read
-+	 * session takes its PCM format from OPEN_READ (enc_cfg_id) and the COPP
-+	 * (1 channel, 16-bit, 48 kHz).
-+	 */
++	{
++		/*
++		 * The read session's output PCM format (q6asm_enc_cfg_blk_pcm_v2):
++		 * SET_ENCDEC_PARAM, not MEDIA_FMT_UPDATE (which is a write command and
++		 * the DSP refuses it). Without it the DSP never completes a read.
++		 */
++		struct {
++			struct apr_hdr h;
++			uint32_t param_id, param_size;
++			uint32_t frames_per_buf, enc_cfg_blk_size;
++			uint16_t num_channels, bits;
++			uint32_t rate;
++			uint16_t is_signed, reserved;
++			uint8_t map[8];
++		} __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.h.opcode = 0x00010C10;        /* ASM_STREAM_CMD_SET_ENCDEC_PARAM */
++		c.param_id = 0x00010DA3;        /* ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2 */
++		c.param_size = 28;
++		c.frames_per_buf = 1;
++		c.enc_cfg_blk_size = 20;
++		c.num_channels = 1;
++		c.bits = 16;
++		c.rate = 48000;
++		c.is_signed = 1;
++		c.map[0] = 1;
++		if (q6_cmd("ASM capture PCM enc config", &c, sizeof(c), SVC_ASM, CASM_PORT, 0, 0)) {
++			return false;
++		}
++	}
 +	mc.ready = true;
 +	printf("SWEET Q6: capture ready (waiting for /dev/sweet-mic)\n");
 +	return true;
