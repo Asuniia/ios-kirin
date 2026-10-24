@@ -277,10 +277,10 @@ index 0000000..d61c864
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_audio.c b/bsd/dev/sweet_audio.c
 new file mode 100644
-index 0000000..e65c54e
+index 0000000..4d95d46
 --- /dev/null
 +++ b/bsd/dev/sweet_audio.c
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,225 @@
 +/*
 + * kirin: the devices iOS's audio plug-in writes to (tools/sweetaudio, after
 + * HackiOS's RedwoodAudio.driver, APSL 2.0): mediaserverd gets from it the
@@ -358,6 +358,47 @@ index 0000000..e65c54e
 +			break;
 +		}
 +		sweet_q6audio_play(buf, (uint32_t)n);
++	}
++	return error;
++}
++
++/*
++ * /dev/sweet-mic: the phone's microphone, read by iOS's audio plug-in while its
++ * input runs (sweetaudio codec_read). Opening it starts the ADSP capture
++ * (sweet_q6audio.c), closing it stops it. A read never blocks: it gives the
++ * captured mono 16-bit 48 kHz samples that have come, and no more.
++ */
++static int
++mic_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	extern void sweet_q6audio_capture_start(void);
++	sweet_q6audio_capture_start();
++	return 0;
++}
++
++static int
++mic_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	extern void sweet_q6audio_capture_stop(void);
++	sweet_q6audio_capture_stop();
++	return 0;
++}
++
++static int
++mic_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	extern uint32_t sweet_q6audio_capture_read(uint8_t *out, uint32_t len);
++	uint8_t buf[2048];
++	int error = 0;
++	while (uio_resid(uio) > 0) {
++		uint32_t want = (uint32_t)MIN(uio_resid(uio), (user_ssize_t)sizeof(buf));
++		uint32_t got = sweet_q6audio_capture_read(buf, want);
++		if (got == 0) {
++			break;          /* non-blocking: nothing more is buffered */
++		}
++		if ((error = uiomove((caddr_t)buf, (int)got, uio)) != 0) {
++			break;
++		}
 +	}
 +	return error;
 +}
@@ -444,18 +485,25 @@ index 0000000..e65c54e
 +	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 +};
 +
++static const struct cdevsw mic_cdevsw = {
++	.d_open = mic_open, .d_close = mic_close, .d_read = mic_read, .d_write = eno_rdwrt,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
 +void
 +sweet_audio_init(void)
 +{
-+	int a = cdevsw_add(-1, &audio_cdevsw), h = cdevsw_add(-1, &haptic_cdevsw);
-+	bool ok = a >= 0 && h >= 0 &&
++	int a = cdevsw_add(-1, &audio_cdevsw), h = cdevsw_add(-1, &haptic_cdevsw), m = cdevsw_add(-1, &mic_cdevsw);
++	bool ok = a >= 0 && h >= 0 && m >= 0 &&
 +	    devfs_make_node(makedev(a, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-audio") != NULL &&
-+	    devfs_make_node(makedev(h, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-haptic") != NULL;
++	    devfs_make_node(makedev(h, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-haptic") != NULL &&
++	    devfs_make_node(makedev(m, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-mic") != NULL;
 +	thread_t t;
 +	if (ok && kernel_thread_start(haptic_thread, NULL, &t) == KERN_SUCCESS) {
 +		thread_deallocate(t);
 +	}
-+	printf("SWEET AUDIO: /dev/sweet-audio and /dev/sweet-haptic %s\n", ok ? "ready" : "NOT created");
++	printf("SWEET AUDIO: /dev/sweet-audio, /dev/sweet-haptic and /dev/sweet-mic %s\n", ok ? "ready" : "NOT created");
 +}
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
@@ -3067,10 +3115,10 @@ index a0a9ae1..63d27e4 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..3c3c896
+index 0000000..cd0835c
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,1058 @@
+@@ -0,0 +1,1400 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -3289,6 +3337,37 @@ index 0000000..3c3c896
 +	(void)sweet_pmic_read(CDC_ANA_PPID, 0x80, &ncp);
 +	printf("SWEET CDC: earpiece on (EAR_CTL %#x NCP_EN %#x; digital RX_I2S %#x RX1_B6 %#x MCLK %#x)\n", ear, ncp,
 +	    dig_cdc[0x0c / 4], dig_cdc[0x54 / 4], dig_cdc[0x24 / 4]);
++}
++
++/*
++ * Microphone (TX) path: ADC1 on INT3, as msm_anlg_cdc (analog TX1 front-end,
++ * micbias, PM660L SPMI 0xf1) and msm_dig_cdc (decimator and TX I2S, the LPASS
++ * digital codec MMIO 0x152c0000). First pass -- the exact TX sequence is
++ * finicky, as the earpiece was; iterate against what the DSP reads back.
++ */
++static void
++cdc_mic_on(void)
++{
++	/* micbias1 for the internal (bottom) microphone */
++	cdc_upd(CDC_ANA_PPID, 0x42, 0x02, 0x02);        /* MICB_1_CTL: enable */
++	cdc_w(CDC_ANA_PPID, 0x40, 0x80);                /* MICB_1_EN */
++	delay(10000);
++	/* TX1 analog front-end (ADC1) */
++	cdc_w(CDC_ANA_PPID, 0x65, 0x6b);                /* TX_1_2_OPAMP_BIAS (POR) */
++	cdc_w(CDC_ANA_PPID, 0x66, 0x51);                /* TX_1_2_TXFE_CLKDIV (POR) */
++	cdc_w(CDC_ANA_PPID, 0x62, 0xbf);                /* TX_1_2_TEST_CTL_1 (POR) */
++	cdc_w(CDC_ANA_PPID, 0x63, 0x8c);                /* TX_1_2_TEST_CTL_2 (POR) */
++	cdc_upd(CDC_ANA_PPID, 0x60, 0x03, 0x03);        /* TX_1_EN: ADC1 on */
++	delay(12000);
++	/* digital decimator and TX I2S (LPASS dig codec, MMIO) */
++	cdc_upd(CDC_DIG_PPID, 0x50, 0x03, 0x00);        /* CONN_TX1_CTL: ADC1 -> TX1 */
++	dig_upd(0x10, 0x0f, 0x03);                      /* CLK_TX_I2S_CTL: 48 kHz */
++	dig_upd(0x10, 0x10, 0x10);                      /* CLK_TX_I2S_CTL: enable */
++	dig_upd(0x28c, 0x0f, 0x01);                     /* TX1_MUX_CTL: decimator input = ADC1 */
++	dig_upd(0x288, 0xff, 0x00);                     /* TX1_VOL_CTL_CFG */
++	dig_upd(0x284, 0xff, 0x00);                     /* TX1_VOL_CTL_GAIN: 0 dB */
++	__builtin_arm_dsb(0xf);
++	printf("SWEET CDC: mic on (micbias, TX1 ADC1, TX I2S)\n");
 +}
 +
 +static void
@@ -3564,6 +3643,70 @@ index 0000000..3c3c896
 +static LCK_GRP_DECLARE(sweet_q6_grp, "sweet_q6audio");
 +static LCK_SPIN_DECLARE(sweet_q6_ring_lock, &sweet_q6_grp);
 +
++/* ---- microphone capture (INT3_MI2S_TX, ADSP read) ---- */
++#define PORT_INT3_TX    0x1035
++#define CSESSION        2
++#define CASM_PORT       ((CSESSION << 8) | 1)
++#define NBUF_CAP        8
++#define MICRING         65536u
++
++static struct {
++	volatile uint32_t capturing;            /* /dev/sweet-mic is open */
++	volatile uint32_t read_done;            /* bitmask of buffers the DSP filled */
++	volatile uint32_t read_len[NBUF_CAP];   /* bytes filled, per buffer */
++	uint8_t ring[MICRING];                  /* captured mono 16-bit, waiting for iOS */
++	volatile uint32_t rhead, rtail;
++	bool ready;                             /* the capture session is set up */
++	uint32_t handle;
++	uint8_t *cbuf;
++	uint64_t cpa;
++} mc;
++static LCK_SPIN_DECLARE(mic_ring_lock, &sweet_q6_grp);
++
++void sweet_q6audio_capture_start(void);
++void sweet_q6audio_capture_stop(void);
++uint32_t sweet_q6audio_capture_read(uint8_t *out, uint32_t len);
++
++void
++sweet_q6audio_capture_start(void)
++{
++	mc.capturing = 1;
++}
++
++void
++sweet_q6audio_capture_stop(void)
++{
++	mc.capturing = 0;
++}
++
++uint32_t
++sweet_q6audio_capture_read(uint8_t *out, uint32_t len)
++{
++	lck_spin_lock(&mic_ring_lock);
++	uint32_t avail = (mc.rhead - mc.rtail) & (MICRING - 1);
++	len = MIN(len, avail);
++	for (uint32_t i = 0; i < len; i++) {
++		out[i] = mc.ring[(mc.rtail + i) & (MICRING - 1)];
++	}
++	mc.rtail = (mc.rtail + len) & (MICRING - 1);
++	lck_spin_unlock(&mic_ring_lock);
++	return len;
++}
++
++/* the DSP filled a capture buffer: keep its mono samples for iOS to read */
++static void
++mic_ring_put(const uint8_t *pcm, uint32_t len)
++{
++	lck_spin_lock(&mic_ring_lock);
++	uint32_t room = (mc.rtail - mc.rhead - 1) & (MICRING - 1);
++	len = MIN(len, room);
++	for (uint32_t i = 0; i < len; i++) {
++		mc.ring[(mc.rhead + i) & (MICRING - 1)] = pcm[i];
++	}
++	mc.rhead = (mc.rhead + len) & (MICRING - 1);
++	lck_spin_unlock(&mic_ring_lock);
++}
++
 +static void
 +q_sleep_ms(unsigned ms)
 +{
@@ -3586,6 +3729,13 @@ index 0000000..3c3c896
 +		}
 +		if (h->token < NBUF) {
 +			__c11_atomic_fetch_or((_Atomic uint32_t *)&q.done_mask, 1u << h->token, __ATOMIC_RELEASE);
++		}
++		return;
++	}
++	if (h->opcode == 0x00010D9A) {          /* ASM_DATA_EVENT_READ_DONE_V2 */
++		if (h->token < NBUF_CAP) {
++			mc.read_len[h->token] = n >= 5 ? pl[4] : BUFSZ;      /* enc_framesotal_size */
++			__c11_atomic_fetch_or((_Atomic uint32_t *)&mc.read_done, 1u << h->token, __ATOMIC_RELEASE);
 +		}
 +		return;
 +	}
@@ -3843,6 +3993,244 @@ index 0000000..3c3c896
 +	q.last_write = mach_absolute_time();
 +}
 +
++/*
++ * Capture (microphone) setup: the mirror of the playback path on INT3_MI2S_TX.
++ * Runs once in q6_thread after playback is set up; a failure here leaves
++ * playback working. The capture session (CSESSION) reads mono 16-bit 48 kHz
++ * from the DSP into mc.cbuf, which capture_pump() drains into the mic ring.
++ */
++static uint16_t cap_copp;
++
++static bool
++capture_setup(void)
++{
++	vm_offset_t cva = 0;
++	if (kmem_alloc_contig(kernel_map, &cva, NBUF_CAP * BUFSZ, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET Q6: no memory for the capture buffers\n");
++		return false;
++	}
++	mc.cbuf = (uint8_t *)cva;
++	mc.cpa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)cva));
++
++	if (afe_clock("INT3_MI2S bit clock (1.536 MHz)", 0x112, 1536000, 1, 0)) {
++		return false;
++	}
++	{
++		struct {
++			struct apr_hdr h;
++			uint16_t port, payload_size;
++			uint32_t mem[3];
++			uint32_t module, param;
++			uint16_t psize, reserved;
++			uint32_t ver;
++			uint16_t bit_width, channel_mode, mono_stereo, ws_src;
++			uint32_t rate;
++			uint16_t data_format, reserved2;
++		} __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.h.opcode = 0x000100EF;        /* AFE_PORT_CMD_SET_PARAM_V2 */
++		c.port = PORT_INT3_TX;
++		c.payload_size = 12 + 20;
++		c.module = 0x0001020C;
++		c.param = 0x0001020D;
++		c.psize = 20;
++		c.ver = 1;
++		c.bit_width = 16;
++		c.channel_mode = 1;
++		c.mono_stereo = 0;              /* mono */
++		c.ws_src = 1;
++		c.rate = 48000;
++		if (q6_cmd("INT3_MI2S_TX I2S config", &c, sizeof(c), SVC_AFE, 0, 0, 0)) {
++			return false;
++		}
++	}
++	{
++		struct { struct apr_hdr h; uint16_t port, reserved; } __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.h.opcode = 0x000100E5;        /* AFE_PORT_CMD_DEVICE_START */
++		c.port = PORT_INT3_TX;
++		if (q6_cmd("INT3_MI2S_TX start", &c, sizeof(c), SVC_AFE, 0, 0, 0)) {
++			return false;
++		}
++	}
++	cdc_mic_on();
++	{
++		struct {
++			struct apr_hdr h;
++			uint16_t flags, mode, ep1, ep2;
++			uint32_t topology;
++			uint16_t channels, bit_width;
++			uint32_t rate;
++			uint8_t map[8];
++		} __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.h.opcode = 0x00010326;        /* ADM_CMD_DEVICE_OPEN_V5 */
++		c.mode = 2;                     /* live record (TX) COPP */
++		c.ep1 = PORT_INT3_TX;
++		c.ep2 = 0xffff;
++		c.topology = 0x00010312;        /* NULL_COPP_TOPOLOGY */
++		c.channels = 1;
++		c.bit_width = 16;
++		c.rate = 48000;
++		c.map[0] = 1;
++		if (q6_cmd("ADM TX COPP open", &c, sizeof(c), SVC_ADM, PORT_INT3_TX, 0, 0x00010329)) {
++			return false;
++		}
++		if (q.pl[0] != 0) {
++			printf("SWEET Q6: ADM TX COPP open: ADSP error %#x\n", q.pl[0]);
++			return false;
++		}
++		cap_copp = (uint16_t)q.pl[1];
++		printf("SWEET Q6: TX COPP %u on INT3_MI2S_TX\n", cap_copp);
++	}
++	{
++		struct {
++			struct apr_hdr h;
++			uint16_t pool, nregions;
++			uint32_t property;
++			uint32_t lsw, msw, size;
++		} __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.h.opcode = 0x00010D92;        /* ASM_CMD_SHARED_MEM_MAP_REGIONS */
++		c.pool = 3;
++		c.nregions = 1;
++		c.lsw = (uint32_t)mc.cpa;
++		c.msw = (uint32_t)(mc.cpa >> 32) | AUDIO_SID;
++		c.size = NBUF_CAP * BUFSZ;
++		if (q6_cmd("ASM capture buffer map", &c, sizeof(c), SVC_ASM, 0, 0, 0x00010D93)) {
++			return false;
++		}
++		mc.handle = q.pl[0];
++	}
++	{
++		struct {
++			struct apr_hdr h;
++			uint32_t mode_flags, src_endpoint, preproc, enc_fmt;
++			uint16_t bits, reserved;
++		} __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.h.opcode = 0x00010DB4;        /* ASM_STREAM_CMD_OPEN_READ_V3 */
++		c.src_endpoint = 0;             /* device matrix */
++		c.preproc = 0x00010C68;         /* NONE */
++		c.enc_fmt = 0x00010DA5;         /* MULTI_CHANNEL_PCM_V2 */
++		c.bits = 16;
++		if (q6_cmd("ASM capture open", &c, sizeof(c), SVC_ASM, CASM_PORT, 0, 0)) {
++			return false;
++		}
++	}
++	{
++		struct {
++			struct apr_hdr h;
++			uint32_t matrix, nsessions;
++			uint16_t session, ncopps;
++			uint16_t copp, pad;
++		} __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.h.opcode = 0x00010325;        /* ADM_CMD_MATRIX_MAP_ROUTINGS_V5 */
++		c.matrix = 1;                   /* audio TX */
++		c.nsessions = 1;
++		c.session = CSESSION;
++		c.ncopps = 1;
++		c.copp = cap_copp;
++		if (q6_cmd("ADM route capture session", &c, sizeof(c), SVC_ADM, 0, 0, 0)) {
++			return false;
++		}
++	}
++	{
++		struct {
++			struct apr_hdr h;
++			uint32_t fmt_blk_size;
++			uint16_t channels, bits;
++			uint32_t rate;
++			uint16_t is_signed, reserved;
++			uint8_t map[8];
++		} __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.h.opcode = 0x00010D98;        /* ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2 */
++		c.fmt_blk_size = 20;
++		c.channels = 1;
++		c.bits = 16;
++		c.rate = 48000;
++		c.is_signed = 1;
++		c.map[0] = 1;
++		if (q6_cmd("ASM capture media format", &c, sizeof(c), SVC_ASM, CASM_PORT, 0, 0)) {
++			return false;
++		}
++	}
++	mc.ready = true;
++	printf("SWEET Q6: capture ready (waiting for /dev/sweet-mic)\n");
++	return true;
++}
++
++/* submit one empty buffer for the DSP to fill */
++static void
++capture_read_submit(uint32_t i, uint32_t seq)
++{
++	struct { struct apr_hdr h; uint32_t lsw, msw, handle, size, seq; } __attribute__((packed)) r;
++	bzero(&r, sizeof(r));
++	r.h.hdr_field = (2 << 8) | (5 << 4);
++	r.h.pkt_size = sizeof(r);
++	r.h.src_svc = r.h.dest_svc = SVC_ASM;
++	r.h.src_domain = 5;
++	r.h.dest_domain = 4;
++	r.h.src_port = r.h.dest_port = CASM_PORT;
++	r.h.token = i;
++	r.h.opcode = 0x00010DAC;                /* ASM_DATA_CMD_READ_V2 */
++	r.lsw = (uint32_t)(mc.cpa + i * BUFSZ);
++	r.msw = (uint32_t)((mc.cpa + i * BUFSZ) >> 32) | AUDIO_SID;
++	r.handle = mc.handle;
++	r.size = BUFSZ;
++	r.seq = seq;
++	(void)sweet_glink_apr_send(&r, sizeof(r));
++}
++
++/* RUN/PAUSE the capture with /dev/sweet-mic, and drain filled buffers */
++static void
++capture_pump(void)
++{
++	static bool crun;
++	static uint32_t cseq;
++	if (!mc.ready) {
++		return;
++	}
++	if (mc.capturing && !crun) {
++		struct { struct apr_hdr h; uint32_t flags, lsw, msw; } __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.h.opcode = 0x00010DAA;        /* ASM_SESSION_CMD_RUN_V2 */
++		if (q6_cmd("mic: ASM run", &c, sizeof(c), SVC_ASM, CASM_PORT, 0, 0)) {
++			return;
++		}
++		crun = true;
++		mc.read_done = 0;
++		for (uint32_t i = 0; i < NBUF_CAP; i++) {
++			capture_read_submit(i, cseq++);
++		}
++		printf("SWEET Q6: mic capture running\n");
++		return;
++	}
++	if (!mc.capturing && crun) {
++		struct apr_hdr c;
++		bzero(&c, sizeof(c));
++		c.opcode = 0x00010BD3;          /* ASM_SESSION_CMD_PAUSE */
++		(void)q6_cmd("mic: ASM pause", &c, sizeof(c), SVC_ASM, CASM_PORT, 0, 0);
++		crun = false;
++		return;
++	}
++	if (!crun) {
++		return;
++	}
++	uint32_t done = __c11_atomic_exchange((_Atomic uint32_t *)&mc.read_done, 0, __ATOMIC_ACQUIRE);
++	for (uint32_t i = 0; i < NBUF_CAP; i++) {
++		if (!(done & (1u << i))) {
++			continue;
++		}
++		uint32_t got = MIN(mc.read_len[i], BUFSZ);
++		mic_ring_put(mc.cbuf + i * BUFSZ, got);
++		capture_read_submit(i, cseq++);
++	}
++}
++
 +static void
 +q6_thread(__unused void *arg, __unused wait_result_t wr)
 +{
@@ -4027,6 +4415,7 @@ index 0000000..3c3c896
 +	q.playing = true;
 +	q.done_mask = 0;
 +	printf("SWEET Q6: ready, waiting for iOS to play\n");
++	(void)capture_setup();          /* the microphone; a failure leaves playback working */
 +	uint32_t inflight = 0, next = 0, seq = 0;
 +	uint64_t writes = 0, dones = 0, run_writes = 0, run_dones = 0, run_start = 0;
 +	bool running = false, diagnosed = false;
@@ -4116,7 +4505,8 @@ index 0000000..3c3c896
 +			inflight++;
 +			writes++;
 +		}
-+		q_sleep_ms(running ? 2 : 20);
++		capture_pump();
++		q_sleep_ms(running || mc.capturing ? 2 : 20);
 +	}
 +}
 +
