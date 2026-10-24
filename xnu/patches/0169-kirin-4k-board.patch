@@ -4050,10 +4050,10 @@ index 0000000..3c3c896
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_rpm_kirin.c b/bsd/dev/sweet_rpm_kirin.c
 new file mode 100644
-index 0000000..b40baeb
+index 0000000..f76f0d9
 --- /dev/null
 +++ b/bsd/dev/sweet_rpm_kirin.c
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,621 @@
 +/*
 + * kirin: voting power resources on the RPM, as Linux 4.19's qcom_glink_rpm +
 + * rpmsg/rpm-smd do it for DT /soc/rpm-glink + /soc/qcom,rpm-smd.
@@ -4179,6 +4179,7 @@ index 0000000..b40baeb
 +	return n > r.rx_len ? 0 : n;
 +}
 +
++/* the RPM message RAM allows 32-bit accesses only: read word by word */
 +static void
 +rx_peek(void *out, uint32_t off, uint32_t n)
 +{
@@ -4186,12 +4187,16 @@ index 0000000..b40baeb
 +	if (t >= r.rx_len) {
 +		t -= r.rx_len;
 +	}
-+	uint32_t a = MIN(n, r.rx_len - t);
-+	for (uint32_t i = 0; i < a; i++) {
-+		((uint8_t *)out)[i] = r.rx_fifo[t + i];
-+	}
-+	for (uint32_t i = 0; i < n - a; i++) {
-+		((uint8_t *)out)[a + i] = r.rx_fifo[i];
++	uint8_t *o = (uint8_t *)out;
++	for (uint32_t i = 0; i < n; ) {
++		uint32_t w = *(volatile uint32_t *)(r.rx_fifo + t);
++		for (int b = 0; b < 4 && i < n; b++, i++) {
++			o[i] = (uint8_t)(w >> (8 * b));
++		}
++		t += 4;
++		if (t >= r.rx_len) {
++			t = 0;
++		}
 +	}
 +}
 +
@@ -4214,18 +4219,21 @@ index 0000000..b40baeb
 +	return a < 16 ? 0 : a - 16;
 +}
 +
++/* the RPM message RAM allows 32-bit accesses only; n and head are 4-aligned */
 +static uint32_t
 +tx_write_one(uint32_t head, const void *d, uint32_t n)
 +{
-+	uint32_t a = MIN(n, r.tx_len - head);
-+	for (uint32_t i = 0; i < a; i++) {
-+		r.tx_fifo[head + i] = ((const uint8_t *)d)[i];
++	const uint8_t *s = (const uint8_t *)d;
++	for (uint32_t i = 0; i < n; i += 4) {
++		uint32_t w = (uint32_t)s[i] | ((uint32_t)s[i + 1] << 8) |
++		    ((uint32_t)s[i + 2] << 16) | ((uint32_t)s[i + 3] << 24);
++		*(volatile uint32_t *)(r.tx_fifo + head) = w;
++		head += 4;
++		if (head >= r.tx_len) {
++			head = 0;
++		}
 +	}
-+	for (uint32_t i = 0; i < n - a; i++) {
-+		r.tx_fifo[i] = ((const uint8_t *)d)[a + i];
-+	}
-+	head += n;
-+	return head >= r.tx_len ? head - r.tx_len : head;
++	return head;
 +}
 +
 +static void
