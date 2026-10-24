@@ -3115,10 +3115,10 @@ index a0a9ae1..63d27e4 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..cd0835c
+index 0000000..f49bd0b
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,1400 @@
+@@ -0,0 +1,1384 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -4137,27 +4137,11 @@ index 0000000..cd0835c
 +			return false;
 +		}
 +	}
-+	{
-+		struct {
-+			struct apr_hdr h;
-+			uint32_t fmt_blk_size;
-+			uint16_t channels, bits;
-+			uint32_t rate;
-+			uint16_t is_signed, reserved;
-+			uint8_t map[8];
-+		} __attribute__((packed)) c;
-+		bzero(&c, sizeof(c));
-+		c.h.opcode = 0x00010D98;        /* ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2 */
-+		c.fmt_blk_size = 20;
-+		c.channels = 1;
-+		c.bits = 16;
-+		c.rate = 48000;
-+		c.is_signed = 1;
-+		c.map[0] = 1;
-+		if (q6_cmd("ASM capture media format", &c, sizeof(c), SVC_ASM, CASM_PORT, 0, 0)) {
-+			return false;
-+		}
-+	}
++	/*
++	 * No MEDIA_FMT_UPDATE here: that is a playback (write) command. A read
++	 * session takes its PCM format from OPEN_READ (enc_cfg_id) and the COPP
++	 * (1 channel, 16-bit, 48 kHz).
++	 */
 +	mc.ready = true;
 +	printf("SWEET Q6: capture ready (waiting for /dev/sweet-mic)\n");
 +	return true;
