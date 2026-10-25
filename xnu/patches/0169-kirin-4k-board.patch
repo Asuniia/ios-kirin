@@ -3115,10 +3115,10 @@ index a0a9ae1..63d27e4 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..57136e8
+index 0000000..0b3edfd
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,1430 @@
+@@ -0,0 +1,1431 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -3356,7 +3356,7 @@ index 0000000..57136e8
 +	delay(10000);
 +	/* ADC1 front-end, as msm_anlg_cdc_codec_enable_adc (TX_1_EN) */
 +	cdc_w(CDC_ANA_PPID, 0x65, 0x6b);                /* TX_1_2_OPAMP_BIAS */
-+	cdc_w(CDC_ANA_PPID, 0x66, 0x51);                /* TX_1_2_TXFE_CLKDIV */
++	cdc_w(CDC_ANA_PPID, 0x66, 0x42);                /* TX_1_2_TXFE_CLKDIV: capture (update_clkdiv 0x42) */
 +	cdc_w(CDC_ANA_PPID, 0x62, 0xbf);                /* TX_1_2_TEST_CTL_1 */
 +	cdc_w(CDC_ANA_PPID, 0x63, 0x8c);                /* TX_1_2_TEST_CTL_2 */
 +	cdc_upd(CDC_ANA_PPID, 0x60, 0x80, 0x80);        /* TX_1_EN: ADC1 enable (bit 7) */
@@ -3371,6 +3371,7 @@ index 0000000..57136e8
 +	cdc_upd(CDC_DIG_PPID, 0x50, 0x03, 0x00);        /* CONN_TX1_CTL: ADC1 -> TX1 */
 +	delay(12000);
 +	cdc_upd(CDC_ANA_PPID, 0x60, 0x20, 0x00);        /* ADC1 init release (POST_PMU) */
++	dig_upd(0x1c, 0x04, 0x04);                      /* CLK_OTHR_CTL: CDC_CONN clock on */
 +	dig_upd(0x10, 0x1f, 0x13);                      /* CLK_TX_I2S_CTL: 48 kHz, enabled */
 +	dig_upd(0x18, 0x01, 0x01);                      /* CLK_TX_CLK_EN_B1: DEC1 clock on */
 +	dig_upd(0x04, 0x01, 0x01);                      /* CLK_TX_RESET_B1: assert DEC1 */
