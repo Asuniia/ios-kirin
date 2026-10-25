@@ -3115,10 +3115,10 @@ index a0a9ae1..63d27e4 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..62f011c
+index 0000000..8317c40
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,1442 @@
+@@ -0,0 +1,1447 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -3158,6 +3158,7 @@ index 0000000..62f011c
 +#include <vm/pmap.h>
 +#include <vm/vm_kern.h>
 +#include <arm/caches_internal.h>
++#include <pexpert/pexpert.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
@@ -4457,7 +4458,11 @@ index 0000000..62f011c
 +	q.playing = true;
 +	q.done_mask = 0;
 +	printf("SWEET Q6: ready, waiting for iOS to play\n");
-+	(void)capture_setup();          /* the microphone; a failure leaves playback working */
++	int miccap = 0;
++	(void)PE_parse_boot_argn("sweetmic", &miccap, sizeof(miccap));
++	if (miccap) {
++		(void)capture_setup();  /* the microphone (sweetmic=1); off by default while unstable */
++	}
 +	uint32_t inflight = 0, next = 0, seq = 0;
 +	uint64_t writes = 0, dones = 0, run_writes = 0, run_dones = 0, run_start = 0;
 +	bool running = false, diagnosed = false;
