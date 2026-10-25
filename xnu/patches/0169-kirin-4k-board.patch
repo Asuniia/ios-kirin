@@ -3115,7 +3115,7 @@ index a0a9ae1..63d27e4 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..8317c40
+index 0000000..aa33515
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
 @@ -0,0 +1,1447 @@
@@ -3373,7 +3373,7 @@ index 0000000..8317c40
 +	delay(12000);
 +	cdc_upd(CDC_ANA_PPID, 0x60, 0x20, 0x00);        /* ADC1 init release (POST_PMU) */
 +	dig_upd(0x1c, 0x04, 0x04);                      /* CLK_OTHR_CTL: CDC_CONN clock on */
-+	dig_upd(0x10, 0x1f, 0x13);                      /* CLK_TX_I2S_CTL: 48 kHz, enabled */
++	dig_upd(0x10, 0x1f, 0x03);                      /* CLK_TX_I2S_CTL: 48 kHz, codec as slave (no bit 4) */
 +	dig_upd(0x18, 0x01, 0x01);                      /* CLK_TX_CLK_EN_B1: DEC1 clock on */
 +	dig_upd(0x04, 0x01, 0x01);                      /* CLK_TX_RESET_B1: assert DEC1 */
 +	dig_upd(0x04, 0x01, 0x00);                      /* release DEC1 */
@@ -3381,7 +3381,7 @@ index 0000000..8317c40
 +	dig_upd(0x288, 0x01, 0x01);                     /* TX1_VOL_CTL_CFG: hold while configuring */
 +	dig_upd(0x284, 0xff, 0x00);                     /* TX1_VOL_CTL_GAIN: 0 dB */
 +	delay(1000);
-+	dig_upd(0x288, 0x08, 0x00);                     /* unmute */
++	dig_upd(0x288, 0x0f, 0x00);                     /* unmute fully (clear hold and mute) */
 +	__builtin_arm_dsb(0xf);
 +	/* read back the TX codec state: confirm the writes landed, find what did not */
 +	uint8_t mben = 0, mbctl = 0, tx1 = 0, clkdiv = 0, conn = 0;
