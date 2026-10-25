@@ -3115,10 +3115,10 @@ index a0a9ae1..63d27e4 100644
  	}
 diff --git a/bsd/dev/sweet_q6audio.c b/bsd/dev/sweet_q6audio.c
 new file mode 100644
-index 0000000..0b3edfd
+index 0000000..62f011c
 --- /dev/null
 +++ b/bsd/dev/sweet_q6audio.c
-@@ -0,0 +1,1431 @@
+@@ -0,0 +1,1442 @@
 +/*
 + * kirin: playback through the ADSP (APR services AFE, ADM, ASM over
 + * bsd/dev/sweet_glink.c), as Linux's q6afe/q6adm/q6asm and sdm660-internal
@@ -3382,7 +3382,18 @@ index 0000000..0b3edfd
 +	delay(1000);
 +	dig_upd(0x288, 0x08, 0x00);                     /* unmute */
 +	__builtin_arm_dsb(0xf);
-+	printf("SWEET CDC: mic on (micbias, ADC1, DEC1, TX I2S)\n");
++	/* read back the TX codec state: confirm the writes landed, find what did not */
++	uint8_t mben = 0, mbctl = 0, tx1 = 0, clkdiv = 0, conn = 0;
++	(void)sweet_pmic_read(CDC_ANA_PPID, 0x40, &mben);
++	(void)sweet_pmic_read(CDC_ANA_PPID, 0x42, &mbctl);
++	(void)sweet_pmic_read(CDC_ANA_PPID, 0x60, &tx1);
++	(void)sweet_pmic_read(CDC_ANA_PPID, 0x66, &clkdiv);
++	(void)sweet_pmic_read(CDC_DIG_PPID, 0x50, &conn);
++	printf("SWEET CDC: mic on. analog MICB_EN=%02x MICB_CTL=%02x TX1_EN=%02x TXFE=%02x CONN_TX1=%02x\n",
++	    mben, mbctl, tx1, clkdiv, conn);
++	printf("SWEET CDC: digital TX_I2S=%02x TX_CLK_EN=%02x TX_RESET=%02x OTHR=%02x TX1_MUX=%02x TX1_VOL=%02x\n",
++	    dig_cdc[0x10 / 4], dig_cdc[0x18 / 4], dig_cdc[0x04 / 4], dig_cdc[0x1c / 4],
++	    dig_cdc[0x28c / 4], dig_cdc[0x288 / 4]);
 +}
 +
 +static void
