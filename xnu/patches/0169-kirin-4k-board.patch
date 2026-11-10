@@ -4908,10 +4908,10 @@ index 0000000..2a5f63a
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 new file mode 100644
-index 0000000..0f5c8fb
+index 0000000..5e8725d
 --- /dev/null
 +++ b/bsd/dev/sweet_modem.c
-@@ -0,0 +1,664 @@
+@@ -0,0 +1,665 @@
 +/*
 + * kirin, boot-arg sweetmodem=1: bring up the SDM630 modem (MSS, the Hexagon Q6 that runs
 + * the cellular and Wi-Fi firmware), stage A. Unlike the ADSP (a simple TrustZone PAS), the
@@ -5531,14 +5531,15 @@ index 0000000..0f5c8fb
 +	}
 +	if (!ok) {
 +		/*
-+		 * Only the QDSP6SS (0x4080000, clocked) and RMB (message RAM) are safe
-+		 * to read here. The MSS halt NoC registers (halt_q6/modem/nc, 0x1f63000)
-+		 * external-abort when the subsystem is wedged (ESR 0x96000210 data abort,
-+		 * seen 10/11): never touch them on the failure path.
++		 * Once the Q6 has run the PBL and it errored, the whole QDSP6SS and the
++		 * MSS halt NoC external-abort on any read (ESR 0x96000210 data abort at
++		 * QDSP6SS_RESET +0x14, seen 10/11). Only the RMB (message RAM) stays
++		 * readable: the poll loop above read RMB_PBL_STATUS from it without a
++		 * fault. Read nothing else on the failure path.
 +		 */
-+		printf("SWEET MODEM: PBL never validated the MBA (PBL %#x MBA_STATUS %#x RESET %#x PWR_CTL %#x GFMUX %#x BHS %#x)\n",
-+		    rmb[RMB_PBL_STATUS / 4], rmb[RMB_MBA_STATUS / 4], q6[QDSP6SS_RESET / 4], q6[QDSP6SS_PWR_CTL / 4],
-+		    q6[QDSP6SS_GFMUX_CTL / 4], q6[QDSP6V62SS_BHS_STATUS / 4]);
++		printf("SWEET MODEM: the PBL did not validate the MBA (PBL %#x MBA_STATUS %#x PMI_START %#x PMI_LEN %#x)\n",
++		    rmb[RMB_PBL_STATUS / 4], rmb[RMB_MBA_STATUS / 4],
++		    rmb[RMB_PMI_CODE_START / 4], rmb[RMB_PMI_CODE_LENGTH / 4]);
 +		return;
 +	}
 +	/* the MBA is now running; it reports through RMB_MBA_STATUS */
