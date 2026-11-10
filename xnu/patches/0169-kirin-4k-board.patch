@@ -20,10 +20,10 @@ index 2a6dc36..1a7c815 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/kirin_bt.c b/bsd/dev/kirin_bt.c
 new file mode 100644
-index 0000000..1cdb105
+index 0000000..410f08d
 --- /dev/null
 +++ b/bsd/dev/kirin_bt.c
-@@ -0,0 +1,594 @@
+@@ -0,0 +1,595 @@
 +/*
 + * kirin (Xperia 10, SDM630), boot-arg sweetbt=1: the WCN3990's Bluetooth core
 + * over BLSP1 UART1 (0xc16f000, UARTDM v1.4 in single-character PIO), HCI in
@@ -60,6 +60,7 @@ index 0000000..1cdb105
 +#include <sys/errno.h>
 +#include <kern/thread.h>
 +#include <kern/clock.h>
++#include <kern/sched_prim.h>
 +#include <pexpert/pexpert.h>
 +#include <kern/kalloc.h>
 +
