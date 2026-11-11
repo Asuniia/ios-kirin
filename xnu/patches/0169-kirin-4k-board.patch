@@ -3741,10 +3741,10 @@ index 0c548d1..9bc7611 100644
  		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_mglink.c b/bsd/dev/sweet_mglink.c
 new file mode 100644
-index 0000000..0a0dd06
+index 0000000..ff27151
 --- /dev/null
 +++ b/bsd/dev/sweet_mglink.c
-@@ -0,0 +1,1463 @@
+@@ -0,0 +1,1491 @@
 +/*
 + * kirin: talking to the modem (MSS) once sweet_modem.c has booted it, the way
 + * sweet_glink.c talks to the ADSP. Everything here is for the modem edge
@@ -4617,6 +4617,8 @@ index 0000000..0a0dd06
 +
 +#define RMTFS_SERVICE   14
 +#define RMTFS_PORT      0x10u
++#define PROBE_PORT_LOC  0x11u           /* servreg_loc (64) probe: requests logged, not answered */
++#define PROBE_PORT_TFTP 0x12u           /* tqftpserv (4096) probe */
 +#define BB_PORT_BASE    0x4100u         /* CBQ_PORT_BASE in coachz_bb_qmux.h */
 +
 +static uint32_t qrtr_modem_node = ~0u;
@@ -4752,6 +4754,15 @@ index 0000000..0a0dd06
 +		}
 +		if (h->dst_port == RMTFS_PORT) {
 +			rmtfs_handle(h, pkt + sizeof(*h), h->size);
++		} else if (h->dst_port == PROBE_PORT_LOC || h->dst_port == PROBE_PORT_TFTP) {
++			const uint8_t *d = pkt + sizeof(*h);
++			char hex[3 * 24 + 1];
++			unsigned o = 0;
++			for (uint32_t i = 0; i < h->size && i < 24; i++) {
++				o += (unsigned)snprintf(hex + o, sizeof(hex) - o, "%02x ", d[i]);
++			}
++			printf("SWEET MQRTR: %s request from %u:%#x, %u bytes: %s\n",
++			    h->dst_port == PROBE_PORT_LOC ? "servreg_loc" : "tqftp", h->src_node, h->src_port, h->size, hex);
 +		} else if (h->dst_port >= BB_PORT_BASE && bb_configured) {
 +			(void)coachz_baseband_qrtr(h->dst_port, h->src_node, h->src_port, pkt + sizeof(*h), h->size);
 +		} else {
@@ -4946,6 +4957,20 @@ index 0000000..0a0dd06
 +	}
 +	uint32_t a[4] = { RMTFS_SERVICE, 1 /* version, instance 0 */, QRTR_LOCAL_NODE, RMTFS_PORT };
 +	qrtr_ctrl(QRTR_TYPE_NEW_SERVER, QRTR_NODE_BCAST, QRTR_PORT_CTRL, a, 4);
++	/*
++	 * Probe (11/11): the modem announces only servreg_notif (66) and ssctl (43)
++	 * and never asks rmtfs for anything. Linux boots this modem with three
++	 * daemons: rmtfs, pd-mapper (QMI service 64, the service locator the modem's
++	 * PDs register with) and tqftpserv (service 4096, files over TFTP). Announce
++	 * the other two on ports of their own and log whatever the modem asks them,
++	 * to learn which one it waits for before going on.
++	 */
++	uint32_t loc[4] = { 64, 1, QRTR_LOCAL_NODE, PROBE_PORT_LOC };
++	qrtr_ctrl(QRTR_TYPE_NEW_SERVER, QRTR_NODE_BCAST, QRTR_PORT_CTRL, loc, 4);
++	uint32_t tftp[4] = { 4096, 1, QRTR_LOCAL_NODE, PROBE_PORT_TFTP };
++	qrtr_ctrl(QRTR_TYPE_NEW_SERVER, QRTR_NODE_BCAST, QRTR_PORT_CTRL, tftp, 4);
++	printf("SWEET MQRTR: announced rmtfs 14 at %#x, servreg_loc 64 at %#x, tqftp 4096 at %#x\n",
++	    RMTFS_PORT, PROBE_PORT_LOC, PROBE_PORT_TFTP);
 +}
 +
 +static int
@@ -5180,14 +5205,17 @@ index 0000000..0a0dd06
 +			if (bb_configured) {
 +				coachz_baseband_report((unsigned)(ns / 1000000000ull));
 +			}
-+			/* watch for a late crash too */
++			/* watch for a late crash too: SMP2P if the modem ever created it, SMEM 421 otherwise */
 +			uint32_t st = smp2p_modem_state();
++			char why[200];
 +			if (st != ~0u && (st & 1) && fatal_checks++ == 0) {
-+				char why[200];
 +				printf("SWEET MGLINK: the modem went ERR-FATAL (state %#x)\n", st);
 +				if (sweet_glink_smem_string(421, why, sizeof(why)) && why[0]) {
 +					printf("SWEET MGLINK: modem crash reason: %s\n", why);
 +				}
++			} else if (fatal_checks == 0 && sweet_glink_smem_string(421, why, sizeof(why)) && why[0]) {
++				fatal_checks++;
++				printf("SWEET MGLINK: modem crash reason (SMEM 421): %s\n", why);
 +			}
 +		}
 +		idle = any ? 0 : idle + 1;
@@ -11955,7 +11983,7 @@ index 93377c0..1f5ee70 100644
  		}
  		break;
 diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
-index d11fe26..0c6b322 100644
+index d11fe26..aa5eeb6 100644
 --- a/iokit/Kernel/arm/SweetKeyStore.cpp
 +++ b/iokit/Kernel/arm/SweetKeyStore.cpp
 @@ -55,9 +55,11 @@ enum {
@@ -11981,6 +12009,59 @@ index d11fe26..0c6b322 100644
  		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
  	};
  	uint8_t buf[128];
+@@ -227,6 +229,52 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	/*
++	 * Key wrap and unwrap, as HackiOS does it (ios-redfin 0123, ios-rebivincek
++	 * 0900, credited in their CREDITS): no real key bag here, so the wrapped
++	 * form is a tag, the key class, and the key lightly obfuscated, 8 bytes
++	 * longer than the key. Without them securityd cannot create the keychain's
++	 * metadata key ("ks_crypt: e00002c7 failed to 'oe' item (class 11)",
++	 * SecItem -25291) and every keychain user fails: bluetoothd restarted on
++	 * "Failed to set new identity root" (11/11).
++	 */
++	case kAKSWrapKey: {
++		uint8_t wrapped[8 + 64];
++		size_t len = args->structureInputSize;
++		if (args->structureInput == NULL || len == 0 || len > 64 || in_scalars < 2) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		memcpy(wrapped, "HKwr", 4);
++		wrapped[4] = (uint8_t)args->scalarInput[1];
++		wrapped[5] = wrapped[6] = wrapped[7] = 0;
++		memcpy(wrapped + 8, args->structureInput, len);
++		for (size_t i = 0; i < len; i++) {
++			wrapped[8 + i] ^= (uint8_t)(0x5a + 37 * i);
++		}
++		if (out_scalars >= 1) {
++			args->scalarOutput[0] = args->scalarInput[1];
++			args->scalarOutputCount = 1;
++		}
++		ret = sweet_aks_struct_out(args, wrapped, (uint32_t)(8 + len));
++		break;
++	}
++	case kAKSUnwrapKey: {
++		uint8_t key[64];
++		const uint8_t *w = (const uint8_t *)args->structureInput;
++		size_t len = args->structureInputSize;
++		if (w == NULL || len <= 8 || len > 8 + sizeof(key) || memcmp(w, "HKwr", 4) != 0) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		memcpy(key, w + 8, len - 8);
++		for (size_t i = 0; i < len - 8; i++) {
++			key[i] ^= (uint8_t)(0x5a + 37 * i);
++		}
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_struct_out(args, key, (uint32_t)(len - 8));
++		break;
++	}
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
 diff --git a/iokit/Kernel/arm/SweetNetwork.cpp b/iokit/Kernel/arm/SweetNetwork.cpp
 new file mode 100644
 index 0000000..d08a9f1
