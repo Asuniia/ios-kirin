@@ -3741,10 +3741,10 @@ index 0c548d1..9bc7611 100644
  		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_mglink.c b/bsd/dev/sweet_mglink.c
 new file mode 100644
-index 0000000..ff27151
+index 0000000..e1d8b88
 --- /dev/null
 +++ b/bsd/dev/sweet_mglink.c
-@@ -0,0 +1,1491 @@
+@@ -0,0 +1,1499 @@
 +/*
 + * kirin: talking to the modem (MSS) once sweet_modem.c has booted it, the way
 + * sweet_glink.c talks to the ADSP. Everything here is for the modem edge
@@ -4955,8 +4955,16 @@ index 0000000..ff27151
 +		printf("SWEET RMTFS: buffer at %#llx (shared with the modem: %d), serving %u:%#x\n",
 +		    rmtfs_buf_pa, shared, QRTR_LOCAL_NODE, RMTFS_PORT);
 +	}
++	/*
++	 * Unicast to the modem's control port once it has said hello, as Linux's name
++	 * service does for a node that just appeared (announce_servers): our hello
++	 * reply, unicast, got the modem's own service list back, while these
++	 * announcements, broadcast (dst node 0xffffffff), never got a single
++	 * request (11/11). The modem's router may well drop broadcast control.
++	 */
++	uint32_t to = qrtr_modem_node != ~0u ? qrtr_modem_node : QRTR_NODE_BCAST;
 +	uint32_t a[4] = { RMTFS_SERVICE, 1 /* version, instance 0 */, QRTR_LOCAL_NODE, RMTFS_PORT };
-+	qrtr_ctrl(QRTR_TYPE_NEW_SERVER, QRTR_NODE_BCAST, QRTR_PORT_CTRL, a, 4);
++	qrtr_ctrl(QRTR_TYPE_NEW_SERVER, to, QRTR_PORT_CTRL, a, 4);
 +	/*
 +	 * Probe (11/11): the modem announces only servreg_notif (66) and ssctl (43)
 +	 * and never asks rmtfs for anything. Linux boots this modem with three
@@ -4966,11 +4974,11 @@ index 0000000..ff27151
 +	 * to learn which one it waits for before going on.
 +	 */
 +	uint32_t loc[4] = { 64, 1, QRTR_LOCAL_NODE, PROBE_PORT_LOC };
-+	qrtr_ctrl(QRTR_TYPE_NEW_SERVER, QRTR_NODE_BCAST, QRTR_PORT_CTRL, loc, 4);
++	qrtr_ctrl(QRTR_TYPE_NEW_SERVER, to, QRTR_PORT_CTRL, loc, 4);
 +	uint32_t tftp[4] = { 4096, 1, QRTR_LOCAL_NODE, PROBE_PORT_TFTP };
-+	qrtr_ctrl(QRTR_TYPE_NEW_SERVER, QRTR_NODE_BCAST, QRTR_PORT_CTRL, tftp, 4);
-+	printf("SWEET MQRTR: announced rmtfs 14 at %#x, servreg_loc 64 at %#x, tqftp 4096 at %#x\n",
-+	    RMTFS_PORT, PROBE_PORT_LOC, PROBE_PORT_TFTP);
++	qrtr_ctrl(QRTR_TYPE_NEW_SERVER, to, QRTR_PORT_CTRL, tftp, 4);
++	printf("SWEET MQRTR: announced to node %#x: rmtfs 14 at %#x, servreg_loc 64 at %#x, tqftp 4096 at %#x\n",
++	    to, RMTFS_PORT, PROBE_PORT_LOC, PROBE_PORT_TFTP);
 +}
 +
 +static int
