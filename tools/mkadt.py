@@ -56,7 +56,7 @@ KIRIN = dict(
     # Largest RAM range Linux sees is 0x94b00000-0xffafffff; start above the
     # splash buffer (0x9d400000 + 0x2300000) and stop below debug_region/ramoops.
     # 2MB aligned (L2 block with 4K pages), same 1GB as the splash (start.s).
-    phys_base=0x9f800000, mem_size=0x60200000,
+    phys_base=0x9f800000, mem_size=0x9f2c0000,  # up to the end of the 3GB bank (0x13eac0000), spanning the 2MB debug/ramoops
     gicd=0x17a00000, gicr=0x17b00000,
     vtimer=19,  # Qualcomm PPI numbering like sweet: CNTV is PPI 3
     fb=0x9d400000, fb_size=0x2300000, fb_w=1080, fb_h=2520, fb_bpp=32,  # B, G, R, X
@@ -276,6 +276,25 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False, kirin=False, boot_
             ('canvas-width', u32(750 if pixel1 else 1125)),
             ('canvas-height', u32(1334 if pixel1 else 2436)),
         ])])
+    if kirin:
+        # bluetoothd and BlueTool only start when a registry entry named
+        # "bluetooth" with local-mac-address exists (without it bluetoothd
+        # exits and launchd relaunches it thousands of times per boot); they
+        # read transport-encoding (3 = H4BC, the iPhone X value) and
+        # transport-speed from it, then talk H4 through the kernel control
+        # com.apple.uart.bluetooth (bsd/dev/sweet_bt_hci.c, ios-sweet's
+        # adt-add-bluetooth.py). The WCN3990 firmware comes from the phone's
+        # bluetooth partition (bsd/dev/kirin_bt.c), not from the ADT.
+        arm_io.children.append(node('bluetooth', [
+            ph(),
+            ('device_type', cstr('bluetooth')),
+            ('compatible', cstr('bluetooth,wcn3990')),
+            ('local-mac-address', bytes.fromhex('02005e77ee11')),
+            ('transport-encoding', u32(3)),
+            ('transport-speed', u32(115200)),
+            ('vendor-id', u32(0x05ac)),
+            ('product-id', u32(0x12a0)),
+        ]))
 
     fbcon = node('sweet-fbcon', [
         ph(),
