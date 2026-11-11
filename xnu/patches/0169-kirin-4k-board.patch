@@ -15116,6 +15116,27 @@ index b8f1807..5ab1f03 100644
  void
  pe_init_fiq()
  {
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 04dda53..cd9f529 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -678,8 +678,16 @@ PE_update_panicheader_nestedpanic()
+ 	 * if the panic header pointer is bogus (e.g. someone stomped on it) then bail.
+ 	 */
+ 	if (!panic_info) {
++#if !defined(SWEET_KIRIN)
+ 		/* if this happens in development then blow up bigly */
+ 		assert(panic_info);
++#endif
++		/*
++		 * kirin has no panic region in its device tree (gPanicBase 0), so this
++		 * pointer is always NULL: with the assert, a nested panic re-panicked
++		 * here until the nesting limit and the original panic string scrolled
++		 * away (11/11). Just skip the header update.
++		 */
+ 		return;
+ 	}
+ 
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 index 5d2856f..cdf69c0 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
