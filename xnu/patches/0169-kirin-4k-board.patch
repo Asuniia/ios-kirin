@@ -4912,10 +4912,10 @@ index 0000000..2a5f63a
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 new file mode 100644
-index 0000000..b4ae73b
+index 0000000..c536244
 --- /dev/null
 +++ b/bsd/dev/sweet_modem.c
-@@ -0,0 +1,812 @@
+@@ -0,0 +1,821 @@
 +/*
 + * kirin, boot-arg sweetmodem=1: bring up the SDM630 modem (MSS, the Hexagon Q6 that runs
 + * the cellular and Wi-Fi firmware), stage A. Unlike the ADSP (a simple TrustZone PAS), the
@@ -4946,9 +4946,12 @@ index 0000000..b4ae73b
 +#include <vm/pmap.h>
 +#include <vm/vm_kern.h>
 +#include <arm/caches_internal.h>
++#include <arm/memory_types.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 +extern vm_map_address_t phystokv(uint64_t pa);
 +void sweet_modem_init(void);
 +
@@ -5429,7 +5432,12 @@ index 0000000..b4ae73b
 +	}
 +	printf("SWEET MODEM: metadata authenticated\n");
 +
-+	uint8_t *region = (uint8_t *)ml_io_map_wcomb(MODEM_PA, MODEM_SZ);
++	/*
++	 * 126 MB of VA: ml_io_map_wcomb carves permanent space out of the small io
++	 * submap and panics for want of room (kmem_alloc failed with 3, 11/11); the
++	 * unmappable variant allocates from kernel_map and ml_io_unmap frees it.
++	 */
++	uint8_t *region = (uint8_t *)ml_io_map_unmappable(MODEM_PA, MODEM_SZ, VM_WIMG_WCOMB);
 +	if (!region) {
 +		printf("SWEET MODEM: the modem region cannot be mapped\n");
 +		return -1;
@@ -5477,6 +5485,7 @@ index 0000000..b4ae73b
 +		loaded++;
 +	}
 +	printf("SWEET MODEM: %u segments loaded (%u bytes), waiting for auth complete\n", loaded, total_len);
++	ml_io_unmap((vm_offset_t)region, MODEM_SZ);
 +	/* the modem alone owns its firmware from here on (pil_reclaim_mem); we never touch region again */
 +	if (hyp_assign(MODEM_PA, MODEM_SZ, HYP_RECLAIM, "modem region to the modem") != 0) {
 +		return -1;
