@@ -3741,10 +3741,10 @@ index 0c548d1..9bc7611 100644
  		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_mglink.c b/bsd/dev/sweet_mglink.c
 new file mode 100644
-index 0000000..00a67d1
+index 0000000..0a0dd06
 --- /dev/null
 +++ b/bsd/dev/sweet_mglink.c
-@@ -0,0 +1,1454 @@
+@@ -0,0 +1,1463 @@
 +/*
 + * kirin: talking to the modem (MSS) once sweet_modem.c has booted it, the way
 + * sweet_glink.c talks to the ADSP. Everything here is for the modem edge
@@ -5160,8 +5160,17 @@ index 0000000..00a67d1
 +		}
 +		if (mg.ch[0].intents_sent && !hello) {
 +			hello = true;
-+			int e = qrtr_ctrl(QRTR_TYPE_HELLO, QRTR_NODE_BCAST, QRTR_PORT_CTRL, NULL, 0);
-+			printf("SWEET MQRTR: hello sent to the modem (%d)\n", e);
++			/*
++			 * The modem says hello by itself as soon as IPCRTR opens, and qrtr_rx
++			 * answers it with our hello and the rmtfs server. A second hello from us
++			 * makes its router forget everything it knew from our node (11/11: it
++			 * re-sent its own servers and never looked for rmtfs again), so only
++			 * speak first if it has not.
++			 */
++			if (qrtr_modem_node == ~0u) {
++				int e = qrtr_ctrl(QRTR_TYPE_HELLO, QRTR_NODE_BCAST, QRTR_PORT_CTRL, NULL, 0);
++				printf("SWEET MQRTR: hello sent to the modem (%d)\n", e);
++			}
 +		}
 +		if (bb_configured) {
 +			coachz_baseband_poll();
