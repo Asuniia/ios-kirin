@@ -20,13 +20,13 @@ index 2a6dc36..1a7c815 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/kirin_bt.c b/bsd/dev/kirin_bt.c
 new file mode 100644
-index 0000000..410f08d
+index 0000000..1e06f70
 --- /dev/null
 +++ b/bsd/dev/kirin_bt.c
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,599 @@
 +/*
 + * kirin (Xperia 10, SDM630), boot-arg sweetbt=1: the WCN3990's Bluetooth core
-+ * over BLSP1 UART1 (0xc16f000, UARTDM v1.4 in single-character PIO), HCI in
++ * over BLSP2 UART1 (0xc1af000, UARTDM v1.4 in single-character PIO), HCI in
 + * the kernel, then the H4 stream for iOS's bluetoothd/BlueTool through the
 + * kernel control com.apple.uart.bluetooth (bsd/dev/sweet_bt_hci.c, from
 + * ios-sweet 0154).
@@ -36,10 +36,13 @@ index 0000000..410f08d
 + *   rails      RPM LDOs (pm660): vdd-core l9 1.8 V, vdd-pa l6 1.304 V,
 + *              vdd-ldo l19 3.312 V, chip-pwd pm660l bob pin1; clock rf_clk1.
 + *              All votable over the GLINK RPM link (sweet_rpm_vote_kvs).
-+ *   UART       pins gpio0-3 (TLMM SOUTH tile 0x3100000, function 2), clocks
-+ *              GCC blsp1_ahb (vote 0x52004 bit 17) and blsp1_uart1_apps
-+ *              (RCG 0x1a00c + branch 0x1a004); UARTDM baud = RCG rate / CSR
-+ *              divider (3.6864 MHz with CSR 0x55 = 2400 for the power pulse,
++ *   UART       the only HS UART the live DT enables is /soc/uart@c1af000
++ *              (qcom,msm-hsuart-v14, status ok; 0xc16f000 is disabled):
++ *              pins gpio16 TX, 17 RX, 18 CTS, 19 RFR (TLMM CENTER tile
++ *              0x3500000, function 1 = blsp_uart5), clocks GCC blsp2_ahb
++ *              (vote 0x52004 bit 15) and blsp2_uart1_apps (RCG 0x2700c +
++ *              branch 0x27004); UARTDM baud = RCG rate / CSR divider
++ *              (3.6864 MHz with CSR 0x55 = 2400 for the power pulse,
 + *              51.2 MHz with CSR 0xff = 3.2 M to operate).
 + *   power      a power-on pulse byte (0xfc) at 2400 baud, then the
 + *              controller talks at 3.2 M.
@@ -85,17 +88,18 @@ index 0000000..410f08d
 +
 +/* ---- addresses ---- */
 +#define GCC_PA          0x00100000ull
-+#define TLMM_SOUTH_PA   0x03100000ull   /* tile of gpio0-3 */
-+#define UART_PA         0x0c16f000ull
++#define TLMM_CENTER_PA  0x03500000ull   /* tile of gpio16-19 (pinctrl-sdm660.c CENTER); ctl at 0x1000 * gpio */
++#define BT_GPIO_FIRST   16u
++#define BT_GPIO_FUNC    1u              /* blsp_uart5 is function 1 on gpio16-19 */
++#define UART_PA         0x0c1af000ull   /* BLSP2 UART1 core_mem */
 +
-+#define GCC_BLSP1_AHB_VOTE      0x52004 /* bit 17 */
-+#define GCC_UART1_BCR           0x1a000
-+#define GCC_UART1_BRANCH        0x1a004 /* bit 0 */
-+#define GCC_UART1_RCG_CMD       0x1a00c
-+#define GCC_UART1_RCG_CFG       0x1a010
-+#define GCC_UART1_RCG_M         0x1a014
-+#define GCC_UART1_RCG_N         0x1a018
-+#define GCC_UART1_RCG_D         0x1a01c
++#define GCC_BLSP2_AHB_VOTE      0x52004 /* bit 15 */
++#define GCC_UART_BRANCH         0x27004 /* gcc_blsp2_uart1_apps_clk, bit 0 */
++#define GCC_UART_RCG_CMD        0x2700c /* blsp2_uart1_apps_clk_src */
++#define GCC_UART_RCG_CFG        0x27010
++#define GCC_UART_RCG_M          0x27014
++#define GCC_UART_RCG_N          0x27018
++#define GCC_UART_RCG_D          0x2701c
 +
 +/* UARTDM v1.4 */
 +#define UART_MR1        0x00
@@ -204,9 +208,9 @@ index 0000000..410f08d
 +static void
 +kb_pins(void)
 +{
-+	/* gpio0-3 to blsp_uart1 (function 2), no pull, 2 mA */
++	/* gpio16-19 to blsp_uart5 (function 1), no pull, 2 mA: the DT's blsp2_uart1_*_active */
 +	for (unsigned g = 0; g < 4; g++) {
-+		wr(bt_tlmm, 0x1000 * g, 2u << 2);
++		wr(bt_tlmm, 0x1000 * (BT_GPIO_FIRST + g), BT_GPIO_FUNC << 2);
 +	}
 +}
 +
@@ -214,12 +218,12 @@ index 0000000..410f08d
 +static void
 +kb_rcg(uint32_t m, uint32_t n, uint32_t src, uint32_t prediv)
 +{
-+	wr(bt_gcc, GCC_UART1_RCG_M, m);
-+	wr(bt_gcc, GCC_UART1_RCG_N, (~(n - m)) & 0xffff);
-+	wr(bt_gcc, GCC_UART1_RCG_D, (~n) & 0xffff);
-+	wr(bt_gcc, GCC_UART1_RCG_CFG, (src << 8) | prediv | (m ? (2u << 12) : 0));
-+	wr(bt_gcc, GCC_UART1_RCG_CMD, rd(bt_gcc, GCC_UART1_RCG_CMD) | 3u);        /* ROOT_EN | UPDATE */
-+	for (int i = 0; i < 1000 && (rd(bt_gcc, GCC_UART1_RCG_CMD) & 1u); i++) {
++	wr(bt_gcc, GCC_UART_RCG_M, m);
++	wr(bt_gcc, GCC_UART_RCG_N, (~(n - m)) & 0xffff);
++	wr(bt_gcc, GCC_UART_RCG_D, (~n) & 0xffff);
++	wr(bt_gcc, GCC_UART_RCG_CFG, (src << 8) | prediv | (m ? (2u << 12) : 0));
++	wr(bt_gcc, GCC_UART_RCG_CMD, rd(bt_gcc, GCC_UART_RCG_CMD) | 3u);        /* ROOT_EN | UPDATE */
++	for (int i = 0; i < 1000 && (rd(bt_gcc, GCC_UART_RCG_CMD) & 1u); i++) {
 +		delay(1);
 +	}
 +}
@@ -227,9 +231,9 @@ index 0000000..410f08d
 +static void
 +kb_clocks(void)
 +{
-+	wr(bt_gcc, GCC_BLSP1_AHB_VOTE, rd(bt_gcc, GCC_BLSP1_AHB_VOTE) | (1u << 17));
++	wr(bt_gcc, GCC_BLSP2_AHB_VOTE, rd(bt_gcc, GCC_BLSP2_AHB_VOTE) | (1u << 15));
 +	kb_rcg(96, 15625, 1, 1);        /* 3.6864 MHz */
-+	wr(bt_gcc, GCC_UART1_BRANCH, rd(bt_gcc, GCC_UART1_BRANCH) | 1u);
++	wr(bt_gcc, GCC_UART_BRANCH, rd(bt_gcc, GCC_UART_BRANCH) | 1u);
 +	delay(100);
 +}
 +
@@ -537,7 +541,7 @@ index 0000000..410f08d
 +	(void)PE_parse_boot_argn("sweetbtbaud", &oper, sizeof(oper));
 +
 +	bt_gcc = (volatile uint32_t *)ml_io_map(GCC_PA, 0x100000);
-+	bt_tlmm = (volatile uint32_t *)ml_io_map(TLMM_SOUTH_PA, 0x4000);
++	bt_tlmm = (volatile uint32_t *)ml_io_map(TLMM_CENTER_PA, 0x1000 * (BT_GPIO_FIRST + 4));
 +	bt_uart = (volatile uint32_t *)ml_io_map(UART_PA, 0x1000);
 +	if (!bt_gcc || !bt_tlmm || !bt_uart) {
 +		printf("SWEET KBT: a register region could not be mapped\n");
@@ -4908,10 +4912,10 @@ index 0000000..2a5f63a
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 new file mode 100644
-index 0000000..5e8725d
+index 0000000..b4ae73b
 --- /dev/null
 +++ b/bsd/dev/sweet_modem.c
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,812 @@
 +/*
 + * kirin, boot-arg sweetmodem=1: bring up the SDM630 modem (MSS, the Hexagon Q6 that runs
 + * the cellular and Wi-Fi firmware), stage A. Unlike the ADSP (a simple TrustZone PAS), the
@@ -5033,6 +5037,135 @@ index 0000000..5e8725d
 +	}
 +	printf("SWEET MODEM: %s: timeout (MBA_STATUS %#x)\n", what, rmb[RMB_MBA_STATUS / 4]);
 +	return -1;
++}
++
++/*
++ * Memory ownership. The modem runs under its own VMID (15, VMID_MSS_MSA, the DT's
++ * qcom,mem-protect-id): the hypervisor's stage-2 tables only let it touch memory
++ * assigned to that VMID. Linux (peripheral-loader.c pil_assign_mem_to_*, secure_buffer.c
++ * hyp_assign_phys) hands the MBA buffer, the metadata buffer and the firmware region
++ * over from HLOS (VMID 3) before each RMB step, and takes them back after. Without the
++ * first hand-over the PBL cannot fetch the MBA and reports an error instead of success
++ * (RMB_PBL_STATUS 0xef110000 on kirin, 10/11, with every clock and rail in place).
++ *
++ * SCM svc 0xc (MP) cmd 0x16 (MEM_PROT_ASSIGN), seven arguments: a list of {addr, size},
++ * a list of source VMIDs, a list of {vmid, perm, ctx, ctx_size} destinations, a spare.
++ * Arguments past the third travel in a buffer whose physical address goes in x5
++ * (scm.c allocate_extra_arg_buffer, SCM_ARMV8_64: seven u64). The arginfo is
++ * SCM_ARGS(7, RO, VAL, RO, VAL, RO, VAL, VAL) = 0x1117.
++ */
++#define VMID_HLOS       3u
++#define VMID_MSS_MSA    15u
++#define HYP_PERM_R      4u
++#define HYP_PERM_W      2u
++#define HYP_PERM_X      1u
++
++enum hyp_move {
++	HYP_TO_MSS,     /* HLOS gives it to the modem (RW) */
++	HYP_TO_HLOS,    /* the modem gives it back (RWX) */
++	HYP_SHARE,      /* HLOS keeps it (RW) and the modem gets it too (RW): while we write the segments */
++	HYP_RECLAIM,    /* shared, then the modem alone (RW): before the final authentication */
++};
++
++struct hyp_mem_info {
++	uint64_t addr, size;
++};
++struct hyp_dest_info {
++	uint32_t vm, perm;
++	uint64_t ctx;
++	uint32_t ctx_size, pad;
++};
++
++static int64_t
++modem_scm(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t *r1)
++{
++	uint64_t fn = (1ull << 30) | (2ull << 24) | ((uint64_t)svc << 8) | cmd;
++	for (int busy = 0;; busy++) {
++		uint64_t a0 = fn, a6 = 0;
++		register uint64_t x0 __asm__("x0"), x1 __asm__("x1"), x2 __asm__("x2"), x3 __asm__("x3");
++		register uint64_t x4 __asm__("x4"), x5 __asm__("x5"), x6 __asm__("x6"), x7 __asm__("x7");
++		do {
++			x0 = a0; x1 = arginfo; x2 = a; x3 = b; x4 = c; x5 = d; x6 = a6; x7 = 0;
++			__asm__ volatile("smc #0"
++			    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++			    :
++			    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++			a0 = 1;
++			a6 = x6;
++		} while (x0 == 1);
++		if ((int64_t)x0 != -12 || busy >= 20) {
++			if (r1) {
++				*r1 = x1;
++			}
++			return (int64_t)x0;
++		}
++		delay(30000);
++	}
++}
++
++static vm_offset_t hyp_args_va;
++static uint64_t hyp_args_pa;
++
++static int
++hyp_assign(uint64_t pa, uint64_t size, enum hyp_move move, const char *what)
++{
++	if (hyp_args_va == 0) {
++		if (kmem_alloc_contig(kernel_map, &hyp_args_va, PAGE_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET MODEM: no page for the hyp_assign arguments\n");
++			return -1;
++		}
++		hyp_args_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)hyp_args_va));
++	}
++	uint8_t *p = (uint8_t *)hyp_args_va;
++	bzero(p, PAGE_SIZE);
++	struct hyp_mem_info *mi = (struct hyp_mem_info *)(p + 0x00);
++	uint32_t *src = (uint32_t *)(p + 0x40);
++	struct hyp_dest_info *dst = (struct hyp_dest_info *)(p + 0x80);
++	uint64_t *extra = (uint64_t *)(p + 0x100);
++	unsigned nsrc = 1, ndst = 1;
++
++	mi->addr = pa;
++	mi->size = size;
++	switch (move) {
++	case HYP_TO_MSS:
++		src[0] = VMID_HLOS;
++		dst[0].vm = VMID_MSS_MSA;
++		dst[0].perm = HYP_PERM_R | HYP_PERM_W;
++		break;
++	case HYP_TO_HLOS:
++		src[0] = VMID_MSS_MSA;
++		dst[0].vm = VMID_HLOS;
++		dst[0].perm = HYP_PERM_R | HYP_PERM_W | HYP_PERM_X;
++		break;
++	case HYP_SHARE:
++		src[0] = VMID_HLOS;
++		dst[0].vm = VMID_HLOS;
++		dst[0].perm = HYP_PERM_R | HYP_PERM_W;
++		dst[1].vm = VMID_MSS_MSA;
++		dst[1].perm = HYP_PERM_R | HYP_PERM_W;
++		ndst = 2;
++		break;
++	case HYP_RECLAIM:
++		src[0] = VMID_HLOS;
++		src[1] = VMID_MSS_MSA;
++		nsrc = 2;
++		dst[0].vm = VMID_MSS_MSA;
++		dst[0].perm = HYP_PERM_R | HYP_PERM_W;
++		break;
++	}
++	/* arguments 3 to 9: source list size, destination list address and size, spare */
++	extra[0] = nsrc * sizeof(uint32_t);
++	extra[1] = hyp_args_pa + 0x80;
++	extra[2] = ndst * sizeof(struct hyp_dest_info);
++	flush_dcache64((addr64_t)hyp_args_pa, PAGE_SIZE, TRUE);
++
++	uint64_t r1 = 0;
++	int64_t r = modem_scm(0xc, 0x16, 0x1117, hyp_args_pa, sizeof(*mi), hyp_args_pa + 0x40,
++	    hyp_args_pa + 0x100, &r1);
++	printf("SWEET MODEM: hyp_assign %s (%#llx + %#llx, move %d): %lld/%#llx\n",
++	    what, pa, size, (int)move, r, r1);
++	return (r == 0 && r1 == 0) ? 0 : -1;
 +}
 +
 +/*
@@ -5280,12 +5413,18 @@ index 0000000..5e8725d
 +	memcpy((void *)meta_va, mdt, (size_t)mdt_len);
 +	uint64_t meta_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)meta_va));
 +	flush_dcache64((addr64_t)meta_pa, (unsigned)meta_sz, TRUE);
++	/* the MBA reads the metadata itself: hand the buffer over for the duration of the check */
++	if (hyp_assign(meta_pa, meta_sz, HYP_TO_MSS, "metadata") != 0) {
++		return -1;
++	}
 +
 +	rmb[RMB_PMI_CODE_LENGTH / 4] = 0;
 +	rmb[RMB_PMI_META_DATA / 4] = (uint32_t)meta_pa;
 +	rmb[RMB_MBA_COMMAND / 4] = CMD_META_DATA_READY;
 +	__builtin_arm_dsb(0xf);
-+	if (rmb_wait(STATUS_META_DATA_AUTH_SUCCESS, "metadata auth") != 0) {
++	int meta_ok = rmb_wait(STATUS_META_DATA_AUTH_SUCCESS, "metadata auth");
++	(void)hyp_assign(meta_pa, meta_sz, HYP_TO_HLOS, "metadata back");
++	if (meta_ok != 0) {
 +		return -1;
 +	}
 +	printf("SWEET MODEM: metadata authenticated\n");
@@ -5293,6 +5432,10 @@ index 0000000..5e8725d
 +	uint8_t *region = (uint8_t *)ml_io_map_wcomb(MODEM_PA, MODEM_SZ);
 +	if (!region) {
 +		printf("SWEET MODEM: the modem region cannot be mapped\n");
++		return -1;
++	}
++	/* the firmware region: ours and the modem's while the segments are written (pil_boot) */
++	if (hyp_assign(MODEM_PA, MODEM_SZ, HYP_SHARE, "modem region shared") != 0) {
 +		return -1;
 +	}
 +	uint32_t total_len = 0, loaded = 0;
@@ -5334,6 +5477,10 @@ index 0000000..5e8725d
 +		loaded++;
 +	}
 +	printf("SWEET MODEM: %u segments loaded (%u bytes), waiting for auth complete\n", loaded, total_len);
++	/* the modem alone owns its firmware from here on (pil_reclaim_mem); we never touch region again */
++	if (hyp_assign(MODEM_PA, MODEM_SZ, HYP_RECLAIM, "modem region to the modem") != 0) {
++		return -1;
++	}
 +	if (rmb_wait(STATUS_AUTH_COMPLETE, "modem auth") != 0) {
 +		return -1;
 +	}
@@ -5472,6 +5619,10 @@ index 0000000..5e8725d
 +	memcpy(mba_region, mba, (size_t)mba_len);
 +	__builtin_arm_dsb(0xf);
 +	printf("SWEET MODEM: MBA (%llu bytes) at %#llx\n", mba_len, MBA_PA);
++	/* the MBA buffer (1 MB, as pil_mss_reset_load_mba) becomes the modem's before the PBL fetches it */
++	if (hyp_assign(MBA_PA, 0x100000, HYP_TO_MSS, "MBA buffer") != 0) {
++		return;
++	}
 +
 +	/*
 +	 * Power up the MSS rails, as pil_mss_power_up does: the modem's DT asks for
