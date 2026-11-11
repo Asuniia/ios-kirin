@@ -20,10 +20,10 @@ index 2a6dc36..1a7c815 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/kirin_bt.c b/bsd/dev/kirin_bt.c
 new file mode 100644
-index 0000000..d605fb5
+index 0000000..4b7ec4e
 --- /dev/null
 +++ b/bsd/dev/kirin_bt.c
-@@ -0,0 +1,726 @@
+@@ -0,0 +1,735 @@
 +/*
 + * kirin (Xperia 10, SDM630), boot-arg sweetbt=1: the WCN3990's Bluetooth core
 + * over BLSP2 UART1 (0xc1af000, UARTDM v1.4 in single-character PIO), HCI in
@@ -314,7 +314,12 @@ index 0000000..d605fb5
 +kb_rx_poll(void)
 +{
 +	uint32_t sr;
++	unsigned got = 0;
 +	while ((sr = rd(bt_uart, UART_SR)) & SR_RXRDY) {
++		if (++got > 8192) {
++			printf("SWEET KBT: RX never drains (SR %#x), giving the thread back\n", sr);
++			break;
++		}
 +		uint8_t b = (uint8_t)rd(bt_uart, UART_RF);
 +		if (kb.raw_budget) {
 +			kb.raw_budget--;
@@ -612,6 +617,10 @@ index 0000000..d605fb5
 +				return EIO;
 +			}
 +			acked++;
++			if ((unsigned)len <= 32 * EDL_SEGMENT) {
++				printf("SWEET KBT: %s: segment at byte %u acknowledged (event %02x len %u: %02x %02x %02x)\n",
++				    what, sent, evt[0], evt[1], evt[2], evt[3], evt[4]);
++			}
 +		} else {
 +			kb.rxn = 0;
 +			if (!kb_hci_send(EDL_OPCODE, seg, 2 + n)) {
@@ -3730,10 +3739,10 @@ index 0c548d1..9bc7611 100644
  		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_mglink.c b/bsd/dev/sweet_mglink.c
 new file mode 100644
-index 0000000..49b5a87
+index 0000000..00a67d1
 --- /dev/null
 +++ b/bsd/dev/sweet_mglink.c
-@@ -0,0 +1,1439 @@
+@@ -0,0 +1,1454 @@
 +/*
 + * kirin: talking to the modem (MSS) once sweet_modem.c has booted it, the way
 + * sweet_glink.c talks to the ADSP. Everything here is for the modem edge
@@ -4646,7 +4655,13 @@ index 0000000..49b5a87
 +	p.h.type = type;
 +	p.h.src_node = QRTR_LOCAL_NODE;
 +	p.h.src_port = QRTR_PORT_CTRL;
-+	p.h.size = 4 + 4 * nargs;
++	/*
++	 * A control packet is always the full struct qrtr_ctrl_pkt (20 bytes: cmd and
++	 * four words, zero when unused), whatever the command; Linux's name service
++	 * and the modem's router drop shorter ones. The 4-byte hello of 11/11 got the
++	 * modem's hello back (sent unsolicited at channel open) but no service list.
++	 */
++	p.h.size = 20;
 +	p.h.dst_node = dst_node;
 +	p.h.dst_port = dst_port;
 +	p.cmd = type;
@@ -4684,6 +4699,11 @@ index 0000000..49b5a87
 +		return;
 +	}
 +	const uint32_t *c = (const uint32_t *)(pkt + sizeof(*h));
++	static unsigned traced;
++	if (traced++ < 20) {
++		printf("SWEET MQRTR: rx type %u from %u:%#x to %u:%#x, %u bytes\n",
++		    h->type, h->src_node, h->src_port, h->dst_node, h->dst_port, h->size);
++	}
 +	switch (h->type) {
 +	case QRTR_TYPE_HELLO:
 +		qrtr_modem_node = h->src_node;
@@ -4916,7 +4936,11 @@ index 0000000..49b5a87
 +		rmtfs_buf_va = (uint8_t *)(va + 0x1000);
 +		rmtfs_buf_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(va + 0x1000)));
 +		rmtfs_announced = true;
-+		printf("SWEET RMTFS: buffer at %#llx, serving %u:%#x\n", rmtfs_buf_pa, QRTR_LOCAL_NODE, RMTFS_PORT);
++		/* the modem reads and writes this buffer itself: HLOS and MSS both RW (msm_sharedmem's hyp_assign) */
++		extern int sweet_modem_share_with_mss(uint64_t pa, uint64_t size);
++		int shared = sweet_modem_share_with_mss(rmtfs_buf_pa, RMTFS_BUF_SIZE);
++		printf("SWEET RMTFS: buffer at %#llx (shared with the modem: %d), serving %u:%#x\n",
++		    rmtfs_buf_pa, shared, QRTR_LOCAL_NODE, RMTFS_PORT);
 +	}
 +	uint32_t a[4] = { RMTFS_SERVICE, 1 /* version, instance 0 */, QRTR_LOCAL_NODE, RMTFS_PORT };
 +	qrtr_ctrl(QRTR_TYPE_NEW_SERVER, QRTR_NODE_BCAST, QRTR_PORT_CTRL, a, 4);
@@ -5175,10 +5199,10 @@ index 0000000..49b5a87
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 new file mode 100644
-index 0000000..c536244
+index 0000000..9d181b8
 --- /dev/null
 +++ b/bsd/dev/sweet_modem.c
-@@ -0,0 +1,821 @@
+@@ -0,0 +1,829 @@
 +/*
 + * kirin, boot-arg sweetmodem=1: bring up the SDM630 modem (MSS, the Hexagon Q6 that runs
 + * the cellular and Wi-Fi firmware), stage A. Unlike the ADSP (a simple TrustZone PAS), the
@@ -5432,6 +5456,14 @@ index 0000000..c536244
 +	printf("SWEET MODEM: hyp_assign %s (%#llx + %#llx, move %d): %lld/%#llx\n",
 +	    what, pa, size, (int)move, r, r1);
 +	return (r == 0 && r1 == 0) ? 0 : -1;
++}
++
++/* for sweet_mglink.c: a buffer the modem must read and write too (rmtfs) */
++int sweet_modem_share_with_mss(uint64_t pa, uint64_t size);
++int
++sweet_modem_share_with_mss(uint64_t pa, uint64_t size)
++{
++	return hyp_assign(pa, size, HYP_SHARE, "shared buffer");
 +}
 +
 +/*
