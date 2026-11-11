@@ -20,10 +20,10 @@ index 2a6dc36..1a7c815 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/kirin_bt.c b/bsd/dev/kirin_bt.c
 new file mode 100644
-index 0000000..1e06f70
+index 0000000..dc54103
 --- /dev/null
 +++ b/bsd/dev/kirin_bt.c
-@@ -0,0 +1,599 @@
+@@ -0,0 +1,613 @@
 +/*
 + * kirin (Xperia 10, SDM630), boot-arg sweetbt=1: the WCN3990's Bluetooth core
 + * over BLSP2 UART1 (0xc1af000, UARTDM v1.4 in single-character PIO), HCI in
@@ -44,8 +44,12 @@ index 0000000..1e06f70
 + *              branch 0x27004); UARTDM baud = RCG rate / CSR divider
 + *              (3.6864 MHz with CSR 0x55 = 2400 for the power pulse,
 + *              51.2 MHz with CSR 0xff = 3.2 M to operate).
-+ *   power      a power-on pulse byte (0xfc) at 2400 baud, then the
-+ *              controller talks at 3.2 M.
++ *   power      qca_regulator_init as ios-sweet replays it: a power-off pulse
++ *              byte (0xc0) at 2400 baud, then the power-on pulse (0xfc) at
++ *              115200, and the controller talks at 115200 from there (the
++ *              baud-change vendor command to 3.2 M is not sent yet; the
++ *              first attempt at 3.2 M straight after the pulse got no
++ *              answer, 11/11).
 + *   firmware   rampatch crbtfw21.tlv + NVM crnv21.bin, streamed in 243-byte
 + *              EDL TLV segments (opcode 0xfc00, command 0x1e); read at boot
 + *              from the phone's own bluetooth firmware partition on the eMMC
@@ -553,21 +557,31 @@ index 0000000..1e06f70
 +	kb_pins();
 +	kb.raw_budget = 64;
 +
-+	/* power-on pulse at 2400 baud, no flow control */
++	/* power-off pulse at 2400 baud, then power-on pulse at 115200, no flow control */
 +	kb_uart_setup(0);
 +	kb_baud(2400);
-+	uint8_t pulse = QCA_PULSE_ON;
++	uint8_t pulse = QCA_PULSE_OFF;
 +	(void)kb_tx_bytes(&pulse, 1);
-+	kb_sleep(150);
++	kb_sleep(10);
++	kb_baud(115200);
++	pulse = QCA_PULSE_ON;
++	(void)kb_tx_bytes(&pulse, 1);
++	kb_sleep(100);
 +
-+	/* operate: flow control on, 3.2 M (or sweetbtbaud) */
++	/* operate: flow control on, 115200 (or sweetbtbaud) */
 +	kb_uart_setup(1);
-+	kb_baud(oper ? oper : 3200000);
++	kb_baud(oper ? oper : 115200);
 +	kb_sleep(50);
++	kb_rx_poll();
++	printf("SWEET KBT: after the power-on pulse: %u stray RX bytes\n", kb.rxn);
++	kb.rxn = 0;
 +
 +	uint8_t evt[48];
++	int err = kb_hci_cmd(0x0c03, NULL, 0, evt, 1000);       /* HCI Reset, as a first sign of life */
++	printf("SWEET KBT: HCI Reset before firmware: %d%s\n", err, err ? "" : " (event received)");
++
 +	uint8_t ver = EDL_VER_REQ;
-+	int err = kb_hci_cmd(EDL_OPCODE, &ver, 1, evt, 2000);
++	err = kb_hci_cmd(EDL_OPCODE, &ver, 1, evt, 2000);
 +	if (err) {
 +		printf("SWEET KBT: no answer to the EDL version request (%d); SR %#x RXFS %#x\n",
 +		    err, rd(bt_uart, UART_SR), rd(bt_uart, UART_RXFS));
@@ -3603,10 +3617,10 @@ index 0c548d1..9bc7611 100644
  		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_mglink.c b/bsd/dev/sweet_mglink.c
 new file mode 100644
-index 0000000..2a5f63a
+index 0000000..38745ef
 --- /dev/null
 +++ b/bsd/dev/sweet_mglink.c
-@@ -0,0 +1,1303 @@
+@@ -0,0 +1,1345 @@
 +/*
 + * kirin: talking to the modem (MSS) once sweet_modem.c has booted it, the way
 + * sweet_glink.c talks to the ADSP. Everything here is for the modem edge
@@ -3756,7 +3770,7 @@ index 0000000..2a5f63a
 +static struct {
 +	volatile uint8_t *smem, *mutex, *apcs;
 +	volatile uint8_t *part;
-+	uint32_t part_size;
++	uint32_t part_size, part_cacheline;
 +	volatile uint32_t *desc;
 +	volatile uint8_t *txf, *rxf;
 +	uint32_t txlen, rxlen;
@@ -3818,11 +3832,13 @@ index 0000000..2a5f63a
 +		    e->offset && e->size && e->offset + (uint64_t)e->size <= SMEM_SZ) {
 +			mg.part = mg.smem + e->offset;
 +			mg.part_size = e->size;
++			mg.part_cacheline = (e->cacheline && !(e->cacheline & (e->cacheline - 1))) ? e->cacheline : 32;
 +			if (memcmp((const void *)mg.part, "$PRT", 4) != 0) {
 +				printf("SWEET MGLINK: APPS/MODEM partition without its magic\n");
 +				return false;
 +			}
-+			printf("SWEET MGLINK: SMEM partition APPS/MODEM at +%#x, %u KB\n", e->offset, e->size >> 10);
++			printf("SWEET MGLINK: SMEM partition APPS/MODEM at +%#x, %u KB, cacheline %u\n",
++			    e->offset, e->size >> 10, mg.part_cacheline);
 +			return true;
 +		}
 +	}
@@ -3859,6 +3875,46 @@ index 0000000..2a5f63a
 +			return NULL;
 +		}
 +		off = next;
++	}
++
++	/*
++	 * Not among the items allocated from the front. The modem allocates its own
++	 * (its GLINK fifo 480, its SMP2P item 428) from the far end of the partition:
++	 * Linux's "cached" list (qcom_smem_get_private), entry headers aligned to the
++	 * partition's cacheline, each header sitting right after its data, walked
++	 * downwards from the end to offset_free_cached. Seen 11/11: the modem had
++	 * consumed our GLINK commands and written 80 bytes we never found.
++	 */
++	uint32_t cl = mg.part_cacheline;
++	uint32_t ehdr = ((uint32_t)sizeof(struct private_entry) + cl - 1) & ~(cl - 1);
++	uint32_t low = ph->offset_free_cached;
++	if (low > mg.part_size || low < sizeof(struct part_header) || mg.part_size < ehdr) {
++		return NULL;
++	}
++	static unsigned cached_complaints;
++	uint32_t eoff = mg.part_size - ehdr;
++	while (eoff > low) {
++		volatile struct private_entry *e = (volatile struct private_entry *)(mg.part + eoff);
++		if (e->canary != 0xa5a5) {
++			if (cached_complaints++ < 3) {
++				printf("SWEET MGLINK: SMEM bad canary in the cached list at +%#x\n", eoff);
++			}
++			return NULL;
++		}
++		if (e->item == item) {
++			if (e->size > eoff) {
++				return NULL;
++			}
++			if (size) {
++				*size = e->size - e->padding_data;
++			}
++			return mg.part + eoff - e->size;
++		}
++		uint32_t step = e->size + ehdr;
++		if (step == 0 || step > eoff) {
++			return NULL;
++		}
++		eoff -= step;
 +	}
 +	return NULL;
 +}
