@@ -20,10 +20,10 @@ index 2a6dc36..1a7c815 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/kirin_bt.c b/bsd/dev/kirin_bt.c
 new file mode 100644
-index 0000000..dc54103
+index 0000000..d605fb5
 --- /dev/null
 +++ b/bsd/dev/kirin_bt.c
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,726 @@
 +/*
 + * kirin (Xperia 10, SDM630), boot-arg sweetbt=1: the WCN3990's Bluetooth core
 + * over BLSP2 UART1 (0xc1af000, UARTDM v1.4 in single-character PIO), HCI in
@@ -486,34 +486,147 @@ index 0000000..dc54103
 +
 +static uint8_t kb_fw[512 * 1024];
 +
++static uint16_t
++le16b(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++static uint32_t
++le32b(const uint8_t *p)
++{
++	return le16b(p) | ((uint32_t)le16b(p + 2) << 16);
++}
++
++/*
++ * The rampatch TLV header (btqca.h tlv_type_patch): download_mode is byte 14 of
++ * the file. 0 and 2: a vendor event per segment; 1: a command complete per
++ * segment; 3 (what WCN399x patches carry): nothing per segment, only the last
++ * one is acknowledged. The first attempt waited 2 s for each segment and gave
++ * up after four (11/11).
++ */
++static unsigned
++kb_patch_mode(const uint8_t *fw, unsigned len)
++{
++	if (len < 28 || (le32b(fw) & 0xff) != 1) {
++		printf("SWEET KBT: rampatch does not start with a TLV patch header\n");
++		return 0;
++	}
++	printf("SWEET KBT: rampatch TLV: total %u, format %u, download_mode %u, product %#x, rom %#x, patch %#x\n",
++	    le32b(fw + 4), fw[12], fw[14], le16b(fw + 16), le16b(fw + 18), le16b(fw + 20));
++	return fw[14] <= 3 ? fw[14] : 0;
++}
++
++/*
++ * The NVM is a list of tags {id u16, len u16, pad u32, data[len]} after the TLV
++ * header (some images carry one more header word). Tag 17 (HCI transport):
++ * data[0] bit 7 = software in-band sleep, data[2] = the UART baud code the
++ * controller switches to once the NVM is in (WCN3990; btqca.h qca_baudrate,
++ * 115200 = 0). Tag 27: deep sleep bit 0. As ios-sweet: both sleep bits off
++ * (the controller never sleeps, no 0xfd/0xfe protocol to get right first)
++ * and the baud pinned so the controller stays where we talk to it.
++ */
++static void
++kb_nvm_edit(uint8_t *fw, unsigned len, uint8_t baud_code)
++{
++	if (len < 16) {
++		return;
++	}
++	unsigned limit = MIN(len, 4 + (le32b(fw) >> 8));
++	unsigned best_start = 0, best_n = 0;
++	for (unsigned start = 4; start <= 8; start += 4) {
++		unsigned idx = start, prev = 0, n = 0;
++		while (idx + 12 <= limit) {
++			unsigned id = le16b(fw + idx), l = le16b(fw + idx + 2);
++			if (id == 0 || id > 0x400 || id <= prev || idx + 12 + l > limit) {
++				break;
++			}
++			n++;
++			prev = id;
++			idx += 12 + l;
++		}
++		if (n > best_n) {
++			best_n = n;
++			best_start = start;
++		}
++	}
++	if (best_n < 3) {
++		printf("SWEET KBT: NVM tag layout not recognised, sent unmodified\n");
++		return;
++	}
++	unsigned idx = best_start, prev = 0;
++	while (idx + 12 <= limit) {
++		unsigned id = le16b(fw + idx), l = le16b(fw + idx + 2);
++		if (id == 0 || id > 0x400 || id <= prev || idx + 12 + l > limit) {
++			break;
++		}
++		uint8_t *t = fw + idx + 12;
++		if (id == 17 && l >= 3) {
++			printf("SWEET KBT: NVM HCI tag: data %02x %02x %02x; IBS off, baud code %u\n", t[0], t[1], t[2], baud_code);
++			t[0] &= (uint8_t)~0x80;
++			t[2] = baud_code;
++		} else if (id == 27 && l >= 1) {
++			t[0] &= (uint8_t)~0x01;
++		}
++		prev = id;
++		idx += 12 + l;
++	}
++	printf("SWEET KBT: NVM: %u tags from offset %u\n", best_n, best_start);
++}
++
 +static int
-+kb_download(const char *part, const char name83[11], const char *what)
++kb_download(const char *part, const char name83[11], const char *what, bool is_patch)
 +{
 +	int64_t len = sweet_fat_read_file_in(part, name83, kb_fw, sizeof(kb_fw));
 +	if (len <= 0) {
 +		printf("SWEET KBT: %s (%.11s) not found in %s\n", what, name83, part);
 +		return ENOENT;
 +	}
-+	printf("SWEET KBT: sending %s (%lld bytes) in %u-byte segments\n", what, (long long)len, EDL_SEGMENT);
++	unsigned mode = 0;
++	if (is_patch) {
++		mode = kb_patch_mode(kb_fw, (unsigned)len);
++	} else {
++		kb_nvm_edit(kb_fw, (unsigned)len, 0);
++	}
++	printf("SWEET KBT: sending %s (%lld bytes) in %u-byte segments, download_mode %u\n",
++	    what, (long long)len, EDL_SEGMENT, mode);
 +	uint8_t seg[2 + EDL_SEGMENT], evt[48];
-+	unsigned sent = 0, errors = 0;
++	unsigned sent = 0, acked = 0;
++	bool cc_wait = mode == 1;
 +	while (sent < (unsigned)len) {
 +		unsigned n = MIN((unsigned)len - sent, EDL_SEGMENT);
++		bool last = sent + n >= (unsigned)len || n < EDL_SEGMENT;
++		unsigned m = last ? 0 : mode;          /* the last segment is always acknowledged */
 +		seg[0] = EDL_TLV_REQ;
 +		seg[1] = (uint8_t)n;
 +		memcpy(seg + 2, kb_fw + sent, n);
-+		int err = kb_hci_cmd(EDL_OPCODE, seg, 2 + n, evt, 2000);
-+		if (err) {
-+			if (errors++ < 3) {
++		if (m == 0 || m == 2) {
++			int err = kb_hci_cmd(EDL_OPCODE, seg, 2 + n, evt, last ? 10000 : 2000);
++			if (err) {
 +				printf("SWEET KBT: %s: no answer at byte %u (%d)\n", what, sent, err);
-+			}
-+			if (errors > 3) {
 +				return err;
 +			}
++			/* vendor event {cresp 0, rtype 4 (TLV download), status} */
++			if (evt[0] == 0xff && evt[1] >= 3 && (evt[2] != 0 || evt[3] != 4 || evt[4] != 0)) {
++				printf("SWEET KBT: %s: segment at byte %u refused (%02x %02x %02x)\n", what, sent, evt[2], evt[3], evt[4]);
++				return EIO;
++			}
++			acked++;
++		} else {
++			kb.rxn = 0;
++			if (!kb_hci_send(EDL_OPCODE, seg, 2 + n)) {
++				return EIO;
++			}
++			if (cc_wait && kb_hci_wait(EDL_OPCODE, evt, 100) != 0) {
++				printf("SWEET KBT: %s: no command complete per segment, not waiting for them\n", what);
++				cc_wait = false;
++			}
++			kb_rx_poll();
++			kb_ibs_service();
 +		}
 +		sent += n;
 +	}
-+	printf("SWEET KBT: %s sent (%u errors)\n", what, errors);
++	printf("SWEET KBT: %s sent, %u segments acknowledged\n", what, acked);
 +	return 0;
 +}
 +
@@ -592,14 +705,14 @@ index 0000000..dc54103
 +
 +	/* rampatch then NVM, from the phone's bluetooth partition */
 +	const char *part = "bluetooth_a";
-+	if (kb_download(part, "CRBTFW21TLV", "rampatch") == ENOENT) {
++	if (kb_download(part, "CRBTFW21TLV", "rampatch", true) == ENOENT) {
 +		part = "bluetooth";
-+		if (kb_download(part, "CRBTFW21TLV", "rampatch") != 0) {
++		if (kb_download(part, "CRBTFW21TLV", "rampatch", true) != 0) {
 +			return;
 +		}
 +	}
 +	kb_sleep(100);
-+	(void)kb_download(part, "CRNV21  BIN", "NVM");
++	(void)kb_download(part, "CRNV21  BIN", "NVM", false);
 +	kb_sleep(100);
 +
 +	err = kb_hci_cmd(0x0c03, NULL, 0, evt, 2000);   /* HCI Reset */
@@ -3617,10 +3730,10 @@ index 0c548d1..9bc7611 100644
  		keys_pon_apid = KEYS_NO_APID;
 diff --git a/bsd/dev/sweet_mglink.c b/bsd/dev/sweet_mglink.c
 new file mode 100644
-index 0000000..38745ef
+index 0000000..49b5a87
 --- /dev/null
 +++ b/bsd/dev/sweet_mglink.c
-@@ -0,0 +1,1345 @@
+@@ -0,0 +1,1439 @@
 +/*
 + * kirin: talking to the modem (MSS) once sweet_modem.c has booted it, the way
 + * sweet_glink.c talks to the ADSP. Everything here is for the modem edge
@@ -3917,6 +4030,76 @@ index 0000000..38745ef
 +		eoff -= step;
 +	}
 +	return NULL;
++}
++
++/* one-shot inventory: the partition's two lists and the global table (items 400 to 520) */
++static void
++mg_dump_items(void)
++{
++	volatile struct part_header *ph = (volatile struct part_header *)mg.part;
++	char line[200];
++	unsigned o;
++	if (mg.part == NULL) {
++		return;
++	}
++	o = (unsigned)snprintf(line, sizeof(line), "SWEET MGLINK: partition items, front:");
++	uint32_t off = sizeof(struct part_header), end = ph->offset_free_uncached;
++	while (end <= mg.part_size && off + sizeof(struct private_entry) <= end) {
++		volatile struct private_entry *e = (volatile struct private_entry *)(mg.part + off);
++		if (e->canary != 0xa5a5) {
++			break;
++		}
++		o += (unsigned)snprintf(line + o, sizeof(line) - o, " %u(%u)", e->item, e->size);
++		if (o > 150) {
++			printf("%s\n", line);
++			o = (unsigned)snprintf(line, sizeof(line), "SWEET MGLINK:   ");
++		}
++		uint32_t next = off + (uint32_t)sizeof(struct private_entry) + e->padding_hdr + e->size;
++		if (next <= off) {
++			break;
++		}
++		off = next;
++	}
++	printf("%s\n", line);
++
++	o = (unsigned)snprintf(line, sizeof(line), "SWEET MGLINK: partition items, back (free_cached %#x):", ph->offset_free_cached);
++	uint32_t cl = mg.part_cacheline;
++	uint32_t ehdr = ((uint32_t)sizeof(struct private_entry) + cl - 1) & ~(cl - 1);
++	uint32_t low = ph->offset_free_cached;
++	if (low <= mg.part_size && mg.part_size >= ehdr) {
++		uint32_t eoff = mg.part_size - ehdr;
++		while (eoff > low) {
++			volatile struct private_entry *e = (volatile struct private_entry *)(mg.part + eoff);
++			if (e->canary != 0xa5a5) {
++				o += (unsigned)snprintf(line + o, sizeof(line) - o, " [bad canary at +%#x]", eoff);
++				break;
++			}
++			o += (unsigned)snprintf(line + o, sizeof(line) - o, " %u(%u)", e->item, e->size);
++			if (o > 150) {
++				printf("%s\n", line);
++				o = (unsigned)snprintf(line, sizeof(line), "SWEET MGLINK:   ");
++			}
++			uint32_t step = e->size + ehdr;
++			if (step == 0 || step > eoff) {
++				break;
++			}
++			eoff -= step;
++		}
++	}
++	printf("%s\n", line);
++
++	o = (unsigned)snprintf(line, sizeof(line), "SWEET MGLINK: global items 400-520:");
++	for (uint32_t item = 400; item <= 520; item++) {
++		volatile uint32_t *toc = (volatile uint32_t *)(mg.smem + 0xd0 + 16 * item);
++		if (toc[0] == 1 && toc[2]) {
++			o += (unsigned)snprintf(line + o, sizeof(line) - o, " %u(%u)", item, toc[2]);
++			if (o > 150) {
++				printf("%s\n", line);
++				o = (unsigned)snprintf(line, sizeof(line), "SWEET MGLINK:   ");
++			}
++		}
++	}
++	printf("%s\n", line);
 +}
 +
 +static volatile uint8_t *
@@ -4236,7 +4419,8 @@ index 0000000..38745ef
 +	case CMD_VERSION:
 +		mg_rx_advance(8);
 +		printf("SWEET MGLINK: the modem speaks GLINK version %u, features %#x\n", m.p1, m.p2);
-+		(void)mg_cmd(CMD_VERSION_ACK, 1, 0);
++		/* qcom_glink_receive_version: ack with the features we both have (ours: INTENT_REUSE) */
++		(void)mg_cmd(CMD_VERSION_ACK, 1, m.p2 & 1u);
 +		mg.version_done = true;
 +		break;
 +	case CMD_VERSION_ACK:
@@ -4288,6 +4472,15 @@ index 0000000..38745ef
 +		if (avail < len) {
 +			return false;
 +		}
++		static unsigned intent_logs;
++		if (intent_logs++ < 6) {
++			uint32_t first[2] = { 0, 0 };
++			if (n) {
++				mg_rx_peek(first, 8, 8);
++			}
++			printf("SWEET MGLINK: the modem offers %u buffer(s) on its channel %u (first %u bytes, id %u)%s\n",
++			    n, m.p1, first[0], first[1], (c->remote_open && c->rcid == m.p1) ? "" : ": not ours, ignored");
++		}
 +		for (uint32_t k = 0; k < n; k++) {
 +			uint32_t pair[2];
 +			mg_rx_peek(pair, 8 + 8 * k, 8);
@@ -4311,6 +4504,12 @@ index 0000000..38745ef
 +	case CMD_RX_DONE:
 +	case CMD_RX_DONE_W_REUSE:
 +		mg_rx_advance(8);
++		{
++			static unsigned done_logs;
++			if (done_logs++ < 4) {
++				printf("SWEET MGLINK: the modem consumed our packet in its buffer %u (channel %u)\n", m.p2, m.p1);
++			}
++		}
 +		if (c->remote_open && c->rcid == m.p1) {
 +			lck_mtx_lock(&mg_tx_lock);
 +			for (int i = 0; i < NREMOTE; i++) {
@@ -4326,6 +4525,7 @@ index 0000000..38745ef
 +		break;
 +	case CMD_RX_INTENT_REQ:
 +		mg_rx_advance(8);
++		printf("SWEET MGLINK: the modem asks for a %u-byte buffer on channel %u\n", m.p2, m.p1);
 +		if (c->remote_open && c->rcid == m.p1) {
 +			if (c->nlocal >= NLOCAL) {
 +				(void)mg_cmd(CMD_RX_INTENT_REQ_ACK, c->lcid, 0);
@@ -4437,7 +4637,7 @@ index 0000000..38745ef
 +	return err;
 +}
 +
-+static void
++static int
 +qrtr_ctrl(uint32_t type, uint32_t dst_node, uint32_t dst_port, const uint32_t *args, uint32_t nargs)
 +{
 +	struct { struct qrtr_hdr_v1 h; uint32_t cmd, a[4]; } p;
@@ -4453,7 +4653,7 @@ index 0000000..38745ef
 +	for (uint32_t i = 0; i < nargs && i < 4; i++) {
 +		p.a[i] = args[i];
 +	}
-+	(void)mch_send(&mg.ch[0], &p, sizeof(p.h) + p.h.size);
++	return mch_send(&mg.ch[0], &p, sizeof(p.h) + p.h.size);
 +}
 +
 +static void rmtfs_announce(void);
@@ -4874,6 +5074,12 @@ index 0000000..38745ef
 +	}
 +	if (last == ~0u || !(last & 2)) {
 +		printf("SWEET MGLINK: no err-ready from the modem after 30 s (state %#x)\n", last);
++		/* what the modem did create, and whether it died: the SMEM inventory and item 421 */
++		mg_dump_items();
++		char why[200];
++		if (sweet_glink_smem_string(421, why, sizeof(why)) && why[0]) {
++			printf("SWEET MGLINK: modem crash reason (SMEM 421): %s\n", why);
++		}
 +		/* keep going: GLINK may still come up */
 +	}
 +
@@ -4928,7 +5134,8 @@ index 0000000..38745ef
 +		}
 +		if (mg.ch[0].intents_sent && !hello) {
 +			hello = true;
-+			qrtr_ctrl(QRTR_TYPE_HELLO, QRTR_NODE_BCAST, QRTR_PORT_CTRL, NULL, 0);
++			int e = qrtr_ctrl(QRTR_TYPE_HELLO, QRTR_NODE_BCAST, QRTR_PORT_CTRL, NULL, 0);
++			printf("SWEET MQRTR: hello sent to the modem (%d)\n", e);
 +		}
 +		if (bb_configured) {
 +			coachz_baseband_poll();
