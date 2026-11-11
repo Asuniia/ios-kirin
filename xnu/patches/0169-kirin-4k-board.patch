@@ -20,10 +20,10 @@ index 2a6dc36..1a7c815 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/kirin_bt.c b/bsd/dev/kirin_bt.c
 new file mode 100644
-index 0000000..4b7ec4e
+index 0000000..50eaf3f
 --- /dev/null
 +++ b/bsd/dev/kirin_bt.c
-@@ -0,0 +1,735 @@
+@@ -0,0 +1,737 @@
 +/*
 + * kirin (Xperia 10, SDM630), boot-arg sweetbt=1: the WCN3990's Bluetooth core
 + * over BLSP2 UART1 (0xc1af000, UARTDM v1.4 in single-character PIO), HCI in
@@ -665,6 +665,8 @@ index 0000000..4b7ec4e
 +{
 +	unsigned oper = 0;
 +	(void)PE_parse_boot_argn("sweetbtbaud", &oper, sizeof(oper));
++	extern void sweet_wait_for_cpus(const char *who);
++	sweet_wait_for_cpus("KBT");
 +
 +	bt_gcc = (volatile uint32_t *)ml_io_map(GCC_PA, 0x100000);
 +	bt_tlmm = (volatile uint32_t *)ml_io_map(TLMM_CENTER_PA, 0x1000 * (BT_GPIO_FIRST + 4));
@@ -5199,10 +5201,10 @@ index 0000000..00a67d1
 +#endif /* SWEET_KIRIN */
 diff --git a/bsd/dev/sweet_modem.c b/bsd/dev/sweet_modem.c
 new file mode 100644
-index 0000000..9d181b8
+index 0000000..4e83fa9
 --- /dev/null
 +++ b/bsd/dev/sweet_modem.c
-@@ -0,0 +1,829 @@
+@@ -0,0 +1,850 @@
 +/*
 + * kirin, boot-arg sweetmodem=1: bring up the SDM630 modem (MSS, the Hexagon Q6 that runs
 + * the cellular and Wi-Fi firmware), stage A. Unlike the ADSP (a simple TrustZone PAS), the
@@ -5891,12 +5893,33 @@ index 0000000..9d181b8
 +	return 0;
 +}
 +
++/*
++ * The bring-up threads used to start while the secondary CPUs were still being
++ * brought up, and twice (11/11) cpu 4 (mpidr 0, the first core of the other
++ * cluster) took a synchronous exception at start-up with the modem's first SCM
++ * call (hyp_assign) in flight on cpu 0. Wait until every CPU is up: it also
++ * puts the modem log after the USB console comes up.
++ */
++void sweet_wait_for_cpus(const char *who);
++void
++sweet_wait_for_cpus(const char *who)
++{
++	extern int processor_avail_count;
++	extern int ml_get_max_cpu_number(void);
++	int want = ml_get_max_cpu_number() + 1;
++	for (int i = 0; i < 3000 && processor_avail_count < want; i++) {
++		delay(10000);
++	}
++	printf("SWEET %s: starting with %d of %d CPUs up\n", who, processor_avail_count, want);
++}
++
 +static void
 +modem_thread(__unused void *arg, __unused wait_result_t wr)
 +{
 +	DTEntry mm;
 +	uint64_t const *v;
 +	unsigned int size;
++	sweet_wait_for_cpus("MODEM");
 +	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
 +	    SecureDTGetProperty(mm, "MBA-FW", (void const **)&v, &size) != kSuccess || size != 16) {
 +		printf("SWEET MODEM: no MBA-FW in the payload\n");
@@ -14583,6 +14606,28 @@ index b082a10..222090a 100644
  		platform_cache_idle_enter();
  #endif
  
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 3fe4fb8..7fd554e 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -520,6 +520,17 @@ sleh_synchronous_sp1(arm_context_t *context, uint32_t esr, vm_offset_t far __unu
+ 	}
+ 		OS_FALLTHROUGH; // panic if we return from the debugger
+ 	default:
++#if defined(SWEET_KIRIN)
++		/*
++		 * One line that survives the console interleave with the other CPUs: a
++		 * secondary CPU hit this at start-up (cpu 4, mpidr 0, 11/11) and its full
++		 * panic text never made it to the screen.
++		 */
++		printf("SWEET SP1 EXC: cpu %d mpidr %#llx esr %#x far %#lx pc %#llx lr %#llx sp %#llx spsr %#llx\n",
++		    cpu_number(), (unsigned long long)__builtin_arm_rsr64("MPIDR_EL1"), esr, far,
++		    (unsigned long long)get_saved_state_pc(state), (unsigned long long)get_saved_state_lr(state),
++		    (unsigned long long)get_saved_state_sp(state), (unsigned long long)get_saved_state_cpsr(state));
++#endif
+ 		panic_with_thread_kernel_state("Synchronous exception taken while SP1 selected", state);
+ 	}
+ }
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index 5ea69e3..27677d0 100644
 --- a/osfmk/arm64/start.s
