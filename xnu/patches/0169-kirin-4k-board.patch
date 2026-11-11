@@ -9396,7 +9396,7 @@ index bb2a2bf..878fb4c 100644
  	lock_trace = 1;
  }
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 01e674f..d403f30 100644
+index 01e674f..bdf4fcd 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -453,13 +453,23 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
@@ -9498,7 +9498,34 @@ index 01e674f..d403f30 100644
  	const char *entry = spec;
  	for (;;) {
  		size_t n = 0;
-@@ -5814,6 +5889,10 @@ exec_extract_strings(struct image_params *imgp)
+@@ -491,7 +566,25 @@ sweet_exec_env(struct image_params *imgp, int ptr_size)
+ 	while (*p && *p != ';') {
+ 		char var[128];
+ 		size_t len = 0;
+-		while (p[len] && p[len] != ',' && p[len] != ';') {
++		while (p[len] && p[len] != ';') {
++			if (p[len] == ',') {
++				/*
++				 * A comma starts the next VAR=VAL only if one follows; otherwise it
++				 * belongs to the value (bluetoothd's BT_HCI_TRANSPORT ends in
++				 * ",<baud>").
++				 */
++				size_t k = len + 1;
++				bool eq = false;
++				while (p[k] && p[k] != ',' && p[k] != ';') {
++					if (p[k] == '=') {
++						eq = true;
++					}
++					k++;
++				}
++				if (eq) {
++					break;
++				}
++			}
+ 			len++;
+ 		}
+ 		if (len > 0 && len < sizeof(var)) {
+@@ -5814,6 +5907,10 @@ exec_extract_strings(struct image_params *imgp)
  	}
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
