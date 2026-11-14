@@ -11437,7 +11437,7 @@ index bec47e0..4f6eecb 100644
  void
  SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 93d6318..3fc5bce 100644
+index 93d6318..fc0ab14 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -85,7 +85,11 @@ SweetCPU::start(IOService *provider)
@@ -11452,7 +11452,7 @@ index 93d6318..3fc5bce 100644
  	if (cpuName == NULL) {
  		return false;
  	}
-@@ -147,10 +151,17 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -147,10 +151,31 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  		}
  		IOSleep(1);
  	}
@@ -11467,10 +11467,53 @@ index 93d6318..3fc5bce 100644
  		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
  	}
 +#endif
++	/*
++	 * Per-CPU startup budget, tunable at boot (sweetcpustartms, default 20 s).
++	 * The first core of the second cluster (mpidr 0x0) can be slow to finish its
++	 * reset/MMU/GIC/SGI bring-up when the cluster was cold, above all after rapid
++	 * reboots; the old fixed 5 s was occasionally too tight and paniced a healthy,
++	 * merely slow core. A generous, configurable budget avoids that, and logging
++	 * how long each core actually took keeps a genuinely stuck core (never alive,
++	 * even at 20 s) distinguishable from one that is just slow to start.
++	 */
++	uint32_t cpu_start_ms = 20000;
++	PE_parse_boot_argn("sweetcpustartms", &cpu_start_ms, sizeof(cpu_start_ms));
++	if (cpu_start_ms < 1000) {
++		cpu_start_ms = 1000;
++	}
  	for (unsigned int i = 0; i < topology->num_cpus; i++) {
  		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
  		kern_return_t kr = processor_start(cpu->machProcessor);
-@@ -237,7 +248,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+@@ -158,18 +183,23 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+-		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
++		uint64_t start_abs = mach_absolute_time();
++		nanoseconds_to_deadline((uint64_t)cpu_start_ms * (NSEC_PER_SEC / 1000), &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
+ 			if (mach_absolute_time() > deadline) {
+-				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+-				    i, topology->cpus[i].phys_id);
++				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after %u ms "
++				    "(initialized=%u signal=%u)\n", i, topology->cpus[i].phys_id,
++				    cpu_start_ms, __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++				    sweet_cpu_signal_is_enabled(i) ? 1u : 0u);
+ 				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
+ 			IOSleep(1);
+ 		}
+-		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+-		    i, topology->cpus[i].phys_id);
++		uint64_t elapsed_ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - start_abs, &elapsed_ns);
++		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK (%llu ms)\n",
++		    i, topology->cpus[i].phys_id, elapsed_ns / (NSEC_PER_SEC / 1000));
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+@@ -237,7 +267,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
  {
  	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
  	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
