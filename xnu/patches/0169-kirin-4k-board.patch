@@ -20,10 +20,10 @@ index 2a6dc36..1a7c815 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/kirin_bt.c b/bsd/dev/kirin_bt.c
 new file mode 100644
-index 0000000..50eaf3f
+index 0000000..d5823e0
 --- /dev/null
 +++ b/bsd/dev/kirin_bt.c
-@@ -0,0 +1,737 @@
+@@ -0,0 +1,817 @@
 +/*
 + * kirin (Xperia 10, SDM630), boot-arg sweetbt=1: the WCN3990's Bluetooth core
 + * over BLSP2 UART1 (0xc1af000, UARTDM v1.4 in single-character PIO), HCI in
@@ -69,6 +69,7 @@ index 0000000..50eaf3f
 +#include <kern/clock.h>
 +#include <kern/sched_prim.h>
 +#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
 +#include <kern/kalloc.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -658,6 +659,80 @@ index 0000000..50eaf3f
 +
 +static const struct bt_hci_ops kbt_ops = { kbt_ops_tx, kbt_ops_baud };
 +
++/* ---- BD_ADDR (QCA 0xfc14) ---- */
++#define QCA_EDL_WRITE_BD_ADDR_OPCODE    0xfc14u         /* btqca.h EDL_WRITE_BD_ADDR_OPCODE */
++
++/*
++ * marconi-bt (inside bluetoothd) reads the controller's BD_ADDR and refuses to
++ * power the module on when it is all-zeros ("Not a valid MAC address (all 00s)"),
++ * which leaves Settings spinning forever. The WCN3990's NVM carries no address,
++ * so we program it with the ADT /arm-io/bluetooth local-mac-address (the value
++ * userland also believes), as Linux qca_set_bdaddr() does. Default stays in sync
++ * with tools/mkadt.py mac-address-bluetooth0.
++ */
++static void
++kb_adt_bdaddr(uint8_t out[6])
++{
++	static const uint8_t def[6] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x11 };
++	DTEntry node;
++	void const *data = NULL;
++	unsigned int size = 0;
++
++	memcpy(out, def, 6);
++	if (SecureDTLookupEntry(NULL, "/arm-io/bluetooth", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "local-mac-address", &data, &size) == kSuccess && size == 6) {
++		memcpy(out, data, 6);
++	}
++	printf("SWEET KBT: BD_ADDR wanted %02x:%02x:%02x:%02x:%02x:%02x\n",
++	    out[0], out[1], out[2], out[3], out[4], out[5]);
++}
++
++/* Read_BD_ADDR (0x1009) into addr, most significant byte first (evt[6]=LSB..evt[11]=MSB) */
++static bool
++kb_read_bdaddr(uint8_t addr[6])
++{
++	uint8_t evt[48];
++	if (kb_hci_cmd(0x1009, NULL, 0, evt, 1000) || evt[0] != 0x0e || evt[5] != 0) {
++		printf("SWEET KBT: Read BD_ADDR failed\n");
++		return false;
++	}
++	for (unsigned i = 0; i < 6; i++) {
++		addr[i] = evt[11 - i];
++	}
++	return true;
++}
++
++/* vendor 0xfc14, most significant byte first; the controller applies it now or on the next reset */
++static void
++kb_set_bdaddr(const uint8_t want[6])
++{
++	uint8_t cur[6], evt[48];
++
++	if (!kb_read_bdaddr(cur)) {
++		return;
++	}
++	printf("SWEET KBT: controller BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x\n",
++	    cur[0], cur[1], cur[2], cur[3], cur[4], cur[5]);
++	if (!memcmp(cur, want, 6)) {
++		printf("SWEET KBT: BD_ADDR already matches\n");
++		return;
++	}
++	if (kb_hci_cmd(QCA_EDL_WRITE_BD_ADDR_OPCODE, want, 6, evt, 1000)) {
++		printf("SWEET KBT: set BD_ADDR (0xfc14): no event\n");
++	}
++	for (unsigned pass = 0; pass < 2; pass++) {
++		if (kb_read_bdaddr(cur) && !memcmp(cur, want, 6)) {
++			printf("SWEET KBT: BD_ADDR now %02x:%02x:%02x:%02x:%02x:%02x%s\n", cur[0], cur[1],
++			    cur[2], cur[3], cur[4], cur[5], pass ? " (after HCI Reset)" : "");
++			return;
++		}
++		if (pass == 0) {
++			(void)kb_hci_cmd(0x0c03, NULL, 0, evt, 3000);   /* HCI Reset, then re-read */
++		}
++	}
++	printf("SWEET KBT: BD_ADDR still mismatched after 0xfc14 (controller reports a different address)\n");
++}
++
 +/* ---- bring-up thread ---- */
 +
 +static void
@@ -731,6 +806,11 @@ index 0000000..50eaf3f
 +	if (err) {
 +		return;
 +	}
++
++	/* give the controller the ADT address so marconi-bt will power it on */
++	uint8_t bdaddr[6];
++	kb_adt_bdaddr(bdaddr);
++	kb_set_bdaddr(bdaddr);
 +
 +	/* hand the controller to iOS and keep draining RX */
 +	kb.xport = true;
